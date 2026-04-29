@@ -1,0 +1,23 @@
+{
+  "id": "prompt-injection-reporting",
+  "name": "Prompt Injection Reporting",
+  "description": "Agent-callable report_injection tool + signed JSONL attack log + Telegram alert. The model self-reports detected injection attempts; the plugin persists them and notifies the operator.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "telegramBotToken": {
+        "type": "string",
+        "description": "Telegram bot token for incident alerts (optional — without it, incidents are logged to disk only)"
+      },
+      "telegramAlertChatId": {
+        "type": "string",
+        "description": "Telegram chat ID to receive attack/incident alerts"
+      },
+      "attackLogDir": {
+        "type": "string",
+        "description": "Directory for attack/incident JSONL logs (default: ~/.openclaw/logs/attacks)"
+      }
+    }
+  }
+}

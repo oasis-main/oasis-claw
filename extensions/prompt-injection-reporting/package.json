@@ -1,7 +1,7 @@
 {
-  "name": "@hyperclaw/hyperclaw-security",
-  "version": "1.0.0",
-  "description": "Hyperclaw security plugin — history logging, attack detection, secrets store, browser approvals",
+  "name": "@oasis-claw/prompt-injection-reporting",
+  "version": "0.1.0",
+  "description": "openclaw plugin: agent-callable report_injection tool + signed JSONL attack log + Telegram alerting",
   "type": "module",
   "devDependencies": {
     "openclaw": "workspace:*",
