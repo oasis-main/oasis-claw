@@ -1,0 +1,19 @@
+{
+  "name": "@oasis-claw/session-history",
+  "version": "0.1.0",
+  "description": "openclaw plugin: append-only JSONL session transcripts with sandbox-isolation invariant tests",
+  "type": "module",
+  "devDependencies": {
+    "openclaw": "workspace:*",
+    "vitest": "^3.0.0"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "id": "approval-gate",
+  "name": "Approval Gate",
+  "description": "Human-in-the-loop approval surface — registers the forward_captcha agent tool and ships library code (api-approval-gate, browser-approvals) that integrates with openclaw's exec approval infrastructure when the requisite core hooks are configured.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "telegramBotToken": {
+        "type": "string",
+        "description": "Telegram bot token for approval prompts and CAPTCHA forwarding"
+      },
+      "telegramChatId": {
+        "type": "string",
+        "description": "Telegram chat ID where approvals are sent and operator answers"
+      },
+      "policyFile": {
+        "type": "string",
+        "description": "Path to API approval policy JSON (default: ~/.openclaw/api-approvals.json)"
+      }
+    }
+  }
+}

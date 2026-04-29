@@ -1,0 +1,15 @@
+{
+  "id": "session-history",
+  "name": "Session History",
+  "description": "Append-only JSONL session transcripts. Hooks llm_input, llm_output, and tool_call events into per-session log files for audit and replay.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "logDir": {
+        "type": "string",
+        "description": "Directory for session history JSONL logs (default: ~/.openclaw/logs/history)"
+      }
+    }
+  }
+}

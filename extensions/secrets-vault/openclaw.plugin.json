@@ -1,0 +1,23 @@
+{
+  "id": "secrets-vault",
+  "name": "Secrets Vault",
+  "description": "AES-256-GCM at-rest secrets store with deposit_secret tool and automatic redaction in session history. The agent receives an opaque handle; the plaintext only re-materializes inside tool calls that explicitly request it.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "secretsDir": {
+        "type": "string",
+        "description": "Directory for the encrypted secrets vault (default: ~/.openclaw/state/secrets)"
+      },
+      "telegramBotToken": {
+        "type": "string",
+        "description": "Telegram bot token for deposit confirmations (optional)"
+      },
+      "telegramAlertChatId": {
+        "type": "string",
+        "description": "Telegram chat ID to confirm deposits to (optional)"
+      }
+    }
+  }
+}

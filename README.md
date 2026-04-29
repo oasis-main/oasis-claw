@@ -19,9 +19,10 @@ By keeping openclaw as a submodule and our plugins as first-class code in this r
 oasis-claw/
   vendor/openclaw/             # git submodule, pinned to upstream tag
   extensions/
-    prompt-injection-reporting/  # report_injection tool + attack logger + Telegram alert
-                                 # (other source files in src/ are pending Stage-2 relocation
-                                 # into secrets-vault, approval-gate, session-history)
+    prompt-injection-reporting/  # report_injection tool + signed attack log + Telegram alert
+    secrets-vault/               # AES-256-GCM at-rest store + deposit_secret + redaction hook
+    approval-gate/               # forward_captcha tool + API/browser approval library code
+    session-history/             # append-only JSONL transcripts + sandbox-isolation invariants
   archive/
     hyperclaw-fork-patches/    # the 7 commits from the deprecated fork, kept as patches
                                # for historical reference
@@ -31,9 +32,9 @@ oasis-claw/
 
 ## Plugins
 
-The deprecated fork bundled five concerns into one `hyperclaw-security` plugin. The plan is to decompose into focused single-responsibility plugins. Stage 1 (rename + narrow) is done; Stages 2–4 are tracked under oasis-x ORG-049.
+The deprecated fork bundled five concerns into one `hyperclaw-security` plugin. We've decomposed into focused single-responsibility plugins. The remaining ORG-049 work is to scaffold the planned plugins (Stage 3) and re-run the test suite against the openclaw submodule runtime (Stage 4).
 
-### `extensions/prompt-injection-reporting` *(active — narrowed in Stage 1)*
+### `extensions/prompt-injection-reporting`
 
 Agent-callable `report_injection` tool — the model invokes it when it detects what it believes is a prompt-injection attempt in its input. The plugin:
 
@@ -41,34 +42,57 @@ Agent-callable `report_injection` tool — the model invokes it when it detects 
 - Emits a Telegram alert to the operator chat (if configured)
 - Returns acknowledgement to the model so it can continue with hardened behavior
 
-Configuration via `~/.openclaw/openclaw.json`:
+The cross-cutting `adversarial.test.ts` (22 tests) lives here as the end-to-end backstop for the security feature set.
+
+### `extensions/secrets-vault`
+
+AES-256-GCM at-rest secrets store. The agent never sees the plaintext after deposit — it gets an opaque handle that re-materializes only inside tool calls that explicitly request it. Provides:
+
+- `deposit_secret` tool — the model invokes this when the user pastes a credential
+- Redaction hook — runs before any history write so plaintext can't slip into JSONL transcripts
+- Optional Telegram deposit confirmations
+
+### `extensions/approval-gate`
+
+Human-in-the-loop approval surface. Currently wired:
+
+- `forward_captcha` agent tool — sends CAPTCHA images via Telegram and returns the operator's typed solution
+
+Library code awaiting core integration (re-exported from the plugin entry):
+
+- `loadApiApprovalPolicy`, `checkApiApproval`, `requestApiApproval`, `handlePotentialApiApprovalResponse` — utility functions for HTTP request approval policy. These need to be invoked from openclaw's HTTP middleware layer; that integration point doesn't yet exist in vanilla upstream.
+- `browser-approvals.ts` — documentation describing how to configure openclaw's existing `approvals.exec` infrastructure to forward browser navigation requests to Telegram. No plugin code wiring needed; the configuration goes in `~/.openclaw/openclaw.json`.
+
+### `extensions/session-history`
+
+Append-only JSONL session transcripts hooked at `llm_input`, `llm_output`, and `tool_call` events. Includes the `sandbox-isolation.test.ts` invariant suite which verifies the JSONL writer never escapes its configured `logDir` even under adversarial path inputs.
+
+### Configuration
+
+Each plugin reads its own block under `plugins.entries` in `~/.openclaw/openclaw.json`:
 
 ```json
 {
   "plugins": {
     "entries": {
-      "prompt-injection-reporting": {
-        "telegramBotToken": "...",
-        "telegramAlertChatId": "...",
-        "attackLogDir": "~/.openclaw/logs/attacks"
-      }
+      "prompt-injection-reporting": { "telegramBotToken": "...", "telegramAlertChatId": "...", "attackLogDir": "~/.openclaw/logs/attacks" },
+      "secrets-vault": { "secretsDir": "~/.openclaw/state/secrets" },
+      "approval-gate": { "telegramBotToken": "...", "telegramChatId": "..." },
+      "session-history": { "logDir": "~/.openclaw/logs/history" }
     }
   }
 }
 ```
 
-### Pending decomposition (Stage 2 of ORG-049)
+### A note on `telegram.ts` duplication
 
-The current `prompt-injection-reporting/src/` directory still contains source files that belong to other plugins. They are kept colocated (and unwired from the narrowed `register()`) until they're relocated into their own packages.
+Three plugins talk to the Telegram Bot API. Rather than carrying a `_shared/telegram` workspace package for ~110 lines of stable HTTP wrapper code, each plugin keeps its own slimmed copy:
 
-| Pending plugin | Will contain | Source files awaiting move |
-|---|---|---|
-| `secrets-vault` | AES-256-GCM at-rest store, `deposit_secret` tool, redaction hook | `secrets-store.ts`, `tools/deposit-secret.ts`, `hooks/secrets-redact.ts`, `secrets-store.test.ts` |
-| `approval-gate` | Browser URL approval gate, API approval gate, CAPTCHA forwarding | `browser-approvals.ts`, `api-approval-gate.ts`, `tools/forward-captcha.ts`, `browser-approvals.test.ts` |
-| `session-history` | JSONL session transcripts hooked at `llm_input`/`llm_output` | `history-logger.ts`, `sandbox-isolation.test.ts` |
-| `_shared/telegram` | Tiny shared helper used by reporting + approval-gate | `telegram.ts` |
+- `prompt-injection-reporting/src/telegram.ts` — `sendTelegramMessage` only (~30 LOC)
+- `secrets-vault/src/telegram.ts` — `sendTelegramMessage` only (~30 LOC)
+- `approval-gate/src/telegram.ts` — `sendTelegramMessage` + `sendTelegramPhoto` (~110 LOC)
 
-The cross-cutting `adversarial.test.ts` (22 tests) stays with `prompt-injection-reporting` since adversarial behavior is the security backstop this plugin tests end-to-end.
+The dead `editTelegramMessage` helper that the original bundle carried (never called anywhere) was dropped. If a real shared utility need emerges later, this is small enough to extract then.
 
 ## Planned plugins (not yet scaffolded)
 
