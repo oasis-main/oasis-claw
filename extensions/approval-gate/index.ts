@@ -5,19 +5,14 @@ import { createForwardCaptchaTool } from "./src/tools/forward-captcha.js";
 /**
  * Approval Gate plugin.
  *
- * What's currently wired:
- *   - forward_captcha agent tool (sends CAPTCHA images to operator via Telegram
- *     and waits for the human-typed solution)
+ * Wired:
+ *   - forward_captcha agent tool (Telegram photo send + operator reply)
  *
- * What ships as library code, awaiting core integration:
- *   - api-approval-gate.ts — utility functions for HTTP request approval policy
- *     (loadApiApprovalPolicy, checkApiApproval, requestApiApproval). These need
- *     to be invoked from openclaw's HTTP middleware layer; the integration point
- *     does not yet exist in vanilla upstream and tracks under oasis-x ORG-049.
- *   - browser-approvals.ts — documentation describing how to configure
- *     openclaw's existing exec approval infrastructure (approvals.exec.targets)
- *     to forward browser navigation requests to Telegram. No code wiring needed
- *     in the plugin; the configuration goes in ~/.openclaw/openclaw.json.
+ * Library code (awaiting core HTTP middleware integration):
+ *   - api-approval-gate.ts — HTTP request approval policy utility functions
+ *
+ * Browser navigation approvals are handled by upstream's approvals.exec
+ * infrastructure — no plugin code required, just config. See ./README.md.
  */
 
 const configSchema = z.object({

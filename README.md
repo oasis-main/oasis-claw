@@ -13,11 +13,33 @@ By keeping openclaw as a submodule and our plugins as first-class code in this r
 - Our plugins ship as standard npm packages on top of any compatible openclaw release
 - The container-native deployment story is cleaner: `FROM openclaw:vX.Y.Z` + `pnpm add @oasis/hyperclaw-security`
 
+## Upstream pin
+
+`vendor/openclaw/` is pinned to **`v2026.4.26`** (commit `be8c24633a`). The pin is deliberate: we bump it on a schedule, never automatically, so we control when upstream changes land.
+
+### Bumping the openclaw pin
+
+```sh
+cd vendor/openclaw
+git fetch --tags
+git checkout v2026.X.Y          # whatever the new stable tag is
+cd ../..
+git add vendor/openclaw .gitmodules
+git commit -m "chore: bump openclaw to v2026.X.Y"
+```
+
+Before bumping, audit the upstream changelog at `vendor/openclaw/CHANGELOG.md` for changes that affect:
+
+- Plugin SDK surface (`packages/plugin-sdk/`, `src/plugins/hook-types.ts`) — would require updates to our plugins' `register()` signatures
+- `src/security/external-content.ts` — adjacent to our `prompt-injection-reporting`
+- `src/infra/approval-handler-*` — what `approval-gate` re-exports as library code targets
+- Any new extensions that overlap with what we ship; prune ours if upstream is now better
+
 ## Layout
 
 ```
 oasis-claw/
-  vendor/openclaw/             # git submodule, pinned to upstream tag
+  vendor/openclaw/             # git submodule, pinned to v2026.4.26
   extensions/
     prompt-injection-reporting/  # report_injection tool + signed attack log + Telegram alert
     secrets-vault/               # AES-256-GCM at-rest store + deposit_secret + redaction hook
@@ -61,7 +83,8 @@ Human-in-the-loop approval surface. Currently wired:
 Library code awaiting core integration (re-exported from the plugin entry):
 
 - `loadApiApprovalPolicy`, `checkApiApproval`, `requestApiApproval`, `handlePotentialApiApprovalResponse` — utility functions for HTTP request approval policy. These need to be invoked from openclaw's HTTP middleware layer; that integration point doesn't yet exist in vanilla upstream.
-- `browser-approvals.ts` — documentation describing how to configure openclaw's existing `approvals.exec` infrastructure to forward browser navigation requests to Telegram. No plugin code wiring needed; the configuration goes in `~/.openclaw/openclaw.json`.
+
+Browser navigation approvals are handled entirely by upstream's `approvals.exec` infrastructure — no plugin code is required, just configuration. See [`extensions/approval-gate/README.md`](./extensions/approval-gate/README.md) for the config recipe.
 
 ### `extensions/session-history`
 
@@ -83,6 +106,21 @@ Each plugin reads its own block under `plugins.entries` in `~/.openclaw/openclaw
   }
 }
 ```
+
+### Upstream features we deliberately do not duplicate
+
+These exist in `vendor/openclaw/` and we use them rather than reimplementing:
+
+| Upstream | What it does | Our relationship |
+|---|---|---|
+| `src/infra/approval-handler-*` | Generic exec-approval routing (Telegram, Discord, Slack delivery channels) | `approval-gate` configures it via `approvals.exec`; previously had a stub `browser-approvals.ts` here that has been pruned |
+| `src/security/external-content.ts` `SUSPICIOUS_PATTERNS` | Regex-based prompt injection detection on inbound external content (emails, web pages) | Complementary to our `prompt-injection-reporting` (voluntary agent self-report); both run simultaneously |
+| `extensions/active-memory/` | Bounded blocking memory sub-agent that injects relevant memory into prompt context before reply | Adjacent to the planned `dot-swarm` plugin (which targets static `.swarm/` file injection rather than sub-agent memory recall) |
+| `extensions/memory-core/`, `memory-lancedb/`, `memory-wiki/` | Pluggable memory backends keyed by `kind: "memory"` | The planned `dot-swarm` will register as `kind: "memory"` peer to these |
+| `extensions/diagnostics-otel/` | OpenTelemetry diagnostics export | Complementary to our `session-history` JSONL writer; can run together |
+| `extensions/telegram/` | Full Telegram channel plugin (user conversations) | Different use case from our slim `telegram.ts` HTTP wrappers (operator alerts only) |
+
+If upstream ships something that subsumes one of our extensions, prune ours when bumping the pin.
 
 ### A note on `telegram.ts` duplication
 

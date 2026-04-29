@@ -1,3 +1,6 @@
 [submodule "vendor/openclaw"]
 	path = vendor/openclaw
 	url = https://github.com/openclaw/openclaw.git
+	# Pinned to v2026.4.26 (commit be8c24633a). Bump deliberately by checking
+	# out a new tag in vendor/openclaw and committing the submodule pointer.
+	# See README.md "Bumping the openclaw pin" for the procedure.
