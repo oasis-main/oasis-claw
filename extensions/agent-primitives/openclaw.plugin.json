@@ -1,0 +1,19 @@
+{
+  "id": "agent-primitives",
+  "name": "Agent Primitives",
+  "description": "Three lifecycle tools the agent can call: sleep (yield for delayed re-invocation), dream (consolidate trail.log → memory.md), compact (graceful handoff at context-ceiling). All three write coordination state into a .swarm/ directory; full host-integration (e.g., scheduler-driven re-invocation for sleep, fresh-context restart for compact) is intentionally out of scope for the plugin and tracked under oasis-x ORG-050.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "swarmDir": {
+        "type": "string",
+        "description": "Directory for .swarm/ trail + state writes. Default: $PWD/.swarm if it exists, else ~/.openclaw/.swarm"
+      },
+      "historyDir": {
+        "type": "string",
+        "description": "Directory containing recent session JSONL transcripts that dream() will summarize. Default: ~/.openclaw/logs/history"
+      }
+    }
+  }
+}

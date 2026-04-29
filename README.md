@@ -43,8 +43,10 @@ oasis-claw/
   extensions/
     prompt-injection-reporting/  # report_injection tool + signed attack log + Telegram alert
     secrets-vault/               # AES-256-GCM at-rest store + deposit_secret + redaction hook
-    approval-gate/               # forward_captcha tool + API/browser approval library code
+    approval-gate/               # forward_captcha tool + API approval library code
     session-history/             # append-only JSONL transcripts + sandbox-isolation invariants
+    dot-swarm/                   # memory prompt supplement: injects .swarm/ files into context
+    agent-primitives/            # sleep / dream / compact lifecycle tools (stubs, FS side wired)
   archive/
     hyperclaw-fork-patches/    # the 7 commits from the deprecated fork, kept as patches
                                # for historical reference
@@ -132,12 +134,57 @@ Three plugins talk to the Telegram Bot API. Rather than carrying a `_shared/tele
 
 The dead `editTelegramMessage` helper that the original bundle carried (never called anywhere) was dropped. If a real shared utility need emerges later, this is small enough to extract then.
 
-## Planned plugins (not yet scaffolded)
+### `extensions/dot-swarm`
 
-| Plugin | Purpose | Tracked as |
+Memory prompt supplement that injects the contents of `.swarm/state.md`, `.swarm/queue.md`, and any other configured peer files into the agent's memory section at session start. Registers via `api.registerMemoryPromptSupplement` — **non-exclusive**, so it coexists cleanly with `memory-core`, `memory-lancedb`, `memory-wiki`, and `active-memory` rather than competing for the `kind: "memory"` slot.
+
+Also registers a `swarm_read` agent tool for explicit mid-session re-reads (when stigmergic state has been updated by a sibling agent or the operator).
+
+Configuration:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "dot-swarm": {
+        "swarmDir": "/path/to/repo/.swarm",
+        "includeFiles": ["state.md", "queue.md", "memory.md"],
+        "maxBytes": 32768,
+        "registerSwarmReadTool": true
+      }
+    }
+  }
+}
+```
+
+If `swarmDir` is omitted, the plugin probes `$PWD/.swarm` first and falls back to `~/.openclaw/.swarm`. Tracks under oasis-x ORG-030.
+
+### `extensions/agent-primitives`
+
+The three lifecycle tools — `sleep`, `dream`, `compact` — each tool-call shaped (no core loop changes required). Current state: filesystem-side fully wired, host integration is a stub.
+
+| Tool | What the stub does | Host-integration TODO (ORG-050) |
 |---|---|---|
-| `dot-swarm` | Register as `kind: "memory"` backend; injects `.swarm/state.md` + `queue.md` into session context, enabling stigmergic coordination across sessions and instances | oasis-x ORG-030 |
-| `agent-primitives` | `sleep` / `dream` / `compact` tools — the three lifecycle primitives. All tool-call shaped, no core loop changes required. `sleep` yields for delayed re-invocation; `dream` consolidates trail.log into memory.md; `compact` performs context-ceiling handoff via state snapshot | oasis-x ORG-050 |
+| `sleep(reason, resumeAfterMs)` | Writes a SLEEP event to `.swarm/trail.log`, returns the scheduled `resumeAt` | Pause the agent loop and schedule re-invocation via cron / systemd-timer |
+| `dream(topic?, maxFiles?)` | Reads recent JSONL session files from `historyDir`, appends a DREAM section to `.swarm/memory.md` with file/byte counts | Sub-agent invocation that actually distills transcripts into prose |
+| `compact(handoffNote, sessionTag?)` | Appends a HANDOFF section to `.swarm/state.md`, writes a COMPACT event | Signal harness to finish the turn and start a fresh session — once dot-swarm is enabled, the new session reads state.md back automatically |
+
+The split is deliberate: agent-primitives owns the *content* of each lifecycle event (what gets written where), and host integration owns the *lifecycle* (when to actually pause/restart). This matches Claude Code's compact pattern — the tool emits the snapshot, the harness handles the reset. Tracks under oasis-x ORG-050.
+
+Configuration:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "agent-primitives": {
+        "swarmDir": "/path/to/repo/.swarm",
+        "historyDir": "~/.openclaw/logs/history"
+      }
+    }
+  }
+}
+```
 
 ## Architecture: agent lifecycle as tools, not core changes
 

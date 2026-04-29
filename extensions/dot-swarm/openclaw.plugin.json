@@ -1,0 +1,28 @@
+{
+  "id": "dot-swarm",
+  "name": "Dot-Swarm",
+  "description": "Memory prompt supplement that injects .swarm/state.md + queue.md (and any configured peer files) into the agent's memory section. Coexists with memory-core / memory-lancedb / active-memory rather than replacing them — registers via registerMemoryPromptSupplement, not as a kind:\"memory\" backend.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "swarmDir": {
+        "type": "string",
+        "description": "Directory containing .swarm/ trail files. Default: $PWD/.swarm if it exists, else ~/.openclaw/.swarm"
+      },
+      "includeFiles": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Files within swarmDir to inject into the memory prompt (default: [\"state.md\", \"queue.md\"])"
+      },
+      "maxBytes": {
+        "type": "number",
+        "description": "Total byte cap across all injected files. Default 32768. If exceeded, files are truncated with a marker."
+      },
+      "registerSwarmReadTool": {
+        "type": "boolean",
+        "description": "If true, also register a swarm_read agent tool so the agent can re-read files mid-session (default: true)"
+      }
+    }
+  }
+}
