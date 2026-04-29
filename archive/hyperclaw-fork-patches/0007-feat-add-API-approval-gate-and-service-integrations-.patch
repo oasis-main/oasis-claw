@@ -1,0 +1,375 @@
+From 65a324b69de6416eab58f9491bba5ce05273a878 Mon Sep 17 00:00:00 2001
+From: Mike <leemichael289@gmail.com>
+Date: Sun, 22 Feb 2026 12:39:16 -0500
+Subject: [PATCH 7/7] feat: add API approval gate and service integrations
+ config
+
+- extensions/hyperclaw-security/src/api-approval-gate.ts: HTTP request approval policy
+- config/services.json.example: Service integrations (Stripe, Gmail, Coda, Amazon, etc.)
+---
+ config/services.json.example                  | 105 ++++++++
+ .../src/api-approval-gate.ts                  | 240 ++++++++++++++++++
+ 2 files changed, 345 insertions(+)
+ create mode 100644 config/services.json.example
+ create mode 100644 extensions/hyperclaw-security/src/api-approval-gate.ts
+
+diff --git a/config/services.json.example b/config/services.json.example
+new file mode 100644
+index 0000000000..d09307145b
+--- /dev/null
++++ b/config/services.json.example
+@@ -0,0 +1,105 @@
++{
++  "$schema": "https://hyperclaw.local/schema/services.json",
++  "version": 1,
++  "description": "Service integrations for Hyperclaw - credentials stored in secrets vault",
++
++  "services": {
++    "stripe": {
++      "enabled": true,
++      "secretKey": "STRIPE_SECRET_KEY",
++      "description": "Stripe payment processing",
++      "scopes": ["read", "write"],
++      "approvalRequired": ["charges", "refunds", "subscriptions"]
++    },
++
++    "gmail": {
++      "enabled": true,
++      "oauth": {
++        "clientId": "GMAIL_CLIENT_ID",
++        "clientSecret": "GMAIL_CLIENT_SECRET",
++        "refreshToken": "GMAIL_REFRESH_TOKEN"
++      },
++      "description": "Gmail API for reading/sending emails",
++      "scopes": ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.send"],
++      "approvalRequired": ["send", "delete", "modify"]
++    },
++
++    "google_drive": {
++      "enabled": true,
++      "oauth": {
++        "clientId": "GOOGLE_DRIVE_CLIENT_ID",
++        "clientSecret": "GOOGLE_DRIVE_CLIENT_SECRET",
++        "refreshToken": "GOOGLE_DRIVE_REFRESH_TOKEN"
++      },
++      "description": "Google Drive for file management",
++      "scopes": ["https://www.googleapis.com/auth/drive"],
++      "approvalRequired": ["create", "update", "delete", "share"]
++    },
++
++    "coda": {
++      "enabled": true,
++      "apiToken": "CODA_API_TOKEN",
++      "description": "Coda docs and tables",
++      "approvalRequired": ["create", "update", "delete"]
++    },
++
++    "amazon_merchant": {
++      "enabled": true,
++      "credentials": {
++        "sellerId": "AMAZON_SELLER_ID",
++        "mwsAuthToken": "AMAZON_MWS_AUTH_TOKEN",
++        "accessKeyId": "AMAZON_ACCESS_KEY_ID",
++        "secretAccessKey": "AMAZON_SECRET_ACCESS_KEY"
++      },
++      "description": "Amazon Seller Central / SP-API",
++      "region": "na",
++      "approvalRequired": ["orders", "inventory", "pricing", "feeds"]
++    },
++
++    "aliexpress": {
++      "enabled": true,
++      "credentials": {
++        "appKey": "ALIEXPRESS_APP_KEY",
++        "appSecret": "ALIEXPRESS_APP_SECRET",
++        "accessToken": "ALIEXPRESS_ACCESS_TOKEN"
++      },
++      "description": "AliExpress dropshipping API",
++      "approvalRequired": ["orders", "products"]
++    },
++
++    "alibaba": {
++      "enabled": true,
++      "credentials": {
++        "appKey": "ALIBABA_APP_KEY",
++        "appSecret": "ALIBABA_APP_SECRET"
++      },
++      "description": "Alibaba.com B2B API",
++      "approvalRequired": ["orders", "inquiries", "rfq"]
++    },
++
++    "ebay": {
++      "enabled": true,
++      "oauth": {
++        "clientId": "EBAY_CLIENT_ID",
++        "clientSecret": "EBAY_CLIENT_SECRET",
++        "refreshToken": "EBAY_REFRESH_TOKEN"
++      },
++      "description": "eBay selling API",
++      "sandbox": false,
++      "approvalRequired": ["listings", "orders", "offers"]
++    },
++
++    "gemini_cli": {
++      "enabled": true,
++      "apiKey": "GEMINI_API_KEY",
++      "description": "Google Gemini CLI for AI tasks",
++      "model": "gemini-2.0-flash"
++    }
++  },
++
++  "notes": {
++    "credential_storage": "All credential values above are SECRET NAMES, not actual values. Store actual credentials using: openclaw secrets set <SECRET_NAME> <value>",
++    "oauth_setup": "For OAuth services (Gmail, Google Drive, eBay), run the OAuth flow first to obtain refresh tokens",
++    "approval_flow": "Actions listed in approvalRequired will trigger Telegram approval requests"
++  }
++}
+diff --git a/extensions/hyperclaw-security/src/api-approval-gate.ts b/extensions/hyperclaw-security/src/api-approval-gate.ts
+new file mode 100644
+index 0000000000..3648774fe1
+--- /dev/null
++++ b/extensions/hyperclaw-security/src/api-approval-gate.ts
+@@ -0,0 +1,240 @@
++/**
++ * API Request Approval Gate
++ *
++ * Intercepts outbound HTTP requests from agent tools and enforces approval
++ * policies for mutating requests (POST, PUT, PATCH, DELETE).
++ *
++ * Policy levels:
++ * 1. Denylist: Block requests to dangerous/private hosts
++ * 2. Allowlist: Pre-approved services for GET requests
++ * 3. Approval required: All mutations need human approval via Telegram
++ */
++
++import fs from "node:fs";
++import path from "node:path";
++import { sendTelegramMessage } from "./telegram.js";
++
++export type ApiApprovalPolicy = {
++  defaultPolicy: "allow" | "deny";
++  approvalRequired: {
++    methods: string[];
++    description: string;
++  };
++  allowlist: Array<{
++    host: string;
++    methods: string[];
++    paths?: string[];
++    reason: string;
++  }>;
++  denylist: Array<{
++    pattern: string;
++    reason: string;
++  }>;
++  serviceAllowlist: Record<
++    string,
++    {
++      hosts: string[];
++      methods: string[];
++      mutationApproval: boolean;
++      description: string;
++    }
++  >;
++};
++
++export type ApiApprovalConfig = {
++  policyFile: string;
++  telegramBotToken: string;
++  telegramChatId: string;
++  timeoutSeconds?: number;
++};
++
++export type ApiApprovalDecision = {
++  allowed: boolean;
++  reason: string;
++  requiresApproval: boolean;
++  service?: string;
++};
++
++// Pending approval requests
++const pendingApprovals = new Map<
++  string,
++  {
++    resolve: (approved: boolean) => void;
++    timeout: ReturnType<typeof setTimeout>;
++  }
++>();
++
++export function loadApiApprovalPolicy(policyFile: string): ApiApprovalPolicy | null {
++  try {
++    const content = fs.readFileSync(policyFile, "utf8");
++    return JSON.parse(content) as ApiApprovalPolicy;
++  } catch {
++    return null;
++  }
++}
++
++function matchPattern(host: string, pattern: string): boolean {
++  if (pattern.startsWith("*.")) {
++    const suffix = pattern.slice(1);
++    return host.endsWith(suffix) || host === pattern.slice(2);
++  }
++  if (pattern.includes("*")) {
++    const regex = new RegExp("^" + pattern.replace(/\*/g, ".*") + "$");
++    return regex.test(host);
++  }
++  return host === pattern;
++}
++
++export function checkApiApproval(
++  policy: ApiApprovalPolicy,
++  method: string,
++  url: string,
++): ApiApprovalDecision {
++  const upperMethod = method.toUpperCase();
++
++  let parsedUrl: URL;
++  try {
++    parsedUrl = new URL(url);
++  } catch {
++    return {
++      allowed: false,
++      reason: "Invalid URL",
++      requiresApproval: false,
++    };
++  }
++
++  const host = parsedUrl.hostname;
++  const pathname = parsedUrl.pathname;
++
++  // Check denylist first
++  for (const entry of policy.denylist) {
++    if (matchPattern(host, entry.pattern)) {
++      return {
++        allowed: false,
++        reason: `Blocked: ${entry.reason}`,
++        requiresApproval: false,
++      };
++    }
++  }
++
++  // Check service allowlist
++  for (const [serviceName, service] of Object.entries(policy.serviceAllowlist)) {
++    const hostMatches = service.hosts.some((h) => matchPattern(host, h));
++    if (hostMatches) {
++      const methodAllowed = service.methods.includes(upperMethod);
++      if (methodAllowed) {
++        return {
++          allowed: true,
++          reason: `Pre-approved: ${service.description}`,
++          requiresApproval: false,
++          service: serviceName,
++        };
++      }
++      // Mutation on known service
++      if (service.mutationApproval) {
++        return {
++          allowed: false,
++          reason: `Mutation requires approval: ${service.description}`,
++          requiresApproval: true,
++          service: serviceName,
++        };
++      }
++    }
++  }
++
++  // Check explicit allowlist
++  for (const entry of policy.allowlist) {
++    if (host === entry.host && entry.methods.includes(upperMethod)) {
++      if (!entry.paths || entry.paths.some((p) => pathname.startsWith(p))) {
++        return {
++          allowed: true,
++          reason: `Allowlisted: ${entry.reason}`,
++          requiresApproval: false,
++        };
++      }
++    }
++  }
++
++  // Check if method requires approval
++  if (policy.approvalRequired.methods.includes(upperMethod)) {
++    return {
++      allowed: false,
++      reason: policy.approvalRequired.description,
++      requiresApproval: true,
++    };
++  }
++
++  // Default policy
++  if (policy.defaultPolicy === "deny") {
++    return {
++      allowed: false,
++      reason: "Default policy: deny",
++      requiresApproval: true,
++    };
++  }
++
++  return {
++    allowed: true,
++    reason: "Default policy: allow",
++    requiresApproval: false,
++  };
++}
++
++export async function requestApiApproval(
++  config: ApiApprovalConfig,
++  method: string,
++  url: string,
++  context: string,
++): Promise<boolean> {
++  const requestId = `api_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
++  const timeoutMs = (config.timeoutSeconds ?? 300) * 1000;
++
++  const message = [
++    `🌐 **API Request Approval**`,
++    ``,
++    `**Method:** ${method.toUpperCase()}`,
++    `**URL:** ${url}`,
++    `**Context:** ${context}`,
++    ``,
++    `Reply "approve" or "deny"`,
++    `Request ID: \`${requestId}\``,
++  ].join("\n");
++
++  await sendTelegramMessage({
++    botToken: config.telegramBotToken,
++    chatId: config.telegramChatId,
++    text: message,
++    parseMode: "Markdown",
++  });
++
++  return new Promise<boolean>((resolve) => {
++    const timeout = setTimeout(() => {
++      pendingApprovals.delete(requestId);
++      resolve(false);
++    }, timeoutMs);
++
++    pendingApprovals.set(requestId, { resolve, timeout });
++  });
++}
++
++export function handlePotentialApiApprovalResponse(messageText: string): boolean {
++  const match = messageText.match(/api_\w+/i);
++  if (!match) {
++    return false;
++  }
++
++  const requestId = match[0].toLowerCase();
++  const pending = pendingApprovals.get(requestId);
++  if (!pending) {
++    return false;
++  }
++
++  const lowerText = messageText.toLowerCase();
++  const approved = lowerText.includes("approve") || lowerText.includes("yes");
++
++  clearTimeout(pending.timeout);
++  pendingApprovals.delete(requestId);
++  pending.resolve(approved);
++
++  return true;
++}
+-- 
+2.53.0
+

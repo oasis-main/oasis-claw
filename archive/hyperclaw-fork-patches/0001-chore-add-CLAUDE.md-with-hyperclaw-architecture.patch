@@ -1,0 +1,109 @@
+From a07ba95c8b308dfead76c5358f341c50d3924430 Mon Sep 17 00:00:00 2001
+From: Mike <leemichael289@gmail.com>
+Date: Fri, 20 Feb 2026 19:06:15 -0500
+Subject: [PATCH 1/7] chore: add CLAUDE.md with hyperclaw architecture
+
+Documents the fork relationship, branch strategy, plugin layout,
+and inspiration from panasonic chat_api patterns.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ CLAUDE.md | 80 ++++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 79 insertions(+), 1 deletion(-)
+ mode change 120000 => 100644 CLAUDE.md
+
+diff --git a/CLAUDE.md b/CLAUDE.md
+deleted file mode 120000
+index c317064255..0000000000
+--- a/CLAUDE.md
++++ /dev/null
+@@ -1 +0,0 @@
+-AGENTS.md
+diff --git a/CLAUDE.md b/CLAUDE.md
+new file mode 100644
+index 0000000000..c334853884
+--- /dev/null
++++ b/CLAUDE.md
+@@ -0,0 +1,79 @@
++# Hyperclaw
++
++Security-hardened fork of [openclaw](https://github.com/openclaw/openclaw) for personal use on a sandboxed Docker work machine.
++
++## Repo layout
++
++```
++origin  → https://github.com/MikeHLee/hyperclaw   (private, our work)
++upstream → https://github.com/openclaw/openclaw    (track for upstream merges)
++
++Branches:
++  main               — stable base, mirrors upstream main
++  upstream-sync      — landing branch for upstream merges, PR → main
++  hyperclaw-security — all our additions, PR → main
++```
++
++To pull upstream changes:
++```bash
++git fetch upstream
++git checkout upstream-sync
++git merge upstream/main
++# resolve conflicts, then open PR → main
++```
++
++## What hyperclaw adds (the `hyperclaw-security` plugin + core patch)
++
++All additions live in `extensions/hyperclaw-security/` **except** one core file patch.
++
++### Core patch (one file)
++- `src/agents/tools/browser-tool.ts` — adds pre-navigate approval gate (mirrors exec approval pattern) at the `navigate` action (~line 614).
++
++### Plugin: `extensions/hyperclaw-security/`
++| Module | Purpose |
++|---|---|
++| `browser-approvals.ts` | URL allowlist + Telegram inline-button approval (mirrors exec-approvals.json format) |
++| `history-logger.ts` | Full agent session log → `~/.openclaw/logs/history/YYYY/MM/DD/<session>.jsonl` |
++| `attack-logger.ts` | Incident stream → `~/.openclaw/logs/attacks/YYYY/MM/DD/<incident>.json` + Telegram alert |
++| `secrets-store.ts` | AES-256-GCM encrypted local vault in `~/.openclaw/state/secrets/` |
++| `tools/report-injection.ts` | Agent self-report tool (inspired by panasonic chat_api `report_user` pattern) |
++| `tools/deposit-secret.ts` | Secrets injection into browser forms — never returns secret to model |
++| `hooks/secrets-redact.ts` | `tool_result_persist` hook — belt-and-suspenders redaction before history write |
++
++### Plugin hook points used
++- `before_prompt_build` — injects security hardening into system prompt
++- `llm_input` / `llm_output` — history logger
++- `before_tool_call` / `after_tool_call` — history logger + attack heuristics
++- `tool_result_persist` — secrets redaction
++- `session_start` / `session_end` — session boundary markers in logs
++
++### Config (in `~/.openclaw/openclaw.json`)
++```json
++{
++  "plugins": {
++    "entries": {
++      "hyperclaw-security": {
++        "enabled": true,
++        "telegramAlertChatId": "<your-chat-id>",
++        "secretsKeyDerivation": "gateway-token"
++      }
++    }
++  }
++}
++```
++
++### Approval files
++- `~/.openclaw/exec-approvals.json` — shell command allowlist (existing openclaw)
++- `~/.openclaw/browser-approvals.json` — URL allowlist (hyperclaw addition, same format)
++
++## Inspiration
++- Panasonic chat_api (`~/Documents/Runes/panasonic/sft/dae_pipelines/prod/ecs/chat_api/v1/`):
++  - `report_user` tool → model self-reports detected attacks
++  - `session_logs.py` → dual-stream logging (sessions + incidents)
++  - `agent_loop.py` → tool interception pattern
++
++## Security notes
++- The `deposit_secret` tool NEVER returns the secret value to the model
++- `tool_result_persist` provides belt-and-suspenders redaction of known secret patterns
++- Secrets vault key is PBKDF2-derived from the gateway token (change gateway token = rotate encryption key)
++- Attack logs are write-only from the agent's perspective — the model cannot read them back
+-- 
+2.53.0
+
