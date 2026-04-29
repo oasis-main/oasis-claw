@@ -1,11 +1,10 @@
 /**
  * Minimal Telegram Bot API client — text-message send only.
- * Used by prompt-injection-reporting to alert the operator when the agent
- * reports a detected injection attempt.
+ * Used by secrets-vault to confirm deposits to the operator chat.
  *
- * The full client (with inline keyboards, photo upload) lives in the
- * approval-gate plugin; this slim copy avoids cross-plugin imports for
- * what is otherwise stable, low-LOC HTTP boilerplate.
+ * The full client (with inline keyboards, message editing, photo upload)
+ * lives in the approval-gate plugin; this slim copy avoids cross-plugin
+ * imports for what is otherwise stable, low-LOC HTTP boilerplate.
  */
 
 export type TelegramSendOpts = {
