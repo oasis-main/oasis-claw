@@ -19,8 +19,9 @@ By keeping openclaw as a submodule and our plugins as first-class code in this r
 oasis-claw/
   vendor/openclaw/             # git submodule, pinned to upstream tag
   extensions/
-    hyperclaw-security/        # browser approval gate, secrets vault, attack logger,
-                               # adversarial injection test suite (73 tests)
+    prompt-injection-reporting/  # report_injection tool + attack logger + Telegram alert
+                                 # (other source files in src/ are pending Stage-2 relocation
+                                 # into secrets-vault, approval-gate, session-history)
   archive/
     hyperclaw-fork-patches/    # the 7 commits from the deprecated fork, kept as patches
                                # for historical reference
@@ -30,15 +31,15 @@ oasis-claw/
 
 ## Plugins
 
-### `extensions/hyperclaw-security`
+The deprecated fork bundled five concerns into one `hyperclaw-security` plugin. The plan is to decompose into focused single-responsibility plugins. Stage 1 (rename + narrow) is done; Stages 2–4 are tracked under oasis-x ORG-049.
 
-The plugin extracted from the deprecated fork. Provides:
+### `extensions/prompt-injection-reporting` *(active — narrowed in Stage 1)*
 
-- **Browser URL approval gate** — Telegram-mediated human approval before navigation to non-allowlisted hosts
-- **Encrypted secrets vault** — AES-256-GCM at-rest store with `deposit_secret` tool and automatic redaction in session history
-- **Attack logger** — `report_injection` tool the model calls when it detects a prompt-injection attempt; writes signed JSONL to disk and alerts via Telegram
-- **History logger** — JSONL session transcripts hooked at `llm_input`/`llm_output` events
-- **Adversarial test suite** — 73 unit tests covering secrets store, sandbox isolation, browser approvals, and adversarial inputs
+Agent-callable `report_injection` tool — the model invokes it when it detects what it believes is a prompt-injection attempt in its input. The plugin:
+
+- Appends a signed JSONL entry to the attack log (`~/.openclaw/logs/attacks/`)
+- Emits a Telegram alert to the operator chat (if configured)
+- Returns acknowledgement to the model so it can continue with hardened behavior
 
 Configuration via `~/.openclaw/openclaw.json`:
 
@@ -46,22 +47,35 @@ Configuration via `~/.openclaw/openclaw.json`:
 {
   "plugins": {
     "entries": {
-      "hyperclaw-security": {
+      "prompt-injection-reporting": {
         "telegramBotToken": "...",
         "telegramAlertChatId": "...",
-        "secretsDir": "~/.openclaw/state/secrets"
+        "attackLogDir": "~/.openclaw/logs/attacks"
       }
     }
   }
 }
 ```
 
-## Planned plugins
+### Pending decomposition (Stage 2 of ORG-049)
 
-| Plugin | Purpose | Status |
+The current `prompt-injection-reporting/src/` directory still contains source files that belong to other plugins. They are kept colocated (and unwired from the narrowed `register()`) until they're relocated into their own packages.
+
+| Pending plugin | Will contain | Source files awaiting move |
 |---|---|---|
-| `dot-swarm` | Register as `kind: "memory"` backend; injects `.swarm/state.md` + `queue.md` into session context, enabling stigmergic coordination across sessions and instances | Planned (oasis-x ORG-030) |
-| `agent-primitives` | `sleep` / `dream` / `compact` tools — the three lifecycle primitives. All tool-call shaped, no core loop changes required. `sleep` yields for delayed re-invocation; `dream` consolidates trail.log into memory.md; `compact` performs context-ceiling handoff via state snapshot | Planned (oasis-x ORG-050) |
+| `secrets-vault` | AES-256-GCM at-rest store, `deposit_secret` tool, redaction hook | `secrets-store.ts`, `tools/deposit-secret.ts`, `hooks/secrets-redact.ts`, `secrets-store.test.ts` |
+| `approval-gate` | Browser URL approval gate, API approval gate, CAPTCHA forwarding | `browser-approvals.ts`, `api-approval-gate.ts`, `tools/forward-captcha.ts`, `browser-approvals.test.ts` |
+| `session-history` | JSONL session transcripts hooked at `llm_input`/`llm_output` | `history-logger.ts`, `sandbox-isolation.test.ts` |
+| `_shared/telegram` | Tiny shared helper used by reporting + approval-gate | `telegram.ts` |
+
+The cross-cutting `adversarial.test.ts` (22 tests) stays with `prompt-injection-reporting` since adversarial behavior is the security backstop this plugin tests end-to-end.
+
+## Planned plugins (not yet scaffolded)
+
+| Plugin | Purpose | Tracked as |
+|---|---|---|
+| `dot-swarm` | Register as `kind: "memory"` backend; injects `.swarm/state.md` + `queue.md` into session context, enabling stigmergic coordination across sessions and instances | oasis-x ORG-030 |
+| `agent-primitives` | `sleep` / `dream` / `compact` tools — the three lifecycle primitives. All tool-call shaped, no core loop changes required. `sleep` yields for delayed re-invocation; `dream` consolidates trail.log into memory.md; `compact` performs context-ceiling handoff via state snapshot | oasis-x ORG-050 |
 
 ## Architecture: agent lifecycle as tools, not core changes
 
