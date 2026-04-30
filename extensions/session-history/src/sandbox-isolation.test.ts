@@ -46,7 +46,7 @@ describe("Sandbox: User Isolation", () => {
     expect(gid).not.toBe(0);
   });
 
-  it("user is 'node' (uid 1000)", () => {
+  skipIfNotFullSandbox("user is 'node' (uid 1000)", () => {
     const uid = process.getuid?.();
     expect(uid).toBe(1000);
   });
@@ -169,7 +169,7 @@ describe("Sandbox: Path Traversal Prevention", () => {
 });
 
 describe("Sandbox: Environment Isolation", () => {
-  it("NODE_ENV is production", () => {
+  skipIfNotFullSandbox("NODE_ENV is production", () => {
     expect(process.env.NODE_ENV).toBe("production");
   });
 

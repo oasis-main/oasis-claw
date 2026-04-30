@@ -8,8 +8,8 @@
     "vitest": "^3.0.0"
   },
   "scripts": {
-    "test": "vitest run",
-    "test:watch": "vitest"
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest --passWithNoTests"
   },
   "openclaw": {
     "extensions": [

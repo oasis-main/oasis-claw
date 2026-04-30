@@ -18,11 +18,44 @@
  *   })
  */
 
-import {
-  checkUrlAllowlist,
-  loadBrowserApprovals,
-} from "openclaw/src/infra/browser-approvals.js";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { SecretsStore } from "../secrets-store.js";
+
+// ---------------------------------------------------------------------------
+// Inlined browser-approvals helpers
+// Previously imported from `openclaw/src/infra/browser-approvals.js`, which
+// was removed in upstream v2026.4. We inline the ~30 LOC we actually use.
+// ---------------------------------------------------------------------------
+
+type BrowserApprovalEntry = { pattern: string; type?: "prefix" | "exact" | "glob" };
+type BrowserApprovals = { entries?: BrowserApprovalEntry[] };
+
+function loadBrowserApprovals(): BrowserApprovals {
+  const configPath = path.join(os.homedir(), ".openclaw", "browser-approvals.json");
+  try {
+    const raw = fs.readFileSync(configPath, "utf8");
+    return JSON.parse(raw) as BrowserApprovals;
+  } catch {
+    return { entries: [] };
+  }
+}
+
+function checkUrlAllowlist(url: string, entries: BrowserApprovalEntry[]): boolean {
+  if (!entries.length) return false;
+  let hostname: string;
+  try {
+    hostname = new URL(url).hostname;
+  } catch {
+    return false;
+  }
+  return entries.some(({ pattern, type }) => {
+    if (type === "exact") return hostname === pattern;
+    // default: prefix match on hostname segments
+    return hostname === pattern || hostname.endsWith(`.${pattern}`);
+  });
+}
 import { sendTelegramMessage } from "../telegram.js";
 
 export type DepositSecretTool = {
