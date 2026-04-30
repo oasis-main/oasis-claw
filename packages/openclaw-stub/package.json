@@ -1,0 +1,12 @@
+{
+  "name": "openclaw",
+  "version": "2026.4.26",
+  "description": "Minimal type stub for openclaw plugin-sdk — used in the oasis-claw workspace so extensions can resolve types without installing the full upstream monorepo. The real openclaw lives at vendor/openclaw/ (pinned submodule).",
+  "type": "module",
+  "exports": {
+    "./plugin-sdk": {
+      "types": "./plugin-sdk/index.ts",
+      "default": "./plugin-sdk/index.js"
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "oasis-claw",
+  "version": "0.1.0",
+  "description": "oasis-claw — openclaw plugin-wrapper monorepo. Six security & agent-lifecycle extensions on top of vanilla openclaw (vendor/openclaw, pinned to v2026.4.26).",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "pnpm -r run test",
+    "test:watch": "pnpm -r run test:watch"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  }
+}
