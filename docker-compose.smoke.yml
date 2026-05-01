@@ -1,0 +1,29 @@
+##
+## oasis-claw plugin smoke test
+##
+## Usage:
+##   docker compose -f docker-compose.smoke.yml up --build --abort-on-container-exit
+##
+## Exit 0 = all 6 plugins loaded and registered correctly.
+## Exit 1 = at least one plugin threw during registration.
+##
+## The runner imports each plugin's TypeScript source directly via tsx — no
+## pre-compilation step. Extensions are bind-mounted read-only so edits on
+## the host are reflected immediately on re-run.
+##
+services:
+  smoke:
+    build:
+      context: .
+      dockerfile: Dockerfile.smoke
+    volumes:
+      # Bind-mount extensions read-only so local edits take effect on re-run
+      - ./extensions:/app/extensions:ro
+      # packages/openclaw-stub needed so workspace: * dep resolves inside container
+      - ./packages:/app/packages:ro
+    environment:
+      NODE_PATH: /usr/local/lib/node_modules
+      # Set to 1 to print full stack traces on failure
+      SMOKE_VERBOSE: ${SMOKE_VERBOSE:-0}
+    # No restart — run once, report result
+    restart: "no"
