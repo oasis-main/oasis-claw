@@ -9,23 +9,24 @@ export type CompactToolConfig = {
 /**
  * compact tool — graceful handoff at context-ceiling.
  *
- * What this stub does:
+ * FS-side (done):
  *   - Appends a HANDOFF section to .swarm/state.md with the agent-supplied
  *     handoff note + ISO timestamp
  *   - Writes a COMPACT event to .swarm/trail.log
  *   - Returns the snapshot path so the caller (or operator) can verify
  *
- * What full integration would add (TODO, ORG-050):
- *   - Signal the openclaw runtime to actually finish the current turn
- *     and start a fresh session with empty context
- *   - Auto-load the freshly-written state.md into the new session's memory
- *     (this happens automatically once dot-swarm is wired, since dot-swarm
- *     reads state.md as a memory prompt supplement)
+ * Host integration (done via SwarmCompactionProvider in compaction-provider.ts):
+ *   - api.registerCompactionProvider(createSwarmCompactionProvider({ swarmDir }))
+ *     is called in index.ts — this wires the openclaw compaction pipeline to read
+ *     from state.md instead of running default summarizeInStages()
+ *   - When openclaw's context limit triggers auto-compaction, it calls our provider
+ *     which serves back the latest HANDOFF section from state.md
+ *   - Remaining: explicit "finish this turn + start fresh session" signal when the
+ *     agent calls compact() proactively. Once dot-swarm is wired, the new session
+ *     picks up state.md automatically via registerMemoryPromptSupplement.
  *
- * The split is deliberate: agent-primitives owns the *content* of the
- * handoff (what to write where), and host integration owns the *lifecycle*
- * (when to actually reset). This matches how Claude Code's compact tool
- * works — the tool emits the snapshot, the harness handles the reset.
+ * The split is deliberate: agent-primitives owns the *content* of the handoff
+ * (what to write where), and host integration owns the *lifecycle* (when to reset).
  */
 export function createCompactTool(config: CompactToolConfig) {
   return {
