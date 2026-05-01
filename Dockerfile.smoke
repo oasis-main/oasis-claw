@@ -1,0 +1,32 @@
+# Smoke-test image for oasis-claw plugin suite.
+#
+# Uses the npm-published openclaw@2026.4.26 binary (same version as the
+# vendor/openclaw submodule) so we don't need to compile from source.
+# Extensions are bind-mounted at run time — no COPY needed.
+#
+# Build: docker build -f Dockerfile.smoke -t oasis-claw-smoke .
+# Run:   docker compose -f docker-compose.smoke.yml up --abort-on-container-exit
+
+FROM node:22-bookworm-slim
+
+# Install openclaw CLI at the exact pinned version
+RUN npm install -g openclaw@2026.4.26
+
+# tsx is needed to load our TypeScript plugin source directly
+# (openclaw loads plugins via dynamic import; tsx registers .ts transforms)
+RUN npm install -g tsx@4
+
+WORKDIR /app
+
+# Install production deps that plugins import at runtime.
+# NODE_PATH is CJS-only; for ESM, deps must live under /app/node_modules so
+# Node's package resolution walks up from /app/extensions/<name>/ and finds them.
+RUN npm install zod
+
+# smoke-runner.mjs is copied in (small, stable)
+COPY scripts/smoke-runner.mjs ./scripts/smoke-runner.mjs
+
+ENV HOME=/home/node
+ENV NODE_PATH=/usr/local/lib/node_modules
+
+ENTRYPOINT ["tsx", "scripts/smoke-runner.mjs"]
