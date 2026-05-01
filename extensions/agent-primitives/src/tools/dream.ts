@@ -1,5 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
+import {
+  distillEvents,
+  parseSessionFile,
+  renderDistillationAsMarkdown,
+} from "../jsonl-parser.js";
 import { appendTrailEvent } from "../trail.js";
 
 export type DreamToolConfig = {
@@ -8,29 +13,29 @@ export type DreamToolConfig = {
 };
 
 /**
- * dream tool — consolidate recent activity into long-term memory.
+ * dream tool — consolidate recent session activity into .swarm/memory.md.
  *
- * What this stub does:
- *   - Reads up to N most recent JSONL session files from historyDir
- *   - Appends a DREAM section to .swarm/memory.md with file count, byte
- *     count, and the user-supplied topic (no LLM-driven distillation)
- *   - Writes a DREAM event to trail.log
+ * FS-side (done):
+ *   - Scans historyDir for the N most-recently-modified .jsonl session files
+ *   - Parses each file: extracts tool calls, assistant text excerpts, token usage
+ *   - Renders a markdown distillation and appends it to .swarm/memory.md
+ *   - Writes a DREAM event to .swarm/trail.log
  *
- * What full integration would add (TODO, ORG-050):
- *   - Sub-agent invocation that actually summarizes the JSONL transcripts
- *     (e.g., dispatch to a dedicated low-context model)
- *   - Importance scoring (which entries are worth keeping vs. discarding)
- *   - Deduplication against existing memory.md entries
- *
- * The point of the stub is to verify the FS-side of the pipeline (history
- * is found, .swarm/ is writable, the trail and memory.md grow correctly)
- * without committing to a particular distillation strategy.
+ * Host integration (remaining, ORG-050):
+ *   - LLM-driven summarization: dispatch the JSONL to a low-context model for
+ *     higher-quality prose synthesis (currently we extract raw assistant text)
+ *   - Importance scoring: rank excerpts before writing
+ *   - Deduplication: skip sessions already present in memory.md
  */
 export function createDreamTool(config: DreamToolConfig) {
   return {
     name: "dream",
-    description:
-      "Consolidate recent session activity into .swarm/memory.md. Pass an optional topic to scope the consolidation. Use during low-activity intervals or before compact().",
+    description: [
+      "Consolidate recent session activity into .swarm/memory.md.",
+      "Parses session JSONL transcripts, extracts tool calls and assistant outputs,",
+      "and appends a structured distillation to memory.md.",
+      "Use during low-activity intervals or before compact() to capture what happened.",
+    ].join(" "),
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -47,14 +52,55 @@ export function createDreamTool(config: DreamToolConfig) {
         },
       },
     },
+
     async invoke(args: { topic?: string; maxFiles?: number }) {
       const maxFiles = args.maxFiles ?? 10;
-      const summary = collectHistorySummary(config.historyDir, maxFiles);
 
-      const memoryEntry = renderMemoryEntry(args.topic, summary);
+      // Scan historyDir for recent JSONL files
+      const recentFiles = collectRecentFiles(config.historyDir, maxFiles);
+
+      // Parse + distill each session
+      const distillations = recentFiles.map((filePath) => {
+        const events = parseSessionFile(filePath);
+        return distillEvents(events);
+      });
+
+      // Build memory.md entry
+      const ts = new Date().toISOString();
+      const topicLine = args.topic
+        ? `**Topic**: ${args.topic}`
+        : "**Topic**: (all recent sessions)";
+
+      const sections: string[] = [
+        "",
+        `## ${ts} — DREAM`,
+        "",
+        topicLine,
+        `- Sessions scanned: ${distillations.length}`,
+        `- Files found: ${recentFiles.length}`,
+        "",
+      ];
+
+      if (distillations.length === 0) {
+        sections.push("_No session files found in historyDir._");
+      } else {
+        distillations.forEach((d, i) => {
+          const label = d.sessionId ?? `session-${i + 1}`;
+          sections.push(`### ${label}`);
+          sections.push("");
+          sections.push(renderDistillationAsMarkdown(d));
+          sections.push("");
+        });
+      }
+
+      sections.push("---");
+      sections.push("");
+
+      const memoryEntry = sections.join("\n");
       const memoryPath = path.join(config.swarmDir, "memory.md");
       let memoryWritten = false;
       let memoryError: string | undefined;
+
       try {
         fs.mkdirSync(config.swarmDir, { recursive: true });
         fs.appendFileSync(memoryPath, memoryEntry, "utf8");
@@ -63,72 +109,54 @@ export function createDreamTool(config: DreamToolConfig) {
         memoryError = err instanceof Error ? err.message : String(err);
       }
 
+      const totalTokens = distillations.reduce((sum, d) => sum + d.tokensUsed, 0);
+      const totalToolCalls = distillations.reduce((sum, d) => sum + d.toolCalls.length, 0);
+
       const trail = appendTrailEvent(config.swarmDir, {
         kind: "DREAM",
         topic: args.topic ?? null,
-        filesScanned: summary.fileCount,
-        bytesScanned: summary.byteCount,
+        filesScanned: recentFiles.length,
+        sessionsDistilled: distillations.length,
+        totalTokens,
+        totalToolCalls,
         memoryWritten,
       });
 
       return {
         status: "consolidated",
         topic: args.topic ?? null,
-        filesScanned: summary.fileCount,
-        bytesScanned: summary.byteCount,
+        sessionsDistilled: distillations.length,
+        filesScanned: recentFiles.length,
+        totalTokens,
+        totalToolCalls,
         memoryPath,
         memoryWritten,
         memoryError,
         trailWritten: trail.written,
         hostIntegrationNote:
-          "This stub records that a dream happened and snapshots history sizes. It does NOT yet run a sub-agent to distill transcripts — wire that per oasis-x ORG-050.",
+          "dream uses deterministic JSONL extraction. LLM-driven distillation (richer prose summaries) is pending ORG-050.",
       };
     },
   };
 }
 
-function collectHistorySummary(
-  historyDir: string,
-  maxFiles: number,
-): { fileCount: number; byteCount: number; mostRecentPath?: string } {
-  if (!fs.existsSync(historyDir)) {
-    return { fileCount: 0, byteCount: 0 };
+function collectRecentFiles(historyDir: string, maxFiles: number): string[] {
+  if (!fs.existsSync(historyDir)) return [];
+  try {
+    return fs
+      .readdirSync(historyDir, { recursive: true, withFileTypes: true })
+      .filter((e) => e.isFile() && e.name.endsWith(".jsonl"))
+      .map((e) => {
+        // `e.path` (Node 20+) contains the directory; fall back to historyDir
+        const dir = (e as { path?: string }).path ?? historyDir;
+        const fullPath = path.join(dir, e.name);
+        const stat = fs.statSync(fullPath);
+        return { fullPath, mtimeMs: stat.mtimeMs };
+      })
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)
+      .slice(0, maxFiles)
+      .map((e) => e.fullPath);
+  } catch {
+    return [];
   }
-  const entries = fs
-    .readdirSync(historyDir, { withFileTypes: true })
-    .filter((e) => e.isFile() && e.name.endsWith(".jsonl"))
-    .map((e) => {
-      const fullPath = path.join(historyDir, e.name);
-      const stat = fs.statSync(fullPath);
-      return { fullPath, mtimeMs: stat.mtimeMs, size: stat.size };
-    })
-    .sort((a, b) => b.mtimeMs - a.mtimeMs)
-    .slice(0, maxFiles);
-
-  return {
-    fileCount: entries.length,
-    byteCount: entries.reduce((sum, e) => sum + e.size, 0),
-    mostRecentPath: entries[0]?.fullPath,
-  };
-}
-
-function renderMemoryEntry(
-  topic: string | undefined,
-  summary: { fileCount: number; byteCount: number; mostRecentPath?: string },
-): string {
-  const ts = new Date().toISOString();
-  const topicLine = topic ? `**Topic**: ${topic}` : "**Topic**: (no topic — global consolidation)";
-  return [
-    `\n## ${ts} — DREAM (agent-primitives stub)`,
-    "",
-    topicLine,
-    `- Files scanned: ${summary.fileCount}`,
-    `- Bytes scanned: ${summary.byteCount}`,
-    summary.mostRecentPath ? `- Most recent: ${summary.mostRecentPath}` : "",
-    "",
-    "_NB: this is a stub entry from agent-primitives — full LLM-driven distillation is pending ORG-050._",
-    "",
-  ]
-    .filter(Boolean)
-    .join("\n");
 }

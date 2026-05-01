@@ -1,32 +1,45 @@
+import { writeSleepSchedule } from "../schedule.js";
 import { appendTrailEvent } from "../trail.js";
 
 export type SleepToolConfig = {
   swarmDir: string;
+  /**
+   * Optional shell command template to suggest to the scheduler.
+   * Use {sessionId} as a placeholder. Default: "openclaw run --session {sessionId}"
+   */
+  resumeCommandTemplate?: string;
 };
 
 /**
  * sleep tool — agent voluntarily yields control for a configured duration.
  *
- * What this stub does:
- *   - Validates the requested duration
+ * FS-side (done):
+ *   - Validates + clamps the requested duration [60s, 1h]
  *   - Writes a SLEEP event to .swarm/trail.log
- *   - Returns immediately with the requested resumeAt timestamp
+ *   - Writes .swarm/sleep-schedule.json (machine-readable sidecar for host scheduler)
  *
- * What full host-integration would add (TODO, ORG-050):
- *   - Signal the openclaw runtime to actually pause the loop
- *   - Schedule a re-invocation at resumeAt via cron / systemd-timer / setTimeout
- *   - Provide a wake-reason channel so external events can resume earlier
- *
- * In its current form the tool is honest: it announces intent, persists it
- * to the trail, and lets the caller layer in the scheduler. The agent's
- * subsequent reasoning sees a well-formed return value rather than a stub
- * marker, which is what we want for testing the prompt path end-to-end.
+ * Host integration wiring (ORG-050):
+ *   - A sidecar process (cron / systemd-timer / Lambda EventBridge) polls
+ *     sleep-schedule.json and re-invokes the openclaw CLI session at `resumeAt`
+ *   - On wake: the scheduler deletes sleep-schedule.json, invokes openclaw,
+ *     and the agent reads the trail.log SLEEP entry to understand why it was woken
+ *   - Early resumption: Telegram callback or S3 inbox event can call
+ *     clearSleepSchedule() + re-invoke openclaw before resumeAt
  */
 export function createSleepTool(config: SleepToolConfig) {
+  const resumeCommandTemplate =
+    config.resumeCommandTemplate ?? "openclaw run --session {sessionId}";
+
   return {
     name: "sleep",
-    description:
-      "Voluntarily yield for the requested duration. Use when waiting on external state (Telegram approval, polling), rate-limit backoff, or any 'check back later' pattern. Returns the scheduled resume timestamp.",
+    description: [
+      "Voluntarily yield for the requested duration.",
+      "Use when waiting on external state (Telegram approval, polling), rate-limit backoff,",
+      "or any 'check back later' pattern.",
+      "Writes a machine-readable sleep-schedule.json that the host scheduler reads to",
+      "re-invoke this session at resumeAt.",
+      "Returns the scheduled resume timestamp.",
+    ].join(" "),
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -34,34 +47,63 @@ export function createSleepTool(config: SleepToolConfig) {
       properties: {
         reason: {
           type: "string",
-          description: "Short human-readable reason — appears in trail.log and the resume notification.",
+          description:
+            "Short human-readable reason — appears in trail.log, sleep-schedule.json, and the resume notification.",
         },
         resumeAfterMs: {
           type: "number",
           minimum: 60_000,
           maximum: 3_600_000,
           description:
-            "Milliseconds to sleep before resuming. Clamped to [60s, 1h] for safety; longer waits should use schedule-tasks.",
+            "Milliseconds to sleep before resuming. Clamped to [60 000, 3 600 000]. Longer waits should use schedule-tasks.",
+        },
+        sessionId: {
+          type: "string",
+          description:
+            "Optional current session identifier — included in sleep-schedule.json so the scheduler knows which session to resume.",
         },
       },
     },
-    async invoke(args: { reason: string; resumeAfterMs: number }) {
+
+    async invoke(args: { reason: string; resumeAfterMs: number; sessionId?: string }) {
       const clamped = Math.max(60_000, Math.min(3_600_000, args.resumeAfterMs));
+      const scheduledAt = new Date().toISOString();
       const resumeAt = new Date(Date.now() + clamped).toISOString();
+
+      // Write machine-readable sidecar for host scheduler
+      const suggestedResumeCommand = args.sessionId
+        ? resumeCommandTemplate.replace("{sessionId}", args.sessionId)
+        : undefined;
+
+      const schedule = writeSleepSchedule(config.swarmDir, {
+        kind: "SLEEP",
+        scheduledAt,
+        resumeAt,
+        resumeAfterMs: clamped,
+        reason: args.reason,
+        suggestedResumeCommand,
+      });
+
+      // Append trail event
       const trail = appendTrailEvent(config.swarmDir, {
         kind: "SLEEP",
         reason: args.reason,
         resumeAfterMs: clamped,
         resumeAt,
+        sessionId: args.sessionId ?? null,
+        scheduleWritten: schedule.written,
       });
+
       return {
         status: "yielded",
         resumeAt,
         clampedMs: clamped,
+        schedulePath: schedule.path,
+        scheduleWritten: schedule.written,
         trailWritten: trail.written,
         trailPath: trail.path,
         hostIntegrationNote:
-          "This stub does not actually pause the agent loop. Wire scheduler-driven re-invocation per oasis-x ORG-050 to make the yield real.",
+          "sleep-schedule.json written. Wire a host scheduler (cron/systemd/EventBridge) to poll this file and re-invoke openclaw at resumeAt. See oasis-x ORG-050.",
       };
     },
   };

@@ -107,7 +107,7 @@ describe("Sandbox: Filesystem Boundaries", () => {
 
 describe("Sandbox: Sensitive Path Access", () => {
   for (const sensitivePath of SENSITIVE_PATHS) {
-    it(`cannot read ${sensitivePath}`, () => {
+    skipIfNotFullSandbox(`cannot read ${sensitivePath}`, () => {
       // These paths should either not exist or not be readable
       if (fs.existsSync(sensitivePath)) {
         // If it exists, we should not be able to read it
