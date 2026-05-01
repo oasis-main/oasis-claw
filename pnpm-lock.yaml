@@ -22,6 +22,10 @@ importers:
         version: 3.2.4
 
   extensions/approval-gate:
+    dependencies:
+      zod:
+        specifier: ^4.4.1
+        version: 4.4.1
     devDependencies:
       openclaw:
         specifier: workspace:*
