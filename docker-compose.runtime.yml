@@ -1,0 +1,95 @@
+##
+## oasis-claw full-runtime compose
+##
+## Usage:
+##   docker compose -f docker-compose.runtime.yml up --build -d
+##   docker compose -f docker-compose.runtime.yml logs -f openclaw
+##
+## Network posture (LAN/IoT-safe by construction):
+##   - Inside the container, gateway binds 0.0.0.0:18789 so Docker's
+##     port-publish can reach it.
+##   - On the host, port is mapped to 127.0.0.1:18789 ONLY — other devices
+##     on the LAN cannot reach the gateway via your Mac's IP.
+##   - Bonjour/mDNS advertisement is disabled, so the gateway does not
+##     announce itself to LAN peers.
+##   - Auth token is mandatory; entrypoint mints one and writes it to
+##     ~/.openclaw/.gateway-token inside the container (volume-persisted).
+##   - Container drops all Linux capabilities and runs as non-root.
+##
+## To talk to the gateway from the Mac:
+##   curl -H "Authorization: Bearer $(docker compose -f docker-compose.runtime.yml \
+##           exec openclaw cat /home/node/.openclaw/.gateway-token)" \
+##        http://127.0.0.1:18789/healthz
+##
+
+services:
+  openclaw:
+    build:
+      context: .
+      dockerfile: Dockerfile.runtime
+    image: oasis-claw-runtime:local
+    container_name: oasis-claw-runtime
+    init: true
+    restart: unless-stopped
+
+    # Load credentials from .env directly. Using env_file (not `environment:`
+    # with ${VAR:-} interpolation) is deliberate — interpolation lets the
+    # invoking shell shadow .env values with empty exports, which silently
+    # broke Anthropic auth once before. env_file always wins.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Non-secret runtime knobs only. Secrets come from env_file above.
+      OPENCLAW_GATEWAY_BIND: lan
+      OPENCLAW_GATEWAY_PORT: "18789"
+      OPENCLAW_DISABLE_BONJOUR: "1"
+      TZ: ${OPENCLAW_TZ:-UTC}
+
+    # Host-side mapping is loopback-only. Other devices on your Wi-Fi
+    # cannot reach this port through your Mac's LAN IP.
+    ports:
+      - "127.0.0.1:18789:18789"
+
+    volumes:
+      # Persist config, plugin state, transcripts, attack logs, and the
+      # gateway token across restarts.
+      - oasis_openclaw_home:/home/node/.openclaw
+
+    # Hardening
+    user: "node"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /home/node/.cache:size=32m,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Block raw sockets / kernel keyring abuse / namespace tricks. The
+    # gateway only needs IP networking on its loopback-published port.
+    networks:
+      - oasis_runtime
+
+    healthcheck:
+      # Authenticated healthz to avoid false-positives if auth is misconfigured.
+      test:
+        - "CMD-SHELL"
+        - >
+          token=$$(cat /home/node/.openclaw/.gateway-token 2>/dev/null);
+          curl -fsS -H "Authorization: Bearer $$token"
+          http://127.0.0.1:18789/healthz >/dev/null
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+networks:
+  oasis_runtime:
+    # Default bridge driver. No driver_opts to expose externally — the
+    # only ingress is the explicit ports: mapping above.
+    driver: bridge
+
+volumes:
+  oasis_openclaw_home:
+    name: oasis_openclaw_home
