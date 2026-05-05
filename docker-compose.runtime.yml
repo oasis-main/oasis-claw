@@ -45,6 +45,10 @@ services:
       OPENCLAW_GATEWAY_PORT: "18789"
       OPENCLAW_DISABLE_BONJOUR: "1"
       TZ: ${OPENCLAW_TZ:-UTC}
+      # Ollama: forward host override when set in .env (default points at host).
+      # Unset means openclaw uses its own default (localhost:11434 inside container,
+      # which is wrong — that's why extra_hosts + this forwarding are both needed).
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
 
     # Host-side mapping is loopback-only. Other devices on your Wi-Fi
     # cannot reach this port through your Mac's LAN IP.
@@ -55,6 +59,12 @@ services:
       # Persist config, plugin state, transcripts, attack logs, and the
       # gateway token across restarts.
       - oasis_openclaw_home:/home/node/.openclaw
+
+    # Ollama: resolves to the Mac's host IP from inside the container.
+    # Required when OPENCLAW_DEFAULT_MODEL=ollama/<model> and Ollama runs on
+    # the host. No-op when Ollama isn't used.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
     # Hardening
     user: "node"

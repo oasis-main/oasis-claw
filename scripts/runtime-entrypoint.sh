@@ -210,6 +210,21 @@ merge_config("agent-primitives", {
     "historyDir": str(home / ".openclaw/logs/history"),
 })
 
+# ---- default LLM model (OPENCLAW_DEFAULT_MODEL env var) ----------------
+# Set via .env + make recreate, or live via `openclaw config set` + make restart.
+# Provider strings: "anthropic/claude-sonnet-4-6", "gemini/gemini-2.0-flash",
+#   "openai/gpt-4o", "bedrock/anthropic.claude-sonnet-4-5-v1:0",
+#   "ollama/llama3.3" (needs host.docker.internal reachable from container).
+# Leave unset to keep whatever openclaw already has configured.
+default_model = os.environ.get("OPENCLAW_DEFAULT_MODEL", "").strip() or None
+if default_model:
+    config.setdefault("agents", {})
+    config["agents"].setdefault("defaults", {})
+    config["agents"]["defaults"].setdefault("model", {})
+    # Always reflect env — lets .env rotation change the active model on recreate.
+    config["agents"]["defaults"]["model"]["primary"] = default_model
+    print(f"[entrypoint] default model set to: {default_model}")
+
 config_path.parent.mkdir(parents=True, exist_ok=True)
 config_path.write_text(json.dumps(config, indent=2) + "\n")
 print(f"[entrypoint] wrote {config_path}")
