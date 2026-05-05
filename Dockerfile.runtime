@@ -22,22 +22,24 @@ RUN apt-get update && \
       ca-certificates curl git openssl python3 procps lsof jq && \
     rm -rf /var/lib/apt/lists/*
 
-# openclaw CLI + tsx for direct .ts plugin loading
-RUN npm install -g openclaw@${OPENCLAW_VERSION} tsx@4
+# openclaw CLI + tsx + sharp installed globally.
+#
+# sharp MUST be global, not at /app/node_modules: openclaw's runtime lives at
+# /usr/local/lib/node_modules/openclaw/, so its `require("sharp")` walks
+# parent dirs of that path and never reaches /app. Global install lands sharp
+# at /usr/local/lib/node_modules/sharp, which is in NODE_PATH and reachable
+# via the standard node_modules walk from openclaw's location.
+#
+# sharp ships prebuilt libvips binaries for linux-arm64 + linux-x64; no extra
+# apt packages needed on bookworm-slim.
+RUN npm install -g openclaw@${OPENCLAW_VERSION} tsx@4 sharp@0.34
 
 WORKDIR /app
 
-# Production deps that our extensions and stock plugins import at runtime.
-# Lives at /app/node_modules so Node's resolution from /app/extensions/<id>/
-# walks up and finds them.
-#
-# - zod: schema validation for our 6 plugins.
-# - sharp: image resize/encode/metadata. Used lazily by document-extract,
-#   browser screenshot post-processing, and any future image-handling tool.
-#   Ships prebuilt libvips binaries for linux-arm64 + linux-x64; no extra
-#   apt packages needed on bookworm-slim.
+# Local /app/node_modules holds deps our extensions import (zod). Node's
+# resolution from /app/extensions/<id>/index.ts walks up to /app/node_modules.
 RUN npm init -y >/dev/null && \
-    npm install --omit=dev zod@4 sharp@0.34
+    npm install --omit=dev zod@4
 
 # Bake our 6 extensions into the image. Paths inside the container:
 #   /app/extensions/<id>/{index.ts,openclaw.plugin.json,package.json,...}

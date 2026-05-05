@@ -5,6 +5,14 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { distillEvents, parseSessionFile, renderDistillationAsMarkdown } from "../jsonl-parser.js";
 import { createDreamTool } from "../tools/dream.js";
 
+// Test helper: unwraps the SDK execute() return shape so existing
+// assertions on plain result objects keep working.
+async function callTool(tool: { execute: (id: string, args: unknown) => Promise<{ content: Array<{ type: string; text: string }> }> }, args: unknown = {}): Promise<Record<string, unknown>> {
+  const r = await tool.execute("test-call-id", args);
+  return JSON.parse(r.content[0].text);
+}
+
+
 let tmpDir: string;
 let swarmDir: string;
 let historyDir: string;
@@ -159,7 +167,7 @@ describe("createDreamTool", () => {
     ]);
 
     const tool = createDreamTool({ swarmDir, historyDir });
-    const result = await tool.invoke({ topic: "code review" });
+    const result = await callTool(tool, { topic: "code review" });
 
     expect(result.status).toBe("consolidated");
     expect(result.memoryWritten).toBe(true);
@@ -175,7 +183,7 @@ describe("createDreamTool", () => {
 
   it("handles empty historyDir gracefully", async () => {
     const tool = createDreamTool({ swarmDir, historyDir: path.join(tmpDir, "nonexistent") });
-    const result = await tool.invoke({});
+    const result = await callTool(tool, {});
     expect(result.status).toBe("consolidated");
     expect(result.sessionsDistilled).toBe(0);
     expect(result.memoryWritten).toBe(true);
@@ -183,7 +191,7 @@ describe("createDreamTool", () => {
 
   it("writes DREAM event to trail.log", async () => {
     const tool = createDreamTool({ swarmDir, historyDir });
-    await tool.invoke({});
+    await callTool(tool, {});
 
     const trailPath = path.join(swarmDir, "trail.log");
     expect(fs.existsSync(trailPath)).toBe(true);
@@ -205,7 +213,7 @@ describe("createDreamTool", () => {
     }
 
     const tool = createDreamTool({ swarmDir, historyDir });
-    const result = await tool.invoke({ maxFiles: 3 });
+    const result = await callTool(tool, { maxFiles: 3 });
     expect(result.sessionsDistilled).toBe(3);
   });
 });

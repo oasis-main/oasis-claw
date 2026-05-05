@@ -46,6 +46,14 @@ function makeMockApi(pluginId, pluginConfig = {}) {
     },
     registerTool(tool, opts) {
       const name = opts?.name ?? tool.name ?? "(unnamed)";
+      // Mirror openclaw's runtime tool-shape validator (src/plugins/tools.ts:73)
+      // so contract breaches surface here instead of inside a live gateway.
+      if (typeof tool?.execute !== "function") {
+        throw new Error(`tool "${name}" missing execute function (use \`execute(toolCallId, args)\`, not \`invoke\`)`);
+      }
+      if (!tool?.parameters || typeof tool.parameters !== "object") {
+        throw new Error(`tool "${name}" missing parameters object (use \`parameters\`, not \`inputSchema\`)`);
+      }
       registered.tools.push(name);
       log("TOOL", pluginId, `registered tool: ${name}`);
     },

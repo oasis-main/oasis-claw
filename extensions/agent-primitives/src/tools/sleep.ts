@@ -40,7 +40,7 @@ export function createSleepTool(config: SleepToolConfig) {
       "re-invoke this session at resumeAt.",
       "Returns the scheduled resume timestamp.",
     ].join(" "),
-    inputSchema: {
+    parameters: {
       type: "object",
       additionalProperties: false,
       required: ["reason", "resumeAfterMs"],
@@ -65,7 +65,7 @@ export function createSleepTool(config: SleepToolConfig) {
       },
     },
 
-    async invoke(args: { reason: string; resumeAfterMs: number; sessionId?: string }) {
+    async execute(_toolCallId: string, args: { reason: string; resumeAfterMs: number; sessionId?: string }) {
       const clamped = Math.max(60_000, Math.min(3_600_000, args.resumeAfterMs));
       const scheduledAt = new Date().toISOString();
       const resumeAt = new Date(Date.now() + clamped).toISOString();
@@ -94,7 +94,7 @@ export function createSleepTool(config: SleepToolConfig) {
         scheduleWritten: schedule.written,
       });
 
-      return {
+      const result = {
         status: "yielded",
         resumeAt,
         clampedMs: clamped,
@@ -105,6 +105,7 @@ export function createSleepTool(config: SleepToolConfig) {
         hostIntegrationNote:
           "sleep-schedule.json written. Wire a host scheduler (cron/systemd/EventBridge) to poll this file and re-invoke openclaw at resumeAt. See oasis-x ORG-050.",
       };
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     },
   };
 }

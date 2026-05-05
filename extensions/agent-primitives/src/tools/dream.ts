@@ -36,7 +36,7 @@ export function createDreamTool(config: DreamToolConfig) {
       "and appends a structured distillation to memory.md.",
       "Use during low-activity intervals or before compact() to capture what happened.",
     ].join(" "),
-    inputSchema: {
+    parameters: {
       type: "object",
       additionalProperties: false,
       properties: {
@@ -53,7 +53,7 @@ export function createDreamTool(config: DreamToolConfig) {
       },
     },
 
-    async invoke(args: { topic?: string; maxFiles?: number }) {
+    async execute(_toolCallId: string, args: { topic?: string; maxFiles?: number } = {}) {
       const maxFiles = args.maxFiles ?? 10;
 
       // Scan historyDir for recent JSONL files
@@ -122,7 +122,7 @@ export function createDreamTool(config: DreamToolConfig) {
         memoryWritten,
       });
 
-      return {
+      const result = {
         status: "consolidated",
         topic: args.topic ?? null,
         sessionsDistilled: distillations.length,
@@ -136,6 +136,7 @@ export function createDreamTool(config: DreamToolConfig) {
         hostIntegrationNote:
           "dream uses deterministic JSONL extraction. LLM-driven distillation (richer prose summaries) is pending ORG-050.",
       };
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     },
   };
 }

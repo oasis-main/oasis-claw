@@ -20,7 +20,7 @@ export function createSwarmReadTool(config: SwarmReadToolConfig) {
     name: "swarm_read",
     description:
       "Re-read the .swarm/ coordination files (state.md, queue.md, ...) and return them as the latest snapshot. Use this when stigmergic state may have changed mid-session.",
-    inputSchema: {
+    parameters: {
       type: "object",
       additionalProperties: false,
       properties: {
@@ -31,7 +31,7 @@ export function createSwarmReadTool(config: SwarmReadToolConfig) {
         },
       },
     },
-    async invoke(args: { files?: string[] }) {
+    async execute(_toolCallId: string, args: { files?: string[] } = {}) {
       const includeFiles = args.files ?? config.includeFiles;
       const snapshot = readSwarmSnapshot({
         swarmDir: config.swarmDir,
@@ -39,7 +39,7 @@ export function createSwarmReadTool(config: SwarmReadToolConfig) {
         maxBytes: config.maxBytes,
       });
       const lines = renderSnapshotAsPromptLines(config.swarmDir, snapshot);
-      return {
+      const result = {
         swarmDir: config.swarmDir,
         files: snapshot.map((f) => ({
           filename: f.filename,
@@ -49,6 +49,7 @@ export function createSwarmReadTool(config: SwarmReadToolConfig) {
         })),
         rendered: lines.join("\n"),
       };
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     },
   };
 }

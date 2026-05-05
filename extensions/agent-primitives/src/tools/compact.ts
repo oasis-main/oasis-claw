@@ -33,7 +33,7 @@ export function createCompactTool(config: CompactToolConfig) {
     name: "compact",
     description:
       "Graceful handoff at context-ceiling. Writes a snapshot of the current task state to .swarm/state.md so a fresh session can resume. Use BEFORE the context window is exhausted, not after.",
-    inputSchema: {
+    parameters: {
       type: "object",
       additionalProperties: false,
       required: ["handoffNote"],
@@ -50,7 +50,7 @@ export function createCompactTool(config: CompactToolConfig) {
         },
       },
     },
-    async invoke(args: { handoffNote: string; sessionTag?: string }) {
+    async execute(_toolCallId: string, args: { handoffNote: string; sessionTag?: string }) {
       const ts = new Date().toISOString();
       const tag = args.sessionTag ?? `compact-${ts}`;
       const snapshot = renderHandoffSection(tag, ts, args.handoffNote);
@@ -74,7 +74,7 @@ export function createCompactTool(config: CompactToolConfig) {
         snapshotWritten,
       });
 
-      return {
+      const result = {
         status: snapshotWritten ? "snapshot_written" : "snapshot_failed",
         snapshotPath: statePath,
         sessionTag: tag,
@@ -85,6 +85,7 @@ export function createCompactTool(config: CompactToolConfig) {
         hostIntegrationNote:
           "This stub writes the snapshot but does NOT signal the runtime to reset context. Wire the harness reset per oasis-x ORG-050. Once dot-swarm is enabled, the next session will pick up state.md automatically via registerMemoryPromptSupplement.",
       };
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     },
   };
 }

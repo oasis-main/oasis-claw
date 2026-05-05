@@ -5,6 +5,14 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { readSleepSchedule, isSleepActive, clearSleepSchedule } from "../schedule.js";
 import { createSleepTool } from "../tools/sleep.js";
 
+// Test helper: unwraps the SDK execute() return shape so existing
+// assertions on plain result objects keep working.
+async function callTool(tool: { execute: (id: string, args: unknown) => Promise<{ content: Array<{ type: string; text: string }> }> }, args: unknown = {}): Promise<Record<string, unknown>> {
+  const r = await tool.execute("test-call-id", args);
+  return JSON.parse(r.content[0].text);
+}
+
+
 let tmpDir: string;
 let swarmDir: string;
 
@@ -21,7 +29,7 @@ describe("createSleepTool", () => {
   it("returns yielded status with ISO resumeAt", async () => {
     const tool = createSleepTool({ swarmDir });
     const before = Date.now();
-    const result = await tool.invoke({ reason: "waiting for Telegram approval", resumeAfterMs: 120_000 });
+    const result = await callTool(tool, { reason: "waiting for Telegram approval", resumeAfterMs: 120_000 });
     const after = Date.now();
 
     expect(result.status).toBe("yielded");
@@ -32,19 +40,19 @@ describe("createSleepTool", () => {
 
   it("clamps minimum duration to 60 000 ms", async () => {
     const tool = createSleepTool({ swarmDir });
-    const result = await tool.invoke({ reason: "test", resumeAfterMs: 1_000 });
+    const result = await callTool(tool, { reason: "test", resumeAfterMs: 1_000 });
     expect(result.clampedMs).toBe(60_000);
   });
 
   it("clamps maximum duration to 3 600 000 ms", async () => {
     const tool = createSleepTool({ swarmDir });
-    const result = await tool.invoke({ reason: "test", resumeAfterMs: 99_999_999 });
+    const result = await callTool(tool, { reason: "test", resumeAfterMs: 99_999_999 });
     expect(result.clampedMs).toBe(3_600_000);
   });
 
   it("writes sleep-schedule.json to swarmDir", async () => {
     const tool = createSleepTool({ swarmDir });
-    const result = await tool.invoke({ reason: "polling for webhook", resumeAfterMs: 300_000 });
+    const result = await callTool(tool, { reason: "polling for webhook", resumeAfterMs: 300_000 });
 
     expect(result.scheduleWritten).toBe(true);
     const schedulePath = path.join(swarmDir, "sleep-schedule.json");
@@ -59,7 +67,7 @@ describe("createSleepTool", () => {
 
   it("includes sessionId in schedule and suggestedResumeCommand", async () => {
     const tool = createSleepTool({ swarmDir });
-    const result = await tool.invoke({
+    const result = await callTool(tool, {
       reason: "rate limit backoff",
       resumeAfterMs: 60_000,
       sessionId: "abc123",
@@ -77,7 +85,7 @@ describe("createSleepTool", () => {
       swarmDir,
       resumeCommandTemplate: "hyperclaw wake --id {sessionId}",
     });
-    await tool.invoke({ reason: "test", resumeAfterMs: 60_000, sessionId: "sess-99" });
+    await callTool(tool, { reason: "test", resumeAfterMs: 60_000, sessionId: "sess-99" });
 
     const schedule = JSON.parse(
       fs.readFileSync(path.join(swarmDir, "sleep-schedule.json"), "utf8"),
@@ -87,7 +95,7 @@ describe("createSleepTool", () => {
 
   it("writes SLEEP event to trail.log", async () => {
     const tool = createSleepTool({ swarmDir });
-    await tool.invoke({ reason: "nightly quiet window", resumeAfterMs: 3_600_000 });
+    await callTool(tool, { reason: "nightly quiet window", resumeAfterMs: 3_600_000 });
 
     const trailPath = path.join(swarmDir, "trail.log");
     expect(fs.existsSync(trailPath)).toBe(true);
@@ -103,7 +111,7 @@ describe("createSleepTool", () => {
 
   it("creates swarmDir if it does not exist", async () => {
     const tool = createSleepTool({ swarmDir: path.join(tmpDir, "nested", "dir", ".swarm") });
-    const result = await tool.invoke({ reason: "test", resumeAfterMs: 60_000 });
+    const result = await callTool(tool, { reason: "test", resumeAfterMs: 60_000 });
     expect(result.scheduleWritten).toBe(true);
   });
 });
@@ -119,13 +127,13 @@ describe("sleep schedule helpers", () => {
 
   it("isSleepActive returns true for a future resumeAt", async () => {
     const tool = createSleepTool({ swarmDir });
-    await tool.invoke({ reason: "test", resumeAfterMs: 3_600_000 });
+    await callTool(tool, { reason: "test", resumeAfterMs: 3_600_000 });
     expect(isSleepActive(swarmDir)).toBe(true);
   });
 
   it("clearSleepSchedule removes the file", async () => {
     const tool = createSleepTool({ swarmDir });
-    await tool.invoke({ reason: "test", resumeAfterMs: 60_000 });
+    await callTool(tool, { reason: "test", resumeAfterMs: 60_000 });
     expect(isSleepActive(swarmDir)).toBe(true);
 
     clearSleepSchedule(swarmDir);

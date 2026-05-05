@@ -5,6 +5,14 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createSwarmCompactionProvider, digestMessages, readLatestHandoff } from "../compaction-provider.js";
 import { createCompactTool } from "../tools/compact.js";
 
+// Test helper: unwraps the SDK execute() return shape so existing
+// assertions on plain result objects keep working.
+async function callTool(tool: { execute: (id: string, args: unknown) => Promise<{ content: Array<{ type: string; text: string }> }> }, args: unknown = {}): Promise<Record<string, unknown>> {
+  const r = await tool.execute("test-call-id", args);
+  return JSON.parse(r.content[0].text);
+}
+
+
 let tmpDir: string;
 let swarmDir: string;
 
@@ -25,7 +33,7 @@ describe("createCompactTool", () => {
   it("appends a HANDOFF section to state.md", async () => {
     const tool = createCompactTool({ swarmDir });
     const note = "We were working on the oasis-claw plugin scaffold. All six extensions are built. Next: run Stage 4 testing and push to oasis-main.";
-    const result = await tool.invoke({ handoffNote: note, sessionTag: "test-compact-1" });
+    const result = await callTool(tool, { handoffNote: note, sessionTag: "test-compact-1" });
 
     expect(result.status).toBe("snapshot_written");
     expect(result.snapshotWritten).toBe(true);
@@ -39,7 +47,7 @@ describe("createCompactTool", () => {
 
   it("uses ISO timestamp as default sessionTag", async () => {
     const tool = createCompactTool({ swarmDir });
-    const result = await tool.invoke({
+    const result = await callTool(tool, {
       handoffNote: "Generic handoff note for testing purposes. Contains enough text to pass validation.",
     });
     expect(result.sessionTag).toMatch(/^compact-\d{4}-\d{2}-\d{2}T/);
@@ -47,7 +55,7 @@ describe("createCompactTool", () => {
 
   it("writes COMPACT event to trail.log", async () => {
     const tool = createCompactTool({ swarmDir });
-    await tool.invoke({
+    await callTool(tool, {
       handoffNote: "Testing compact trail event. This note is long enough at over fifty characters.",
     });
 
@@ -65,8 +73,8 @@ describe("createCompactTool", () => {
 
   it("accumulates multiple handoffs in state.md", async () => {
     const tool = createCompactTool({ swarmDir });
-    await tool.invoke({ handoffNote: "First handoff: started the project. Working on initial scaffolding.", sessionTag: "v1" });
-    await tool.invoke({ handoffNote: "Second handoff: plugins are done. Tests are passing. Ready to push.", sessionTag: "v2" });
+    await callTool(tool, { handoffNote: "First handoff: started the project. Working on initial scaffolding.", sessionTag: "v1" });
+    await callTool(tool, { handoffNote: "Second handoff: plugins are done. Tests are passing. Ready to push.", sessionTag: "v2" });
 
     const stateMd = fs.readFileSync(path.join(swarmDir, "state.md"), "utf8");
     expect(stateMd).toContain("v1");
@@ -78,7 +86,7 @@ describe("createCompactTool", () => {
   it("creates swarmDir if it does not exist", async () => {
     const deepSwarm = path.join(tmpDir, "a", "b", "c", ".swarm");
     const tool = createCompactTool({ swarmDir: deepSwarm });
-    const result = await tool.invoke({
+    const result = await callTool(tool, {
       handoffNote: "Deep path test. Verifying that nested directories are created automatically.",
     });
     expect(result.snapshotWritten).toBe(true);
@@ -104,7 +112,7 @@ describe("readLatestHandoff", () => {
   it("extracts the body of a HANDOFF section", async () => {
     const tool = createCompactTool({ swarmDir });
     const note = "Working on ORG-050. Sleep and dream tools are done. Compact needs the compaction provider wired.";
-    await tool.invoke({ handoffNote: note, sessionTag: "test-read" });
+    await callTool(tool, { handoffNote: note, sessionTag: "test-read" });
 
     const handoff = readLatestHandoff(path.join(swarmDir, "state.md"));
     expect(handoff).not.toBeNull();
@@ -114,8 +122,8 @@ describe("readLatestHandoff", () => {
 
   it("returns the LAST handoff when multiple exist", async () => {
     const tool = createCompactTool({ swarmDir });
-    await tool.invoke({ handoffNote: "First session: built the scaffolding. All extensions created.", sessionTag: "s1" });
-    await tool.invoke({ handoffNote: "Second session: wrote all the tests. Everything is passing now.", sessionTag: "s2" });
+    await callTool(tool, { handoffNote: "First session: built the scaffolding. All extensions created.", sessionTag: "s1" });
+    await callTool(tool, { handoffNote: "Second session: wrote all the tests. Everything is passing now.", sessionTag: "s2" });
 
     const handoff = readLatestHandoff(path.join(swarmDir, "state.md"));
     expect(handoff).toContain("Second session");
@@ -134,7 +142,7 @@ describe("SwarmCompactionProvider", () => {
     // Write a handoff via compact tool
     const tool = createCompactTool({ swarmDir });
     const note = "Agent compacted at 80% context. Next steps: finish ORG-050 tests, push to main, update queue.";
-    await tool.invoke({ handoffNote: note, sessionTag: "pre-compact" });
+    await callTool(tool, { handoffNote: note, sessionTag: "pre-compact" });
 
     const provider = createSwarmCompactionProvider({ swarmDir });
     const summary = await provider.summarize({ messages: [] });
