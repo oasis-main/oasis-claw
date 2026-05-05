@@ -29,6 +29,82 @@ Every LLM input, output, and tool call is written to an append-only JSONL file b
 
 ---
 
+## Running with Docker
+
+The runtime image bakes all six extensions in at build time. Credentials come from `.env`.
+
+```sh
+cp .env.example .env
+# Fill in ANTHROPIC_API_KEY (or another provider — see below),
+# OASIS_TELEGRAM_BOT_TOKEN, OASIS_TELEGRAM_CHAT_ID
+
+make rebuild        # first boot: builds image, starts container
+make healthz        # → {"ok":true}
+make logs           # tail gateway logs
+make smoke          # plugin registration smoke test (mock API, no live LLM)
+```
+
+### Make targets
+
+| Target | What it does | When to use |
+|---|---|---|
+| `make restart` | Restart gateway process | After `openclaw config set` changes |
+| `make recreate` | Recreate container | After `.env` changes (creds, cortex swap) |
+| `make rebuild` | Rebuild image + recreate | After Dockerfile or entrypoint changes |
+| `make smoke` | Plugin smoke test | After plugin code changes |
+| `make token` | Print gateway auth token | Needed for direct API calls |
+| `make healthz` | Authenticated healthz probe | Verify gateway is up |
+
+---
+
+## Language cortex hot-swapping
+
+The gateway is provider-agnostic. The active language model is a single config value — swap it without touching plugin code, rebuilding the image, or rewriting prompts. Works the same whether you're running locally on a MacBook or deployed to EC2.
+
+Set `OPENCLAW_DEFAULT_MODEL` in `.env` and run `make recreate`. The entrypoint writes it into `openclaw.json` on every boot.
+
+```bash
+# Anthropic (default)
+ANTHROPIC_API_KEY=sk-ant-...
+OPENCLAW_DEFAULT_MODEL=anthropic/claude-sonnet-4-6
+
+# Google Gemini
+GEMINI_API_KEY=...
+OPENCLAW_DEFAULT_MODEL=gemini/gemini-2.0-flash
+# also: gemini/gemini-2.5-pro  gemini/gemini-2.5-flash
+
+# OpenAI
+OPENAI_API_KEY=...
+OPENCLAW_DEFAULT_MODEL=openai/gpt-4o
+# also: openai/o3  openai/o4-mini  openai/gpt-4o-mini
+
+# Amazon Bedrock (IAM credentials, no API key)
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_REGION=us-east-1
+OPENCLAW_DEFAULT_MODEL=bedrock/anthropic.claude-sonnet-4-5-v1:0
+# also: bedrock/amazon.nova-pro-v1:0  bedrock/meta.llama3-70b-instruct-v1:0
+
+# Ollama — fully local, runs on the Mac host
+# Pull the model first: `ollama pull llama3.3`
+# No API key. compose already wires host.docker.internal → host gateway.
+OPENCLAW_DEFAULT_MODEL=ollama/llama3.3
+# also: ollama/qwen3  ollama/mistral  ollama/deepseek-r1
+```
+
+**Live swap** (no recreate needed if the API key is already in the container):
+
+```sh
+make shell
+openclaw config set agents.defaults.model.primary "gemini/gemini-2.0-flash"
+exit
+make restart
+```
+
+The `.env.example` in the repo documents all four priority providers with every model string and required credential.
+
+---
+
 ## Plugins
 
 ### `extensions/prompt-injection-reporting`
@@ -210,52 +286,6 @@ oasis-claw/
   README.md
   LICENSE                      # MIT, matching upstream openclaw
 ```
-
-## Running with Docker
-
-The runtime image bakes all six extensions in at build time. Credentials come from `.env`.
-
-```sh
-cp .env.example .env
-# Fill in ANTHROPIC_API_KEY (or another provider — see .env.example),
-# OASIS_TELEGRAM_BOT_TOKEN, OASIS_TELEGRAM_CHAT_ID
-
-make rebuild        # first boot: builds image, starts container
-make healthz        # → {"ok":true}
-make logs           # tail gateway logs
-make smoke          # plugin registration smoke test (mock API, no live LLM)
-```
-
-### LLM provider switching
-
-Set `OPENCLAW_DEFAULT_MODEL` in `.env` and run `make recreate`. The entrypoint writes it into `openclaw.json` on every boot.
-
-```bash
-# Gemini (needs GEMINI_API_KEY)
-OPENCLAW_DEFAULT_MODEL=gemini/gemini-2.0-flash
-
-# OpenAI (needs OPENAI_API_KEY)
-OPENCLAW_DEFAULT_MODEL=openai/gpt-4o
-
-# Bedrock (needs AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY + AWS_REGION)
-OPENCLAW_DEFAULT_MODEL=bedrock/anthropic.claude-sonnet-4-5-v1:0
-
-# Ollama on Mac host (pull model first: `ollama pull llama3.3`)
-OPENCLAW_DEFAULT_MODEL=ollama/llama3.3
-```
-
-Live switch without recreate: `make shell` → `openclaw config set agents.defaults.model.primary "gemini/gemini-2.0-flash"` → `make restart`.
-
-### Make targets
-
-| Target | What it does | When to use |
-|---|---|---|
-| `make restart` | Restart gateway process | After `openclaw config set` changes |
-| `make recreate` | Recreate container | After `.env` changes (creds, model switch) |
-| `make rebuild` | Rebuild image + recreate | After Dockerfile or entrypoint changes |
-| `make smoke` | Plugin smoke test | After plugin code changes |
-| `make token` | Print gateway auth token | Needed for direct API calls |
-| `make healthz` | Authenticated healthz probe | Verify gateway is up |
 
 ## Local development
 
