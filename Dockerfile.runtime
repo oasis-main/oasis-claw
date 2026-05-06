@@ -1,4 +1,4 @@
-# oasis-claw runtime image — full openclaw gateway + our 6 extensions
+# oasis-claw runtime image — full openclaw gateway + our 7 extensions
 #
 # Uses npm-published openclaw@2026.4.26 (same version as vendor/openclaw submodule
 # pin) and bakes our extensions in at /app/extensions/<id>. tsx loads the .ts
@@ -41,7 +41,7 @@ WORKDIR /app
 RUN npm init -y >/dev/null && \
     npm install --omit=dev zod@4
 
-# Bake our 6 extensions into the image. Paths inside the container:
+# Bake our 7 extensions into the image. Paths inside the container:
 #   /app/extensions/<id>/{index.ts,openclaw.plugin.json,package.json,...}
 COPY extensions/ /app/extensions/
 

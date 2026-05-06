@@ -192,6 +192,19 @@ const PLUGINS = [
     config: { swarmDir: SMOKE_SWARM },
     expect: { minTools: 3, compactionProvider: true },
   },
+  {
+    id: "clawhub-skill-audit",
+    path: path.join(ROOT, "extensions/clawhub-skill-audit/index.ts"),
+    // Empty skillsDirs → startup scan finds nothing, no LLM call attempted.
+    // Plugin must still register cleanly (listener subscription, audit-store
+    // dir creation) without throwing.
+    config: {
+      skillsDirs: ["/tmp/oasis-smoke/no-such-skills-dir"],
+      auditLogDir: "/tmp/oasis-smoke/skill-audits",
+      pollIntervalMs: 3_600_000,
+    },
+    expect: {},
+  },
 ];
 
 // ---------------------------------------------------------------------------

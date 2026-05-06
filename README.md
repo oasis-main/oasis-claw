@@ -1,6 +1,6 @@
 # oasis-claw
 
-Vanilla [openclaw](https://github.com/openclaw/openclaw) is a capable AI gateway, but it ships without answers to three production concerns: **what happens when the model is manipulated**, **where credentials go when the user pastes them**, and **how you audit what the agent actually did**. oasis-claw is a thin plugin layer that fills exactly those gaps — no fork, no divergence from upstream, just six focused extensions on top of the standard plugin SDK.
+Vanilla [openclaw](https://github.com/openclaw/openclaw) is a capable AI gateway, but it ships without answers to four production concerns: **what happens when the model is manipulated**, **where credentials go when the user pastes them**, **how you audit what the agent actually did**, and **what stops a malicious skill from the registry running before you ever look at it**. oasis-claw is a thin plugin layer that fills exactly those gaps — no fork, no divergence from upstream, just seven focused extensions on top of the standard plugin SDK.
 
 ## What this adds over vanilla openclaw
 
@@ -12,12 +12,15 @@ Vanilla [openclaw](https://github.com/openclaw/openclaw) is a capable AI gateway
 | No immutable session transcript | `session-history` | Append-only JSONL at `llm_input`, `llm_output`, and `tool_call` events; sandbox invariant tests verify the writer never escapes its `logDir` |
 | Agent loses all context on session reset | `dot-swarm` | Injects `.swarm/state.md`, `.swarm/queue.md`, and peer files into every session's memory section via `registerMemoryPromptSupplement`; agent always knows where it left off |
 | No explicit agent lifecycle signals | `agent-primitives` | `sleep`, `dream`, and `compact` tools let the agent voluntarily yield, consolidate memory, and hand off cleanly at context ceiling |
+| Clawhub skills install with zero security review | `clawhub-skill-audit` | Auto-fires an Opus 4.7 audit on every newly installed skill (SKILL.md + bundled scripts), writes an immutable JSON trail, and optionally quarantines `block`-verdict skills before they're loaded by an agent |
 
 ### Security
 
 openclaw's upstream `external-content.ts` runs regex patterns on inbound content passively. `prompt-injection-reporting` adds the complementary agent-side layer: when the model recognises an attempt, it calls `report_injection`, which writes a tamper-evident signed entry to the attack log and fires an operator alert. Both layers run simultaneously — they target different failure modes.
 
 `secrets-vault` ensures the gateway is never an accidental credential exfiltration path. Plaintext never appears in tool-call history, JSONL transcripts, or memory supplements. The only path to re-materialization is through tool calls that explicitly request the secret, scoped to the plugin's stateDir.
+
+`clawhub-skill-audit` closes the supply-chain gap. Every newly installed skill in the workspace is fed to Opus 4.7 via a forced-tool-use call and graded against a concrete catalogue of malicious patterns: prompt-injection in SKILL.md, credential exfiltration, exfil over curl/webhooks, persistence backdoors, supply-chain `curl|sh`, sandbox-evasion, and explicit attempts to disable other oasis-claw plugins. Verdicts are `pass` / `warn` / `block`; `block` can optionally move the skill to a quarantine directory. The audit trail is one immutable JSON file per skill at `~/.openclaw/logs/skill-audits/YYYY/MM/DD/<auditId>.json`.
 
 ### Explainability
 
@@ -31,7 +34,7 @@ Every LLM input, output, and tool call is written to an append-only JSONL file b
 
 ## Running with Docker
 
-The runtime image bakes all six extensions in at build time. Credentials come from `.env`.
+The runtime image bakes all seven extensions in at build time. Credentials come from `.env`.
 
 ```sh
 cp .env.example .env
@@ -166,6 +169,41 @@ Configuration:
 
 If `swarmDir` is omitted, the plugin probes `$PWD/.swarm` first and falls back to `~/.openclaw/.swarm`. Tracks under oasis-x ORG-030.
 
+### `extensions/clawhub-skill-audit`
+
+Auto-runs a security audit against every newly installed clawhub skill. The plugin subscribes to openclaw's `registerSkillsChangeListener` (so it fires the moment `clawhub install` finishes) and also performs a debounced periodic filesystem scan (so first-boot skills and out-of-band installs aren't missed). Each newly-seen `(skillId, contentHash)` pair triggers a single Opus 4.7 audit:
+
+- The skill's `SKILL.md` and all bundled `.sh`/`.py`/`.js`/`.ts`/`.md`/etc. files are wrapped in `<<<FILE>>>` sentinels and sent to the auditor as untrusted data
+- The auditor is forced to call an `emit_audit` tool, returning structured JSON (`verdict`, `risk_score`, `summary`, `findings[]`)
+- One immutable JSON record per audit is written to `~/.openclaw/logs/skill-audits/YYYY/MM/DD/<auditId>.json` — never overwritten, never deleted by the plugin
+- `warn`/`block` verdicts trigger an operator Telegram alert if the bot creds are configured
+- `block` verdicts optionally move the skill directory to `quarantineDir` (with a `QUARANTINED.txt` marker pointing to the audit id)
+
+The threat model targets recent supply-chain incidents in agent-skill registries: hidden prompt-injection in `SKILL.md`, credential harvesting (`~/.ssh`, `~/.aws`, env dumps), exfiltration over webhooks/pastebin/DNS, persistence via cron/launchctl/rc files, destructive ops, `curl|sh` typosquats, and explicit attempts to disable other oasis-claw plugins (`approval-gate`, `secrets-vault`, `prompt-injection-reporting`).
+
+Configuration:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "clawhub-skill-audit": {
+        "anthropicApiKey": "...",
+        "auditModel": "claude-opus-4-7",
+        "skillsDirs": ["./skills", "~/.openclaw/skills"],
+        "auditLogDir": "~/.openclaw/logs/skill-audits",
+        "quarantineDir": "~/.openclaw/quarantine/skills",
+        "telegramBotToken": "...",
+        "telegramAlertChatId": "...",
+        "pollIntervalMs": 30000
+      }
+    }
+  }
+}
+```
+
+`anthropicApiKey` falls back to the `ANTHROPIC_API_KEY` env var if unset (so you don't have to copy the key into `openclaw.json`). `auditModel` defaults to `claude-opus-4-7` — the strong audit model is the point of the plugin, only override for cost-trial. With `quarantineDir` unset, the plugin is audit-only: it will log and alert but never move files.
+
 ### `extensions/agent-primitives`
 
 Three lifecycle tools — `sleep`, `dream`, `compact` — each tool-call shaped, no core loop changes required. Current state: filesystem-side fully wired, host integration is a stub pending ORG-050.
@@ -208,7 +246,11 @@ Each plugin reads its own block under `plugins.entries` in `~/.openclaw/openclaw
       },
       "secrets-vault": { "secretsDir": "~/.openclaw/state/secrets" },
       "approval-gate": { "telegramBotToken": "...", "telegramChatId": "..." },
-      "session-history": { "logDir": "~/.openclaw/logs/history" }
+      "session-history": { "logDir": "~/.openclaw/logs/history" },
+      "clawhub-skill-audit": {
+        "auditLogDir": "~/.openclaw/logs/skill-audits",
+        "skillsDirs": ["~/.openclaw/skills"]
+      }
     }
   }
 }
@@ -274,12 +316,13 @@ oasis-claw/
     session-history/             # append-only JSONL transcripts + sandbox-isolation invariants
     dot-swarm/                   # memory prompt supplement: injects .swarm/ files into context
     agent-primitives/            # sleep / dream / compact lifecycle tools (stubs, FS side wired)
+    clawhub-skill-audit/         # Opus 4.7 auto-audit of newly installed skills + JSON audit trail
   scripts/
     runtime-entrypoint.sh        # mints token, links plugins, merges config, execs gateway
     smoke-runner.mjs             # plugin-registration smoke test (mock API, no live gateway)
   archive/
     hyperclaw-fork-patches/    # the 7 commits from the deprecated fork, kept as patches
-  Dockerfile.runtime           # full runtime image: openclaw + tsx + sharp + our 6 plugins
+  Dockerfile.runtime           # full runtime image: openclaw + tsx + sharp + our 7 plugins
   docker-compose.runtime.yml   # loopback-only port binding, cap_drop ALL, non-root
   Makefile                     # restart / recreate / rebuild / logs / healthz / smoke
   .env.example                 # all provider keys + OPENCLAW_DEFAULT_MODEL documented

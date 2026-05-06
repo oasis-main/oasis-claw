@@ -56,7 +56,7 @@ if [[ ! -f "${CONFIG_DIR}/.swarm/queue.md" ]]; then
 MD
 fi
 
-# ---- install our 6 extensions via the openclaw plugin registry ---------
+# ---- install our 7 extensions via the openclaw plugin registry ---------
 # `--link` points the registry at /app/extensions/<id>/ (read-only image) so
 # we don't duplicate code. `--force` is incompatible with --link, so we skip
 # install if the plugin is already in the registry from a prior boot.
@@ -72,6 +72,7 @@ declare -A PLUGINS=(
   [session-history]=""
   [dot-swarm]=""
   [agent-primitives]=""
+  [clawhub-skill-audit]=""
 )
 
 # Probe what's already registered so re-runs don't fail.
@@ -210,6 +211,28 @@ merge_config("agent-primitives", {
     "historyDir": str(home / ".openclaw/logs/history"),
 })
 
+# clawhub-skill-audit: Opus 4.7 security review on every newly installed skill,
+# trail at ~/.openclaw/logs/skill-audits. ANTHROPIC_API_KEY is read by the
+# plugin from env directly so we don't have to copy it into the JSON config.
+# Quarantine + auditModel are intentionally not defaulted from the merge
+# layer — change them by editing entries["clawhub-skill-audit"].config in
+# openclaw.json directly when you want a non-default policy.
+skill_audit_cfg = {
+    "auditLogDir": str(home / ".openclaw/logs/skill-audits"),
+    "skillsDirs": [
+        str(home / ".openclaw/skills"),
+        str(home / ".openclaw/workspace/skills"),
+    ],
+}
+if tg_token:
+    skill_audit_cfg["telegramBotToken"] = tg_token
+if tg_chat:
+    skill_audit_cfg["telegramAlertChatId"] = tg_chat
+quarantine_dir = os.environ.get("OASIS_SKILL_AUDIT_QUARANTINE_DIR", "").strip() or None
+if quarantine_dir:
+    skill_audit_cfg["quarantineDir"] = quarantine_dir
+merge_config("clawhub-skill-audit", skill_audit_cfg)
+
 # ---- default LLM model (OPENCLAW_DEFAULT_MODEL env var) ----------------
 # Set via .env + make recreate, or live via `openclaw config set` + make restart.
 # Provider strings: "anthropic/claude-sonnet-4-6", "gemini/gemini-2.0-flash",
@@ -242,7 +265,7 @@ cat <<BANNER
    gateway token  : ${masked}
    plugins        : prompt-injection-reporting, secrets-vault,
                     approval-gate, session-history, dot-swarm,
-                    agent-primitives
+                    agent-primitives, clawhub-skill-audit
    config file    : ${CONFIG_FILE}
 ==============================================================
 BANNER

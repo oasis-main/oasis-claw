@@ -1,0 +1,19 @@
+{
+  "name": "@oasis-claw/clawhub-skill-audit",
+  "version": "0.1.0",
+  "description": "openclaw plugin: Opus 4.7 security audits on every newly installed clawhub skill, with an immutable audit trail",
+  "type": "module",
+  "devDependencies": {
+    "openclaw": "workspace:*",
+    "vitest": "^3.0.0"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

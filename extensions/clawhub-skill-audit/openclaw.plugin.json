@@ -1,0 +1,52 @@
+{
+  "id": "clawhub-skill-audit",
+  "name": "ClawHub Skill Audit",
+  "description": "Auto-runs an Opus 4.7 security audit against every newly installed clawhub skill (SKILL.md + bundled scripts) and writes an immutable JSON audit-trail entry. Optional Telegram alert on warn/block, optional quarantine on block.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "anthropicApiKey": {
+        "type": "string",
+        "description": "Anthropic API key for the auditor LLM. Defaults to the ANTHROPIC_API_KEY environment variable."
+      },
+      "auditModel": {
+        "type": "string",
+        "description": "Model id for the security audit (default: claude-opus-4-7). The point of the plugin is the strong audit model — only override for cost-trial."
+      },
+      "skillsDirs": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Directories that may contain installed skills. Default: ['./skills', '$HOME/.openclaw/skills', '$HOME/.openclaw/workspace/skills']."
+      },
+      "auditLogDir": {
+        "type": "string",
+        "description": "Directory for the immutable audit-trail JSON records (default: $HOME/.openclaw/logs/skill-audits)."
+      },
+      "quarantineDir": {
+        "type": "string",
+        "description": "If set, skills with verdict=block are moved here instead of remaining installed. Otherwise the audit only logs."
+      },
+      "telegramBotToken": {
+        "type": "string",
+        "description": "Telegram bot token for warn/block alerts (optional)."
+      },
+      "telegramAlertChatId": {
+        "type": "string",
+        "description": "Telegram chat id to receive warn/block alerts."
+      },
+      "pollIntervalMs": {
+        "type": "number",
+        "description": "Filesystem-scan fallback interval in ms (default 30000). The SDK skills-change listener is the primary signal; this catches first-boot and out-of-band installs."
+      },
+      "maxBytesPerFile": {
+        "type": "number",
+        "description": "Cap on bytes read from any single skill file before it's truncated for the audit (default 65536)."
+      },
+      "maxFilesPerSkill": {
+        "type": "number",
+        "description": "Cap on number of files read from a skill dir (default 25)."
+      }
+    }
+  }
+}

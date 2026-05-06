@@ -7,6 +7,10 @@
     "./plugin-sdk": {
       "types": "./plugin-sdk/index.ts",
       "default": "./plugin-sdk/index.js"
+    },
+    "./plugin-sdk/skills-runtime": {
+      "types": "./plugin-sdk/skills-runtime.ts",
+      "default": "./plugin-sdk/skills-runtime.js"
     }
   }
 }
