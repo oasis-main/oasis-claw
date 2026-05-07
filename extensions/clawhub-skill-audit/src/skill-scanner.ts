@@ -25,6 +25,16 @@ export type SkillSnapshot = {
   baseDir: string;
   files: SkillFile[];
   contentHash: string;
+  /**
+   * External runtime references the skill declares — plugin keys named in its
+   * SKILL.md frontmatter, sibling extensions referenced by path, etc. — whose
+   * source is NOT in this snapshot.
+   *
+   * Empty array means the snapshot is fully self-contained. A non-empty array
+   * is a coverage hint to the auditor: "the real behavior lives elsewhere."
+   * The auditor's `auditability` rule treats this as at least a 'warn'.
+   */
+  externalRefs: string[];
 };
 
 const AUDITABLE_EXT = new Set([
@@ -126,13 +136,55 @@ export function snapshotSkill(baseDir: string, opts: ScanOpts): SkillSnapshot {
     hash.update("\0");
   }
 
+  const externalRefs = detectExternalRefs(files);
+
   return {
     skillId,
     rootDir: path.dirname(baseDir),
     baseDir,
     files,
     contentHash: hash.digest("hex"),
+    externalRefs,
   };
+}
+
+/**
+ * Heuristic scan for "this skill's real behavior lives in code that isn't in
+ * the snapshot" patterns. Findings are passed to the auditor as a coverage
+ * hint, not used to gate the snapshot itself.
+ *
+ * Bounded and conservative on purpose — we'd rather under-report than walk
+ * sibling repos blindly. A future enhancement can do a real reference walk
+ * once openclaw's runtime layout is pinned, but the heuristic catches the
+ * common cases (skill is just a manifest pointing at a plugin).
+ */
+function detectExternalRefs(files: ReadonlyArray<SkillFile>): string[] {
+  const refs = new Set<string>();
+  for (const f of files) {
+    if (f.relPath !== "SKILL.md") continue;
+    const text = f.contents;
+
+    // 1. YAML frontmatter: metadata.openclaw.requires.config: ["plugins.entries.<key>"]
+    //    or any "plugins.entries.<key>" reference anywhere in the body.
+    for (const m of text.matchAll(/plugins\.entries\.([a-z0-9_-]+)/gi)) {
+      refs.add(`plugin:${m[1]}`);
+    }
+
+    // 2. metadata.openclaw.install array — declares download targets.
+    //    These are remote URLs the host fetches at install time. Surface them
+    //    so the auditor can apply the supply-chain rule even though the bytes
+    //    aren't in the snapshot.
+    for (const m of text.matchAll(/"url"\s*:\s*"(https?:\/\/[^"]+)"/g)) {
+      refs.add(`install-download:${m[1]}`);
+    }
+
+    // 3. Bare references to a sibling extension/plugin package by path or name.
+    //    Catch "extensions/<name>", "plugins/<name>", and "lib/<name>".
+    for (const m of text.matchAll(/\b(?:extensions|plugins|lib)\/([a-z0-9_-]+)/gi)) {
+      refs.add(`sibling:${m[0]}`);
+    }
+  }
+  return [...refs].sort();
 }
 
 function readFileForAudit(absPath: string, baseDir: string, maxBytes: number): SkillFile {
