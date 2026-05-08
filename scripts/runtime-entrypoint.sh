@@ -56,7 +56,7 @@ if [[ ! -f "${CONFIG_DIR}/.swarm/queue.md" ]]; then
 MD
 fi
 
-# ---- install our 7 extensions via the openclaw plugin registry ---------
+# ---- install our 9 extensions via the openclaw plugin registry ---------
 # `--link` points the registry at /app/extensions/<id>/ (read-only image) so
 # we don't duplicate code. `--force` is incompatible with --link, so we skip
 # install if the plugin is already in the registry from a prior boot.
@@ -73,6 +73,8 @@ declare -A PLUGINS=(
   [dot-swarm]=""
   [agent-primitives]=""
   [clawhub-skill-audit]=""
+  [model-switcher]=""
+  [oasis-voice]=""
 )
 
 # Probe what's already registered so re-runs don't fail.
@@ -233,6 +235,33 @@ if quarantine_dir:
     skill_audit_cfg["quarantineDir"] = quarantine_dir
 merge_config("clawhub-skill-audit", skill_audit_cfg)
 
+# model-switcher: agent tool + /setmodel slash command for hot-swapping the
+# default LLM. No required config; allowedProviders is opt-in via env so a tight
+# deployment can lock the agent to specific providers (defaults to unrestricted).
+model_switcher_cfg: dict = {}
+allowed_providers_env = os.environ.get("OASIS_MODEL_SWITCHER_ALLOWED_PROVIDERS", "").strip()
+if allowed_providers_env:
+    model_switcher_cfg["allowedProviders"] = [
+        item.strip() for item in allowed_providers_env.split(",") if item.strip()
+    ]
+merge_config("model-switcher", model_switcher_cfg)
+
+# oasis-voice: speech (TTS) + realtime STT backed by the oasis-voice sidecar.
+# Lite tier runs at 127.0.0.1:8731 (Piper TTS + Moonshine STT, CPU-only).
+# Cloud/GPU tiers: set OASIS_VOICE_ENDPOINT + OASIS_VOICE_BEARER_TOKEN.
+oasis_voice_endpoint = os.environ.get("OASIS_VOICE_ENDPOINT", "").strip() or "http://127.0.0.1:8731"
+oasis_voice_bearer = os.environ.get("OASIS_VOICE_BEARER_TOKEN", "").strip() or None
+oasis_voice_tts_voice = (
+    os.environ.get("OASIS_VOICE_TTS_VOICE", "").strip() or "piper:en_US-lessac-high"
+)
+oasis_voice_cfg: dict = {
+    "endpoint": oasis_voice_endpoint,
+    "tts_voice": oasis_voice_tts_voice,
+}
+if oasis_voice_bearer:
+    oasis_voice_cfg["bearer_token"] = oasis_voice_bearer
+merge_config("oasis-voice", oasis_voice_cfg)
+
 # ---- default LLM model (OPENCLAW_DEFAULT_MODEL env var) ----------------
 # Set via .env + make recreate, or live via `openclaw config set` + make restart.
 # Provider strings: "anthropic/claude-sonnet-4-6", "gemini/gemini-2.0-flash",
@@ -265,7 +294,8 @@ cat <<BANNER
    gateway token  : ${masked}
    plugins        : prompt-injection-reporting, secrets-vault,
                     approval-gate, session-history, dot-swarm,
-                    agent-primitives, clawhub-skill-audit
+                    agent-primitives, clawhub-skill-audit,
+                    model-switcher, oasis-voice
    config file    : ${CONFIG_FILE}
 ==============================================================
 BANNER

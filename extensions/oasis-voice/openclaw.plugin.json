@@ -1,0 +1,27 @@
+{
+  "id": "oasis-voice",
+  "name": "Oasis Voice",
+  "description": "TTS and streaming STT via oasis-voice sidecar (Piper TTS + Moonshine STT on the lite tier; GPU tiers available on the hosted endpoint).",
+  "contracts": {
+    "speechProviders": ["oasis-voice"],
+    "realtimeTranscriptionProviders": ["oasis-voice"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "endpoint": {
+        "type": "string",
+        "description": "Base URL of the oasis-voice HTTP server. Default: http://127.0.0.1:8731"
+      },
+      "tts_voice": {
+        "type": "string",
+        "description": "Default TTS voice passed to oasis-voice (e.g. piper:en_US-lessac-high). Default: piper:en_US-lessac-high"
+      },
+      "bearer_token": {
+        "type": "string",
+        "description": "Optional Bearer token for hosted/cloud oasis-voice endpoint (CLAW-013+). Not needed for local lite tier."
+      }
+    }
+  }
+}

@@ -1,4 +1,4 @@
-# oasis-claw runtime image — full openclaw gateway + our 7 extensions
+# oasis-claw runtime image — full openclaw gateway + our 9 extensions
 #
 # Uses npm-published openclaw@2026.4.26 (same version as vendor/openclaw submodule
 # pin) and bakes our extensions in at /app/extensions/<id>. tsx loads the .ts
@@ -22,6 +22,23 @@ RUN apt-get update && \
       ca-certificates curl git openssl python3 procps lsof jq && \
     rm -rf /var/lib/apt/lists/*
 
+# gog CLI for Gmail/Calendar/Drive (https://github.com/steipete/gogcli).
+# OAuth tokens are encrypted with GOG_KEYRING_PASSWORD and live in the
+# /home/node/.openclaw volume, so they persist across image rebuilds.
+# Releases ship as gogcli_<version>_<os>_<arch>.tar.gz; binary inside is `gog`.
+# TARGETARCH is set automatically by buildx (amd64 or arm64).
+ARG GOGCLI_VERSION=0.15.0
+ARG TARGETARCH
+RUN case "${TARGETARCH:-amd64}" in \
+      amd64) GOG_ARCH=linux_amd64 ;; \
+      arm64) GOG_ARCH=linux_arm64 ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL "https://github.com/steipete/gogcli/releases/download/v${GOGCLI_VERSION}/gogcli_${GOGCLI_VERSION}_${GOG_ARCH}.tar.gz" \
+      | tar -xz -C /usr/local/bin gog && \
+    chmod +x /usr/local/bin/gog && \
+    /usr/local/bin/gog --version
+
 # openclaw CLI + tsx + sharp installed globally.
 #
 # sharp MUST be global, not at /app/node_modules: openclaw's runtime lives at
@@ -41,7 +58,7 @@ WORKDIR /app
 RUN npm init -y >/dev/null && \
     npm install --omit=dev zod@4
 
-# Bake our 7 extensions into the image. Paths inside the container:
+# Bake our 9 extensions into the image. Paths inside the container:
 #   /app/extensions/<id>/{index.ts,openclaw.plugin.json,package.json,...}
 COPY extensions/ /app/extensions/
 

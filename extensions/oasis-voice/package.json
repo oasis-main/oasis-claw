@@ -1,0 +1,19 @@
+{
+  "name": "@oasis-claw/oasis-voice",
+  "version": "0.1.0",
+  "description": "openclaw plugin: oasis-voice TTS (SpeechProvider) and STT (RealtimeTranscriptionProvider) backed by a local or hosted oasis-voice sidecar",
+  "type": "module",
+  "devDependencies": {
+    "openclaw": "^2026.4.26",
+    "vitest": "^3.2.4"
+  },
+  "scripts": {
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest --passWithNoTests"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
