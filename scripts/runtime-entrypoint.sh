@@ -283,23 +283,33 @@ merge_config("oasis-voice", oasis_voice_cfg)
 
 # ---- audio media-understanding routing (CLAW-021) ----------------------
 # Telegram (and future iMessage) voice-message inbound: when a user sends
-# a voice note, openclaw's media-understanding pipeline picks ONE audio
-# provider to transcribe it. Force-pin oasis-voice as that provider so
-# the lite-tier local sidecar handles it — not whatever cloud STT provider
-# happens to be registered (deepgram / google / groq / etc., none of which
-# we want for Nimbus's voice-in path).
-#
-# Also pin baseUrl so the openclaw `MediaUnderstandingProvider` framework
-# passes the right URL to our `transcribeAudio` (see
-# extensions/oasis-voice/media-understanding-provider.ts). The plugin
-# defaults to the same URL but plumbing it through config lets a future
-# `openclaw config set` rotate it without touching env.
+# a voice note, openclaw's media-understanding pipeline picks an audio
+# provider to transcribe it. The valid config schema for this section is
+# enumerated in vendor/openclaw-source/src/config/media-audio-field-metadata.ts
+# — `tools.media.audio.provider` is NOT a valid key (which caused a config
+# validation failure on the first boot of d081484). The right route is:
+#   - Just enable the section: `tools.media.audio.enabled = true`
+#   - Let provider selection happen via the registered providers'
+#     autoPriority — our oasis-voice plugin sets
+#     `autoPriority: { audio: 10 }` which ranks ahead of the cloud
+#     providers (deepgram/google/groq at 20-30). So when oasis-voice is
+#     reachable, it wins; if it's down, an explicitly-configured cloud
+#     provider takes over.
+#   - If we ever NEED to hard-force (e.g. cloud STT key is configured
+#     but we still want local), add `tools.media.audio.models = [...]`
+#     with our model id first. Not needed today.
 config.setdefault("tools", {})
 config["tools"].setdefault("media", {})
 config["tools"]["media"].setdefault("audio", {})
 config["tools"]["media"]["audio"]["enabled"] = True
-config["tools"]["media"]["audio"]["provider"] = "oasis-voice"
 
+# Provider baseUrl + apiKey hand-off. The openclaw
+# MediaUnderstandingProvider framework reads these from
+# `models.providers.<id>` and passes them to our `transcribeAudio`
+# callback. Without them, the plugin falls back to its DEFAULT_ENDPOINT
+# (http://127.0.0.1:8731) which is wrong inside the openclaw container
+# (no sidecar at loopback); the docker-DNS name we set above is the
+# right value.
 config.setdefault("models", {})
 config["models"].setdefault("providers", {})
 config["models"]["providers"].setdefault("oasis-voice", {})
