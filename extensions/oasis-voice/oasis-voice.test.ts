@@ -55,6 +55,39 @@ describe("buildOasisVoiceSpeechProvider", () => {
     expect(result.outputFormat).toBe("wav");
     expect(result.fileExtension).toBe(".wav");
     expect(result.audioBuffer).toBeInstanceOf(Buffer);
+    // audio-file target must NOT request opus — that's a Telegram-style
+    // voice-note thing. WAV is the cheaper, more compatible default.
+    expect(url).not.toContain("format=opus");
+
+    fetchSpy.mockRestore();
+  });
+
+  it("synthesize requests opus + reports voice-compatible when target=voice-note", async () => {
+    const fakeOpus = Buffer.from("OggS\x00fake-opus-data");
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce({
+      ok: true,
+      arrayBuffer: async () => fakeOpus.buffer as ArrayBuffer,
+    } as Response);
+
+    const result = await provider.synthesize({
+      text: "hello from telegram",
+      providerConfig: { endpoint: "http://oasis-voice:8731" },
+      target: "voice-note",
+      timeoutMs: 5000,
+      cfg: {} as never,
+    });
+
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    const [url] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    // Must hit /v1/tts/speak WITH ?format=opus so oasis-voice does the
+    // WAV→opus transcode server-side. Telegram sendVoice rejects WAV.
+    expect(url).toContain("/v1/tts/speak");
+    expect(url).toContain("format=opus");
+
+    expect(result.outputFormat).toBe("opus");
+    expect(result.fileExtension).toBe(".ogg");
+    expect(result.voiceCompatible).toBe(true);
+    expect(result.audioBuffer).toBeInstanceOf(Buffer);
 
     fetchSpy.mockRestore();
   });

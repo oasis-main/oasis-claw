@@ -76,7 +76,19 @@ export function buildOasisVoiceSpeechProvider(): SpeechProviderPlugin {
       const voice = getVoice(req.providerConfig);
       const bearer = getBearer(req.providerConfig);
 
-      const res = await fetch(`${endpoint}/v1/tts/speak`, {
+      // When the framework asks for a "voice-note", channels like Telegram
+      // route the result through `sendVoice` — which only accepts opus-in-OGG,
+      // not WAV. Request `?format=opus` from oasis-voice so the WAV→opus
+      // transcode happens server-side (ffmpeg in the sidecar). For
+      // "audio-file" / "auto-detect" targets we keep WAV: it's cheaper and
+      // libsndfile-compatible everywhere we hand it off.
+      const wantsVoiceNote = req.target === "voice-note";
+      const url = new URL(`${endpoint}/v1/tts/speak`);
+      if (wantsVoiceNote) {
+        url.searchParams.set("format", "opus");
+      }
+
+      const res = await fetch(url.toString(), {
         method: "POST",
         headers: buildHeaders(bearer),
         body: JSON.stringify({ text: req.text, voice }),
@@ -88,9 +100,9 @@ export function buildOasisVoiceSpeechProvider(): SpeechProviderPlugin {
       const audioBuffer = Buffer.from(await res.arrayBuffer());
       return {
         audioBuffer,
-        outputFormat: "wav",
-        fileExtension: ".wav",
-        voiceCompatible: req.target === "voice-note",
+        outputFormat: wantsVoiceNote ? "opus" : "wav",
+        fileExtension: wantsVoiceNote ? ".ogg" : ".wav",
+        voiceCompatible: wantsVoiceNote,
       };
     },
 

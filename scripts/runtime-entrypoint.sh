@@ -307,6 +307,29 @@ config["models"]["providers"]["oasis-voice"]["baseUrl"] = oasis_voice_endpoint
 if oasis_voice_bearer:
     config["models"]["providers"]["oasis-voice"]["apiKey"] = oasis_voice_bearer
 
+# ---- outbound voice (CLAW-021): voice-in → voice-out ------------------
+# Three knobs together make this work:
+#   1. `messages.tts.provider = "oasis-voice"` — when openclaw decides to
+#      TTS a reply, it asks our SpeechProvider (not deepgram/elevenlabs/
+#      anything else that may register later). This is the OUTBOUND
+#      counterpart of the inbound `tools.media.audio.provider` pin above.
+#   2. `messages.tts.auto = "inbound"` — only TTS the reply when the
+#      INBOUND message was itself audio. Text-in → text-out (cheap path).
+#      Voice-note-in → voice-note-out (Nimbus speaks back). Other modes:
+#      "off" (never), "always" (every reply), "tagged" (a /tts toggle).
+#      "inbound" is the right default for the MVP — matches conversational
+#      cadence and doesn't spend Piper cycles on text-only chats.
+#   3. The plugin's SpeechProvider already requests `?format=opus` when
+#      the framework asks for a voice-note shape, so Telegram's sendVoice
+#      gets the right container. See speech-provider.ts.
+config.setdefault("messages", {})
+config["messages"].setdefault("tts", {})
+config["messages"]["tts"]["provider"] = "oasis-voice"
+# Don't overwrite an operator's explicit `auto` setting — only seed the
+# default if absent. If someone runs `openclaw config set messages.tts.auto
+# always`, we respect that on the next boot.
+config["messages"]["tts"].setdefault("auto", "inbound")
+
 # browser: vendored openclaw `browser` plugin (extensions/browser/).
 # Manifest declares `onConfigPaths: ["browser"]`, so this plugin reads its
 # runtime config from the TOP-LEVEL `browser` key in openclaw.json — NOT
