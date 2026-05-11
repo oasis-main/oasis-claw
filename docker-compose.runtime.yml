@@ -158,10 +158,10 @@ services:
       - no-new-privileges:true
     healthcheck:
       # /healthz is a cheap liveness probe — no model invocation required.
-      # /v1/tiers also exists but /healthz is the canonical liveness route.
+      # oasis-voice image has no curl; use Python stdlib urllib instead.
       test:
         - "CMD-SHELL"
-        - "curl -fsS http://127.0.0.1:8731/healthz >/dev/null"
+        - "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8731/healthz')\""
       interval: 30s
       timeout: 5s
       retries: 5
