@@ -1,0 +1,16 @@
+{
+  "source": "AUDIT-NARROWED snapshot derived from extensions/browser/skills/browser-automation/SKILL.md",
+  "vendoredFromSha": "e3b919fd0759a7c3399ff8841b46dbfb4fd2bbde",
+  "downloadedAt": "2026-05-09T00:00:00Z",
+  "tool": "hand-authored audit slice (CLAW-014 second-pass)",
+  "files": [
+    {
+      "path": "SKILL.md",
+      "size": 4973,
+      "sha256": "3ead105eaea375ed200a948e982c2b330f3a2288542b0602c766a764724a5400"
+    }
+  ],
+  "note": "Static audit only. Not a real installable skill — this is an audit-narrowing snapshot that points the auditor at the evaluate() ARBITRARY-JS PATH of the openclaw browser plugin (pw-tools-core.interactions.ts evaluate branch, browser-config.ts DEFAULT_BROWSER_EVALUATE_ENABLED, pw-tools-core.interactions.evaluate.abort.test.ts, server.evaluate-disabled-does-not-block-storage.test.ts, plus pw-ai-module.ts / pw-ai.ts / act-policy.ts / client-actions-core.ts as adjacent risk). Companion snapshots: browser-auth, browser-ssrf. CLAW-015 will add patches on top of this code; this audit baselines current state.",
+  "auditTask": "CLAW-014 (second pass — evaluate path)",
+  "inspectorRoot": "vendor/openclaw-source/extensions"
+}

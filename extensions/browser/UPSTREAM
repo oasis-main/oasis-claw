@@ -1,0 +1,85 @@
+# extensions/browser — vendored from upstream openclaw
+#
+# This file is the source of truth for what version of the browser plugin
+# we ship, and the refresh script in scripts/refresh-browser-plugin.sh
+# (CLAW-016) reads it on every run. Do NOT edit by hand without also
+# bumping the corresponding ARG in Dockerfile.runtime — they must agree.
+#
+# Three layered pins, each independently bumpable when a CVE drops at
+# that layer:
+#   1. openclaw browser plugin SOURCE
+#   2. playwright-core (the JS library, NOT the Chromium binary)
+#   3. Chromium revision (the binary blob inside the Playwright cache)
+#
+# See .swarm/queue.md CLAW-014 / CLAW-015 / CLAW-016 / CLAW-017 for the full plan.
+
+# ── 1. openclaw browser plugin source ─────────────────────────────────
+# Vendored on 2026-05-08 from a local clone of openclaw at this SHA.
+# Our vendor/openclaw-source clone is at the same SHA — the refresh
+# script diffs against this to detect drift.
+upstream_repo:    https://github.com/openclaw/openclaw
+upstream_path:    extensions/browser
+upstream_sha:     e3b919fd0759a7c3399ff8841b46dbfb4fd2bbde
+vendored_on:      2026-05-08
+
+# ── 2. playwright-core ────────────────────────────────────────────────
+# Pinned in upstream extensions/browser/package.json. We mirror that
+# pin in Dockerfile.runtime's /app install layer (NOT in this plugin's
+# package.json) so the runtime image is the source of truth.
+playwright_core_version: 1.59.1
+
+# ── 3. Chromium revision ──────────────────────────────────────────────
+# Resolved from playwright-core@1.59.1's browsers.json. Playwright lays
+# the binary out at $PLAYWRIGHT_BROWSERS_PATH/chromium-<rev>/. The
+# Dockerfile asserts `test -d` on that path so a silently-republished
+# build trips the build instead of shipping unverified bytes.
+chromium_revision:        1217
+chromium_browser_version: 147.0.7727.15
+chromium_title:           Chrome for Testing
+# Note (2026-05-11): The installed Chromium binary self-reports
+# `147.0.7727.0` even though playwright-core@1.59.1's browsers.json
+# declares `147.0.7727.15`. This is a known Playwright-side drift —
+# the manifest version doesn't always match the binary's reported
+# version. The REVISION (1217) is the actual enforced pin (via the
+# `test -d` build assertion in Dockerfile.runtime). The browser_version
+# field above mirrors browsers.json for traceability; do not panic if
+# `chrome --version` inside the container reports a slightly different
+# patch level.
+# Headless shell is shipped alongside (Playwright installs both by default
+# unless we set PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD or pass an explicit list).
+chromium_headless_shell_revision: 1217
+
+# ── Patches ───────────────────────────────────────────────────────────
+# Local patches live under extensions/browser/patches/ and are applied
+# on top of the vendored tree (so the working tree is buildable as-is).
+# CLAW-015 will add the first three:
+#   0001-require-evaluate-audit-log.patch
+#   0002-default-tracing-on.patch
+#   0003-evaluate-history-security-collector.patch
+patches_dir: extensions/browser/patches
+applied_patches: []   # populated as CLAW-015 lands
+
+# ── How to bump ───────────────────────────────────────────────────────
+# Mode A (just Chromium, e.g. for a Chromium-only CVE):
+#   - Bump chromium_revision + chromium_browser_version above.
+#   - Bump CHROMIUM_REVISION ARG in Dockerfile.runtime.
+#   - Rebuild image; the `test -d` assertion fails loud if the bumped
+#     revision dir doesn't exist after `playwright install`.
+#
+# Mode B (Playwright release, e.g. for a Playwright-only CVE):
+#   - Bump playwright_core_version above.
+#   - Read the matching Chromium revision from the new playwright-core's
+#     browsers.json; bump chromium_* fields too.
+#   - Bump PLAYWRIGHT_VERSION + CHROMIUM_REVISION ARGs.
+#
+# Mode C (openclaw upstream bump, full refresh):
+#   - Run scripts/refresh-browser-plugin.sh (CLAW-016).
+#   - It rsyncs upstream into a scratch tree, replays patches/, runs
+#     the audit pipeline, and either opens a PR (success) or an issue
+#     (conflict / new high-severity finding).
+#
+# Mode D (kill switch, "shipped the bump" gap):
+#   - Apply patches/000N-disable-browser-plugin.patch which flips
+#     `enabledByDefault: false` in openclaw.plugin.json.
+#   - Rebuild. Voice/messaging stays up; only browser-tool agents
+#     are affected until the gap closes.

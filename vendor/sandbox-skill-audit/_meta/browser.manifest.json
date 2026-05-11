@@ -1,0 +1,16 @@
+{
+  "source": "github.com/openclaw/openclaw/tree/<sha>/extensions/browser/skills/browser-automation",
+  "vendoredFromSha": "e3b919fd0759a7c3399ff8841b46dbfb4fd2bbde",
+  "downloadedAt": "2026-05-08T00:00:00Z",
+  "tool": "manual copy from vendor/openclaw-source clone",
+  "files": [
+    {
+      "path": "SKILL.md",
+      "size": 4838,
+      "sha256": "9073ece929455f3811c2dd047d8d8247c6df70c9c46b0765f7b65fe70dc78f27"
+    }
+  ],
+  "note": "Static audit only. Not executed. SKILL.md was AUGMENTED for the audit input vs. the upstream original (which has no metadata.openclaw frontmatter): we added `metadata.openclaw.requires.config: [\"plugins.entries.browser.enabled\"]` so the auditor's `detectExternalRefs` recognizes `plugin:browser` and uses `inspect_file` to deep-walk `extensions/browser/`. We also appended a final `## Implementation backing` section pointing the auditor at the security-relevant source files (bridge-server, control-auth, request-policy, cdp-reachability-policy, navigation-guard, csrf, pw-tools-core evaluate path, browser-profiles, SSRF tests). The body content is otherwise byte-identical to the upstream skill's SKILL.md.",
+  "auditTask": "CLAW-014",
+  "inspectorRoot": "vendor/openclaw-source/extensions"
+}

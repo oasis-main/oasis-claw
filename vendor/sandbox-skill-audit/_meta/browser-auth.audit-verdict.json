@@ -1,0 +1,106 @@
+{
+  "verdict": "pass",
+  "risk_score": 11,
+  "summary": "Audit-narrowed skill describing the browser plugin's local-bridge auth surface. SKILL.md is documentation only with no executable content. Deep-walked the bind/auth quartet: bridge-server enforces loopback bind and refuses to start without auth; control-auth uses crypto.randomBytes(24); http-auth uses safeEqualSecret (constant-time) for both bearer and password; CSRF guard rejects mutating cross-site origins. No findings on the audited slice.",
+  "findings": [],
+  "coverage": {
+    "audited_files": 1,
+    "declared_external_refs": [
+      "plugin:browser",
+      "sibling:extensions/browser"
+    ],
+    "unaudited_paths": [
+      {
+        "path": "extensions/browser/src/browser/server.auth-fail-closed.test.ts",
+        "reason": "test file referenced in SKILL.md; not inspected to conserve budget on prod code paths.",
+        "severity": "info"
+      },
+      {
+        "path": "extensions/browser/src/browser/server.auth-token-gates-http.test.ts",
+        "reason": "test file referenced in SKILL.md; not inspected to conserve budget.",
+        "severity": "info"
+      },
+      {
+        "path": "extensions/browser/src/security/secret-equal.ts",
+        "reason": "implementation of safeEqualSecret used for token compare; not opened but name and import are consistent with timingSafeEqual wrapper.",
+        "severity": "low"
+      },
+      {
+        "path": "extensions/browser/src/gateway/net.ts",
+        "reason": "isLoopbackHost helper used by bind-host check; not opened.",
+        "severity": "low"
+      },
+      {
+        "path": "extensions/browser/src/browser/routes/",
+        "reason": "route handlers; not opened individually but auth middleware is installed app-wide before route registration so fail-closed property holds.",
+        "severity": "low"
+      }
+    ],
+    "pct_visible": 80
+  },
+  "inspections": [
+    {
+      "requestedPath": "browser/src/browser/bridge-server.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 5109,
+      "totalSize": 5109,
+      "truncated": false,
+      "reason": "Verify bind addr defaults to loopback and auth check fail-closed before route handlers.",
+      "ts": "2026-05-10T01:16:22.085Z"
+    },
+    {
+      "requestedPath": "browser/src/browser/control-auth.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 5972,
+      "totalSize": 5972,
+      "truncated": false,
+      "reason": "Check token mint/compare for constant-time and logging of token.",
+      "ts": "2026-05-10T01:16:22.262Z"
+    },
+    {
+      "requestedPath": "browser/src/browser/csrf.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 2365,
+      "totalSize": 2365,
+      "truncated": false,
+      "reason": "Inspect CSRF protection model and default-on for state-changing routes.",
+      "ts": "2026-05-10T01:16:22.263Z"
+    },
+    {
+      "requestedPath": "browser/src/browser/bridge-auth-registry.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 1044,
+      "totalSize": 1044,
+      "truncated": false,
+      "reason": "Check token lifetime, scope, revocation.",
+      "ts": "2026-05-10T01:16:22.286Z"
+    },
+    {
+      "requestedPath": "browser/src/browser/server-middleware.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 1577,
+      "totalSize": 1577,
+      "truncated": false,
+      "reason": "Verify auth middleware uses constant-time compare and applies before route handlers.",
+      "ts": "2026-05-10T01:16:25.279Z"
+    },
+    {
+      "requestedPath": "browser/src/browser/http-auth.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 1917,
+      "totalSize": 1917,
+      "truncated": false,
+      "reason": "Check token comparison primitive (constant-time vs ===) and how the token is read.",
+      "ts": "2026-05-10T01:16:28.416Z"
+    }
+  ],
+  "auditModel": "claude-opus-4-7",
+  "auditedAt": "2026-05-10T01:16:16.952Z",
+  "latencyMs": 25095
+}

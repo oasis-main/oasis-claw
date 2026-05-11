@@ -1,0 +1,228 @@
+# Weekly upstream-drift refresh for the vendored `browser` plugin.
+#
+# This workflow is the ONLY mechanism by which upstream openclaw code
+# reaches our deployed image. It calls scripts/refresh-browser-plugin.sh,
+# which:
+#   1. Fetches upstream openclaw at HEAD (or a manually-specified ref).
+#   2. Rsyncs upstream/extensions/browser/ + replays our patches.
+#   3. Re-runs the full audit cohort (broad / auth / ssrf / evaluate / ai-loop)
+#      with --live --inspect against ANTHROPIC_API_KEY.
+#   4. Either opens a PR to `dev` (clean refresh, audit pass) or opens an
+#      issue (patch conflict / audit regression).
+#
+# Until the PR merges, the deployed extensions/browser/ stays at the
+# previous pin. That's the load-bearing property — supply-chain drift
+# is a normal commit on top, gated by an audit.
+#
+# Schedule: Monday 09:00 UTC weekly. Plus manual workflow_dispatch with
+# optional ref input (kill-switch testing).
+
+name: refresh-browser
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream openclaw ref to refresh against (default: HEAD)"
+        required: false
+        default: ""
+
+# Only one refresh in flight at a time — refreshes mutate
+# extensions/browser/ and the working tree.
+concurrency:
+  group: refresh-browser
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  refresh:
+    name: refresh + audit + PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - name: Checkout dev
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # System tools the refresh script expects.
+      - name: Install jq + rsync
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends jq rsync
+
+      # Run the refresh. Exit codes:
+      #   0 = clean refresh (we open a PR)
+      #   2 = no-op (upstream unchanged; skip rest of workflow)
+      #   3 = patch conflict (we open an issue)
+      #   4 = audit regression (we open an issue)
+      #   5 = invariant violation (we open an issue)
+      - name: Run refresh script
+        id: refresh
+        continue-on-error: true
+        run: |
+          set +e
+          UPSTREAM_REF="${{ inputs.upstream_ref }}"
+          if [ -n "$UPSTREAM_REF" ]; then
+            REF_ARG="--upstream-ref=$UPSTREAM_REF"
+          else
+            REF_ARG=""
+          fi
+          scripts/refresh-browser-plugin.sh --live $REF_ARG | tee refresh.log
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: Parse refresh outcome
+        id: outcome
+        run: |
+          set -e
+          rc="${{ steps.refresh.outputs.rc }}"
+          echo "rc=$rc"
+          case "$rc" in
+            0) echo "kind=pr" ;;
+            2) echo "kind=noop" ;;
+            3) echo "kind=conflict" ;;
+            4) echo "kind=audit-regression" ;;
+            *) echo "kind=invariant-violation" ;;
+          esac >> "$GITHUB_OUTPUT"
+
+          # Pull the trailing JSON summary block for PR / issue bodies.
+          if grep -q '^::summary::' refresh.log; then
+            awk '/^::summary::/{flag=1;next}flag' refresh.log > refresh-summary.json
+            cat refresh-summary.json
+          else
+            echo '{}' > refresh-summary.json
+          fi
+
+      # ───── clean refresh: open PR ─────
+      - name: Create PR (clean refresh)
+        if: steps.outcome.outputs.kind == 'pr'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          base: dev
+          branch: refresh/browser-${{ github.run_id }}
+          commit-message: |
+            refresh(browser): bump vendored plugin to upstream HEAD
+
+            Automated by .github/workflows/refresh-browser.yml.
+            Audit cohort: pass. See PR body for details.
+          title: "refresh(browser): bump vendored plugin to upstream HEAD"
+          body: |
+            ## Upstream-drift refresh
+
+            Weekly refresh of `extensions/browser/` against upstream openclaw.
+            Audit cohort ran live and all slices returned `pass` (or `warn`
+            with mitigations already in force — see AUDIT_LOG.md).
+
+            ### Refresh summary
+
+            ```json
+            $(cat refresh-summary.json)
+            ```
+
+            ### What changed
+
+            See file diff. Security-keyword hits in the upstream diff are
+            logged in the workflow run (job `refresh + audit + PR`).
+
+            ### Audit verdicts (this refresh)
+
+            Verdict files in `vendor/sandbox-skill-audit/_meta/`:
+            - `browser.audit-verdict.json`
+            - `browser-auth.audit-verdict.json`
+            - `browser-ssrf.audit-verdict.json`
+            - `browser-evaluate.audit-verdict.json`
+            - `browser-ai-loop.audit-verdict.json`
+
+            Compare against the previous-pin row in
+            [AUDIT_LOG.md](../blob/dev/AUDIT_LOG.md) to see what changed.
+
+            ### Before merging
+
+            - [ ] Read the upstream diff with attention to the security-
+                  keyword hits (workflow log, "security-keyword hits in
+                  diff" section).
+            - [ ] Confirm all five verdict files still show `pass` (or a
+                  previously-accepted `warn`).
+            - [ ] Append a row to `AUDIT_LOG.md`'s change-log section.
+
+            ---
+
+            🤖 Generated by `refresh-browser.yml` · CLAW-016 / CLAW-017
+          labels: |
+            refresh
+            automated
+            browser-plugin
+          delete-branch: true
+
+      # ───── conflict / regression / invariant: open issue ─────
+      - name: Open issue (refresh blocked)
+        if: steps.outcome.outputs.kind == 'conflict' || steps.outcome.outputs.kind == 'audit-regression' || steps.outcome.outputs.kind == 'invariant-violation'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const kind = '${{ steps.outcome.outputs.kind }}';
+            const rc = '${{ steps.refresh.outputs.rc }}';
+            const log = fs.readFileSync('refresh.log', 'utf8').slice(-12000);
+            const titlePrefix = {
+              'conflict': 'refresh-browser: patch conflict on upstream bump',
+              'audit-regression': 'refresh-browser: AUDIT REGRESSION on upstream bump',
+              'invariant-violation': 'refresh-browser: invariant violation',
+            }[kind];
+            const body = [
+              `## Automated refresh blocked: \`${kind}\` (exit ${rc})`,
+              '',
+              kind === 'conflict' ? '**Patch replay failed.** A patch in `extensions/browser/patches/` no longer applies to upstream HEAD. Re-derive the fix against the new tree and save it as the next-numbered patch.' : '',
+              kind === 'audit-regression' ? '**Audit regressed.** A slice returned `block` or otherwise failed. Investigate before merging — upstream may have introduced a vuln or adversarial design.' : '',
+              kind === 'invariant-violation' ? '**Invariant violation.** The refresh script aborted before getting to the audit step (e.g. UPSTREAM file malformed, ANTHROPIC_API_KEY missing).' : '',
+              '',
+              '### Workflow run',
+              '',
+              `[Run ${context.runId}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+              '',
+              '### Tail of refresh.log',
+              '',
+              '```',
+              log,
+              '```',
+              '',
+              '---',
+              '🤖 Generated by `refresh-browser.yml` · CLAW-016 / CLAW-017',
+            ].join('\n');
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: titlePrefix,
+              body,
+              labels: ['refresh', 'blocked', 'browser-plugin'],
+            });
+
+      # ───── no-op: nothing to do ─────
+      - name: No-op (upstream unchanged)
+        if: steps.outcome.outputs.kind == 'noop'
+        run: |
+          echo "::notice::No upstream change since last refresh. Pinned SHA already at upstream HEAD."

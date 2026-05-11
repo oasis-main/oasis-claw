@@ -1,0 +1,22 @@
+{
+  "name": "@oasis-claw/model-switcher",
+  "version": "0.1.0",
+  "description": "openclaw plugin: self-referencing LLM swap (switch_model agent tool + /setmodel slash command)",
+  "type": "module",
+  "devDependencies": {
+    "openclaw": "workspace:*",
+    "vitest": "^3.0.0"
+  },
+  "scripts": {
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest --passWithNoTests"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "zod": "^4.4.1"
+  }
+}

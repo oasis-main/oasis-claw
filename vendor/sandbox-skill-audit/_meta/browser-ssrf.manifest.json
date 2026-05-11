@@ -1,0 +1,16 @@
+{
+  "source": "AUDIT-NARROWED snapshot derived from extensions/browser/skills/browser-automation/SKILL.md",
+  "vendoredFromSha": "e3b919fd0759a7c3399ff8841b46dbfb4fd2bbde",
+  "downloadedAt": "2026-05-09T00:00:00Z",
+  "tool": "hand-authored audit slice (CLAW-014 second-pass)",
+  "files": [
+    {
+      "path": "SKILL.md",
+      "size": 4373,
+      "sha256": "bf7db8fc992e5660ba694b0e5f52aa722028c611076fce4631ba827e497f5eb9"
+    }
+  ],
+  "note": "Static audit only. Not a real installable skill — this is an audit-narrowing snapshot that points the auditor at the SSRF / OUTBOUND REQUEST SURFACE of the openclaw browser plugin (request-policy.ts, cdp-reachability-policy.ts, navigation-guard.ts, cdp-proxy-bypass.ts, ssrf-policy-helpers.ts, url-pattern.ts, plus chrome.loopback-ssrf.integration.test.ts and pw-tools-core.browser-ssrf-guard.test.ts). Companion snapshots: browser-auth, browser-evaluate.",
+  "auditTask": "CLAW-014 (second pass — SSRF surface)",
+  "inspectorRoot": "vendor/openclaw-source/extensions"
+}

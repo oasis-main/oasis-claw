@@ -1,0 +1,18 @@
+{
+  "source": "github.com/openclaw/openclaw/tree/main/skills/voice-call",
+  "downloadedAt": "2026-05-06T19:16:24Z",
+  "tool": "gh api raw",
+  "files": [
+    {
+      "path": "AUDIT_VERDICT.json",
+      "size": 1213,
+      "sha256": "71974aa1cdce7bcbd26431e6310f075e420b6c52e351bc91f8ba7b704a0aea04"
+    },
+    {
+      "path": "SKILL.md",
+      "size": 1159,
+      "sha256": "d3e2c6d3d4ab409b186684d250d77f47117a466d33e9d83e23f60831e768b3f4"
+    }
+  ],
+  "note": "Static audit only. Not executed."
+}

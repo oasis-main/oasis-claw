@@ -1,0 +1,50 @@
+{
+  "verdict": "pass",
+  "risk_score": 14,
+  "summary": "The voice-call skill is a thin documentation wrapper for the openclaw voice-call plugin. SKILL.md describes CLI commands, tool actions, and provider config (Twilio/Telnyx/Plivo/mock). The plugin's index.ts confirms expected behavior: registers gateway methods, a tool, and CLI under proper scopes; sensitive config fields are flagged; no exfiltration, eval, or injection patterns observed.",
+  "findings": [],
+  "coverage": {
+    "audited_files": 1,
+    "declared_external_refs": [
+      "plugin:voice-call"
+    ],
+    "unaudited_paths": [
+      {
+        "path": "voice-call/runtime-entry.ts",
+        "reason": "Runtime construction (provider drivers, webhook server) not inspected; behavior plausible from index.ts.",
+        "severity": "low"
+      },
+      {
+        "path": "voice-call/src/providers/",
+        "reason": "Twilio/Telnyx/Plivo provider implementations not inspected; they handle credentials and outbound HTTP.",
+        "severity": "medium"
+      },
+      {
+        "path": "voice-call/src/cli.ts",
+        "reason": "CLI registration not inspected; consistent with documented commands.",
+        "severity": "low"
+      },
+      {
+        "path": "voice-call/src/config.ts",
+        "reason": "Config resolution / validation not inspected.",
+        "severity": "low"
+      }
+    ],
+    "pct_visible": 70
+  },
+  "inspections": [
+    {
+      "requestedPath": "voice-call/index.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 32290,
+      "totalSize": 32290,
+      "truncated": false,
+      "reason": "Verify the voice-call plugin entry point matches the skill's stated behavior.",
+      "ts": "2026-05-07T16:24:30.920Z"
+    }
+  ],
+  "auditModel": "claude-opus-4-7",
+  "auditedAt": "2026-05-07T16:24:28.492Z",
+  "latencyMs": 12575
+}

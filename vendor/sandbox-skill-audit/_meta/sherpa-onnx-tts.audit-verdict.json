@@ -1,0 +1,49 @@
+{
+  "verdict": "pass",
+  "risk_score": 13,
+  "summary": "Skill is a thin Node.js wrapper around the sherpa-onnx offline TTS CLI. The wrapper resolves runtime/model dirs from env or flags, validates files exist, sets platform-appropriate library paths, and invokes the binary via spawnSync with an argv array (no shell). No prompt injection, exfiltration, persistence, or destructive ops detected. Only concern is install-time downloads from GitHub releases without checksum pinning, which is informational.",
+  "findings": [
+    {
+      "category": "supply_chain",
+      "severity": "info",
+      "file": "SKILL.md",
+      "detail": "Downloads runtime binaries and model from GitHub releases without checksum/signature pinning."
+    }
+  ],
+  "coverage": {
+    "audited_files": 2,
+    "declared_external_refs": [
+      "install-download:https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-lessac-high.tar.bz2",
+      "install-download:https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.12.23/sherpa-onnx-v1.12.23-linux-x64-shared.tar.bz2",
+      "install-download:https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.12.23/sherpa-onnx-v1.12.23-osx-universal2-shared.tar.bz2",
+      "install-download:https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.12.23/sherpa-onnx-v1.12.23-win-x64-shared.tar.bz2"
+    ],
+    "unaudited_paths": [
+      {
+        "path": "install-download:https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.12.23/sherpa-onnx-v1.12.23-linux-x64-shared.tar.bz2",
+        "reason": "Install-time binary download from upstream GitHub release; not on disk. No checksum/signature pinning declared.",
+        "severity": "info"
+      },
+      {
+        "path": "install-download:https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.12.23/sherpa-onnx-v1.12.23-osx-universal2-shared.tar.bz2",
+        "reason": "Install-time binary download from upstream GitHub release; not on disk. No checksum/signature pinning declared.",
+        "severity": "info"
+      },
+      {
+        "path": "install-download:https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.12.23/sherpa-onnx-v1.12.23-win-x64-shared.tar.bz2",
+        "reason": "Install-time binary download from upstream GitHub release; not on disk. No checksum/signature pinning declared.",
+        "severity": "info"
+      },
+      {
+        "path": "install-download:https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-lessac-high.tar.bz2",
+        "reason": "Install-time model download from upstream GitHub release; not on disk. No checksum/signature pinning declared.",
+        "severity": "info"
+      }
+    ],
+    "pct_visible": 85
+  },
+  "inspections": [],
+  "auditModel": "claude-opus-4-7",
+  "auditedAt": "2026-05-07T16:24:15.415Z",
+  "latencyMs": 13073
+}

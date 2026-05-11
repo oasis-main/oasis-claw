@@ -4,3 +4,17 @@ node_modules/
 dist/
 .env
 .env.local
+
+# OAuth client secrets (Google / GCP, etc.) — never commit
+client_secret*.json
+*-client-secret.json
+service-account*.json
+
+# Claude Code local session metadata (settings, worktree state)
+.claude/
+
+# Upstream openclaw clone used by audit-sandbox.ts as the auditor's
+# inspector root. Auto-cloned on demand by scripts/audit-sandbox.ts.
+# ~2GB on disk, no reason to track it — the SHA we depend on lives in
+# extensions/browser/UPSTREAM, not in this clone.
+vendor/openclaw-source/

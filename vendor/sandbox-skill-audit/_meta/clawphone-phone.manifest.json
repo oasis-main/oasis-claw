@@ -1,0 +1,18 @@
+{
+  "source": "github.com/ranacseruet/clawphone/tree/main/skills/phone",
+  "downloadedAt": "2026-05-06T19:16:24Z",
+  "tool": "gh api raw",
+  "files": [
+    {
+      "path": "AUDIT_VERDICT.json",
+      "size": 338,
+      "sha256": "beb4868e6bdc99a03171364943d72175492b19c8f42c8535d9ee0eee41b80f37"
+    },
+    {
+      "path": "SKILL.md",
+      "size": 1890,
+      "sha256": "b0719f3ea90a1658355a239a9fedfb73371095582bc47b26ce96aeb0f30bd468"
+    }
+  ],
+  "note": "Static audit only. Not executed."
+}

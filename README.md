@@ -1,6 +1,6 @@
 # oasis-claw
 
-Vanilla [openclaw](https://github.com/openclaw/openclaw) is a capable AI gateway, but it ships without answers to four production concerns: **what happens when the model is manipulated**, **where credentials go when the user pastes them**, **how you audit what the agent actually did**, and **what stops a malicious skill from the registry running before you ever look at it**. oasis-claw is a thin plugin layer that fills exactly those gaps — no fork, no divergence from upstream, just seven focused extensions on top of the standard plugin SDK.
+Vanilla [openclaw](https://github.com/openclaw/openclaw) is a capable AI gateway, but it ships without answers to four production concerns: **what happens when the model is manipulated**, **where credentials go when the user pastes them**, **how you audit what the agent actually did**, and **what stops a malicious skill from the registry running before you ever look at it**. oasis-claw is a thin plugin layer that fills exactly those gaps — no fork, no divergence from upstream, ten focused extensions on top of the standard plugin SDK. Seven are the security/observability surface; three (`oasis-voice`, `model-switcher`, `browser`) ship voice + LLM-routing + headless-browser capability. Anything we vendor in from upstream (currently just `browser`) is pinned, audited, and refresh-gated — see [AUDIT_LOG.md](./AUDIT_LOG.md).
 
 ## What this adds over vanilla openclaw
 
@@ -13,6 +13,9 @@ Vanilla [openclaw](https://github.com/openclaw/openclaw) is a capable AI gateway
 | Agent loses all context on session reset | `dot-swarm` | Injects `.swarm/state.md`, `.swarm/queue.md`, and peer files into every session's memory section via `registerMemoryPromptSupplement`; agent always knows where it left off |
 | No explicit agent lifecycle signals | `agent-primitives` | `sleep`, `dream`, and `compact` tools let the agent voluntarily yield, consolidate memory, and hand off cleanly at context ceiling |
 | Clawhub skills install with zero security review | `clawhub-skill-audit` | Auto-fires an Opus 4.7 audit on every newly installed skill (SKILL.md + bundled scripts), writes an immutable JSON trail, and optionally quarantines `block`-verdict skills before they're loaded by an agent |
+| LLM provider is hardcoded per session | `model-switcher` | `setmodel` agent tool + `/setmodel` slash command for hot-swapping the active model without a recreate; optional `allowedProviders` lock-down |
+| No native voice (TTS / streaming STT) | `oasis-voice` | Registers as openclaw `SpeechProvider` + `RealtimeTranscriptionProvider`; lite tier is Piper TTS + Moonshine STT, runnable on a laptop CPU |
+| No headless browser tool — vendored from upstream | `browser` | Chromium via Playwright with control-auth, SSRF guards, and `evaluateEnabled` forced off-by-default at our config layer; pinned + audited per [AUDIT_LOG.md](./AUDIT_LOG.md) |
 
 ### Security
 
@@ -34,7 +37,7 @@ Every LLM input, output, and tool call is written to an append-only JSONL file b
 
 ## Running with Docker
 
-The runtime image bakes all seven extensions in at build time. Credentials come from `.env`.
+The runtime image bakes all ten extensions in at build time. Credentials come from `.env`. The build also pulls in pinned Chromium + Playwright via the `browser` plugin (~400MB on top of bookworm-slim). See [AUDIT_LOG.md](./AUDIT_LOG.md) for the per-plugin audit verdicts that gate every release.
 
 ```sh
 cp .env.example .env
@@ -105,6 +108,21 @@ make restart
 ```
 
 The `.env.example` in the repo documents all four priority providers with every model string and required credential.
+
+---
+
+## Auditing the openclaw plugins we vendor in
+
+Most of what we ship is our own code. But for capabilities that already exist upstream (the `browser` plugin is the canonical example — Chromium+Playwright with auth, SSRF guards, profiles, ~39k LOC), forking is the wrong shape and an unaudited `npm install` is worse. Our policy:
+
+1. **Vendor, don't fork.** We `cp -R` the upstream plugin into `extensions/<id>/` and record the source commit in `extensions/<id>/UPSTREAM`. The vendored tree is buildable as-is; any local modifications live as numbered patches in `extensions/<id>/patches/` and are also applied to `src/` so there's a single working tree.
+2. **Three layered pins, separately bumpable.** For plugins with binary dependencies, we pin (a) the openclaw plugin source SHA, (b) any JS library version (e.g. `playwright-core`), and (c) the binary blob revision (e.g. Chromium revision). A CVE at any one layer can be addressed without touching the others. The Dockerfile asserts the pinned binary path exists at build time so a silently-republished build trips the build, not a deploy.
+3. **Audit before merge.** Every vendored plugin is fed to `clawhub-skill-audit` in `--inspect` mode (Opus 4.7, multi-turn, with budgeted file inspection from the plugin source tree). Verdicts of `pass` / `warn` / `block` and the full inspection trail are written under `vendor/sandbox-skill-audit/_meta/<id>.audit-verdict.json`. Server-side rule: any high-severity unaudited path or medium+ auditability finding caps the verdict at `warn` and blocks `pass`. For the `browser` plugin we ran four targeted audit slices (broad / auth / SSRF / evaluate / AI-loop) to drive `pct_visible` above 70% on the security-sensitive surface. The verdict files and the runbook are in [AUDIT_LOG.md](./AUDIT_LOG.md).
+4. **Findings become entrypoint config, not aspirational docs.** The browser audit found that upstream defaults `evaluateEnabled = true`. The fix isn't a doc note; it's a literal line in [`scripts/runtime-entrypoint.sh`](scripts/runtime-entrypoint.sh) that writes `browser.evaluateEnabled = false` into `openclaw.json` on every boot. Removing that line requires writing the per-session opt-in + audit-log patches first (CLAW-015).
+5. **Refresh, don't auto-merge.** The CLAW-016 weekly job (`scripts/refresh-browser-plugin.sh`) `rsync`s upstream into a scratch tree, replays our patches, re-runs the audit, and either opens a PR (success) or an issue (conflict / new high-severity finding). The refresh job is the **only** mechanism by which upstream code reaches a deployed image — until the PR merges, our `extensions/browser/` stays at the pinned SHA. That property is load-bearing: it converts "supply-chain drift" into "a normal commit on top, gated by an audit."
+6. **Upstream-bumps publish to the same log.** Every audit verdict, refresh PR, and CVE response gets a timestamped row in [AUDIT_LOG.md](./AUDIT_LOG.md). It's the single place to see what's been audited, when, by what model, with what verdict, and what mitigations are in force.
+
+When a Chromium CVE drops in the gap window between Google's patch and Playwright's release, our mitigations in priority order are: (a) tighten `navigation-guard` allowlist via patch + rebuild, (b) flip `enabledByDefault: false` as a kill switch (voice/messaging stay up; only browser-tool agents are affected), (c) build our own Chromium tarball as escalation. The runbook lives in [extensions/browser/UPSTREAM](./extensions/browser/UPSTREAM).
 
 ---
 
@@ -317,12 +335,16 @@ oasis-claw/
     dot-swarm/                   # memory prompt supplement: injects .swarm/ files into context
     agent-primitives/            # sleep / dream / compact lifecycle tools (stubs, FS side wired)
     clawhub-skill-audit/         # Opus 4.7 auto-audit of newly installed skills + JSON audit trail
+    model-switcher/              # setmodel tool + /setmodel slash; hot-swap LLM provider mid-session
+    oasis-voice/                 # speech + realtime-STT provider (Piper TTS + Moonshine STT lite tier)
+    browser/                     # VENDORED: openclaw browser plugin (Chromium/Playwright); evaluate off-by-default
+  AUDIT_LOG.md                 # per-plugin audit verdict log; gates every release
   scripts/
     runtime-entrypoint.sh        # mints token, links plugins, merges config, execs gateway
     smoke-runner.mjs             # plugin-registration smoke test (mock API, no live gateway)
   archive/
     hyperclaw-fork-patches/    # the 7 commits from the deprecated fork, kept as patches
-  Dockerfile.runtime           # full runtime image: openclaw + tsx + sharp + our 7 plugins
+  Dockerfile.runtime           # full runtime image: openclaw + tsx + sharp + Chromium + our 10 plugins
   docker-compose.runtime.yml   # loopback-only port binding, cap_drop ALL, non-root
   Makefile                     # restart / recreate / rebuild / logs / healthz / smoke
   .env.example                 # all provider keys + OPENCLAW_DEFAULT_MODEL documented
@@ -338,6 +360,29 @@ cd oasis-claw
 pnpm install
 pnpm test
 ```
+
+## CI + branch model
+
+This repo follows the standard oasis-x branch model: push experiments freely to `dev`, merge to `main` requires approval AND green CI. Three workflows in `.github/workflows/`:
+
+| Workflow | Trigger | Blocks merge? | What it does |
+|---|---|---|---|
+| [`test.yml`](.github/workflows/test.yml) | PR + push to `dev`/`main` | **Yes** (on `main`) | `pnpm -r run test` + plugin smoke + per-extension `tsc --noEmit` |
+| [`image-build.yml`](.github/workflows/image-build.yml) | PR touching Dockerfile / entrypoint / extensions | No (informational) | Builds the runtime image, asserts the pinned Chromium revision lands, posts image size + pin status to the PR summary |
+| [`refresh-browser.yml`](.github/workflows/refresh-browser.yml) | Weekly cron (Mon 09:00 UTC) + manual | N/A (opens its own PR/issue) | Runs [`scripts/refresh-browser-plugin.sh`](scripts/refresh-browser-plugin.sh) — refreshes the vendored `browser` plugin against upstream openclaw, replays our patches, re-runs the audit cohort live, opens a PR on success or an issue on conflict/regression |
+
+Live LLM audits run on **refresh only**. Routine PRs trust the pre-PR audit cohort that gated the change; re-auditing on every PR would burn API credits without adding coverage we don't already have. The refresh job is the choke point through which upstream code reaches our deployed image — until its PR merges, `extensions/browser/` stays at the SHA recorded in [extensions/browser/UPSTREAM](extensions/browser/UPSTREAM).
+
+Notifications are GitHub-native (PR comments, issue mentions, branch-protection failure emails). Telegram is reserved for user/operator workflows (`prompt-injection-reporting`, `approval-gate`, `clawhub-skill-audit`) and is not used for CI.
+
+Branch protection on `main` (set in repo settings, not in YAML):
+- Required status checks: `test` (all three jobs)
+- Required reviews: 1
+- Linear history, no direct pushes
+- `dev` stays unprotected — fix on the fly
+
+Secrets the workflows need:
+- `ANTHROPIC_API_KEY` — only `refresh-browser.yml` uses this
 
 ## License
 

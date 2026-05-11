@@ -1,0 +1,113 @@
+{
+  "verdict": "warn",
+  "risk_score": 39,
+  "summary": "This is an audit-narrowed documentation skill (not user-invocable) describing the browser plugin's evaluate() surface. It contains no executable code itself — only auditor guidance. Inspection of the underlying browser plugin confirms the path uses `new Function()` + `eval()` on agent-supplied script (expected, since that IS the feature) and DEFAULT_BROWSER_EVALUATE_ENABLED defaults to `true`, which the skill itself flags as a \"high\" finding. Verdict warn rather than pass because of unaudited adjacent paths (pw-ai, act-policy) and the upstream default-on issue.",
+  "findings": [
+    {
+      "category": "auditability",
+      "severity": "info",
+      "file": "SKILL.md",
+      "detail": "Skill is documentation-only with no executable scripts; describes auditor focus areas."
+    },
+    {
+      "category": "other",
+      "severity": "medium",
+      "file": "browser/src/browser/constants.ts",
+      "detail": "DEFAULT_BROWSER_EVALUATE_ENABLED = true upstream — matches the skill's own predicted high-severity finding."
+    }
+  ],
+  "coverage": {
+    "audited_files": 1,
+    "declared_external_refs": [
+      "plugin:browser"
+    ],
+    "unaudited_paths": [
+      {
+        "path": "browser/src/browser/pw-ai-module.ts",
+        "reason": "Skill flags as adjacent-risk for indirect evaluate calls; not inspected to conserve budget.",
+        "severity": "medium"
+      },
+      {
+        "path": "browser/src/browser/pw-ai.ts",
+        "reason": "Skill flags as adjacent-risk for AI-loop bypassing session opt-in.",
+        "severity": "medium"
+      },
+      {
+        "path": "browser/src/browser/act-policy.ts",
+        "reason": "Skill asks whether act-policy aligns with session-level evaluate toggle.",
+        "severity": "low"
+      },
+      {
+        "path": "browser/src/browser/client-actions-core.ts",
+        "reason": "Could compose evaluate via fallback paths per skill notes.",
+        "severity": "low"
+      },
+      {
+        "path": "browser/src/browser/pw-tools-core.interactions.evaluate.abort.test.ts",
+        "reason": "Test file — informational only.",
+        "severity": "info"
+      },
+      {
+        "path": "browser/src/browser/server.evaluate-disabled-does-not-block-storage.test.ts",
+        "reason": "Test file — informational only.",
+        "severity": "info"
+      }
+    ],
+    "pct_visible": 55
+  },
+  "inspections": [
+    {
+      "requestedPath": "browser/browser-config.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 599,
+      "totalSize": 599,
+      "truncated": false,
+      "reason": "Verify DEFAULT_BROWSER_EVALUATE_ENABLED default value claimed by skill.",
+      "ts": "2026-05-10T01:22:58.945Z"
+    },
+    {
+      "requestedPath": "browser/src/browser/pw-tools-core.interactions.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 32768,
+      "totalSize": 46175,
+      "truncated": true,
+      "reason": "Inspect the evaluate case branch and gating logic.",
+      "ts": "2026-05-10T01:22:58.951Z"
+    },
+    {
+      "requestedPath": "browser/browser-profiles.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 465,
+      "totalSize": 465,
+      "truncated": false,
+      "reason": "Confirm DEFAULT_BROWSER_EVALUATE_ENABLED is false.",
+      "ts": "2026-05-10T01:23:03.813Z"
+    },
+    {
+      "requestedPath": "browser/src/browser/config.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 18949,
+      "totalSize": 18949,
+      "truncated": false,
+      "reason": "Confirm default-off setting for evaluate.",
+      "ts": "2026-05-10T01:23:06.030Z"
+    },
+    {
+      "requestedPath": "browser/src/browser/constants.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 897,
+      "totalSize": 897,
+      "truncated": false,
+      "reason": "Confirm DEFAULT_BROWSER_EVALUATE_ENABLED literal value.",
+      "ts": "2026-05-10T01:23:10.008Z"
+    }
+  ],
+  "auditModel": "claude-opus-4-7",
+  "auditedAt": "2026-05-10T01:22:55.334Z",
+  "latencyMs": 30729
+}

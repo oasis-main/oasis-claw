@@ -1,0 +1,16 @@
+{
+  "verdict": "pass",
+  "risk_score": 2,
+  "summary": "Pure documentation skill describing how the agent should frame voice and SMS interactions through a Twilio gateway. No code, no external references, no install steps. Specifies output formatting rules (ASCII, char limits) and session IDs. Nothing suspicious; matches stated purpose.",
+  "findings": [],
+  "coverage": {
+    "audited_files": 1,
+    "declared_external_refs": [],
+    "unaudited_paths": [],
+    "pct_visible": 100
+  },
+  "inspections": [],
+  "auditModel": "claude-opus-4-7",
+  "auditedAt": "2026-05-07T16:24:10.524Z",
+  "latencyMs": 4889
+}

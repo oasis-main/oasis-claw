@@ -1,4 +1,4 @@
-# oasis-claw runtime image — full openclaw gateway + our 9 extensions
+# oasis-claw runtime image — full openclaw gateway + our 10 extensions
 #
 # Uses npm-published openclaw@2026.4.26 (same version as vendor/openclaw submodule
 # pin) and bakes our extensions in at /app/extensions/<id>. tsx loads the .ts
@@ -51,6 +51,34 @@ RUN case "${TARGETARCH:-amd64}" in \
 # apt packages needed on bookworm-slim.
 RUN npm install -g openclaw@${OPENCLAW_VERSION} tsx@4 sharp@0.34
 
+# Playwright + Chromium for the vendored `browser` plugin (extensions/browser/).
+# Three layered pins; bump independently per AUDIT_LOG.md and extensions/browser/UPSTREAM:
+#   PLAYWRIGHT_VERSION  — JS library
+#   CHROMIUM_REVISION   — binary build inside Playwright's cache
+# Both are kept in lockstep with playwright-core@1.59.1's browsers.json. The
+# `test -d` assertion below fails the build if the pinned revision dir isn't
+# laid down — the early-fail-loud property means a silently-republished build
+# trips the build, not a deploy.
+#
+# Browsers live at /opt/playwright (image-level, not the persistent volume),
+# so a stale /home/node/.openclaw on a new image with a bumped CHROMIUM_REVISION
+# can never shadow the binary. User profile data still goes under the volume
+# at /home/node/.openclaw/browser/ (configured at the runtime-config layer).
+#
+# `--with-deps` pulls the apt set Chromium needs on bookworm-slim (libnss3,
+# libdrm2, libxkbcommon0, libxcomposite1, libgtk-3-0, fonts-liberation, etc.,
+# ~150–200MB). Curating that list manually is a CVE-management nightmare, so
+# we let Playwright own it.
+ARG PLAYWRIGHT_VERSION=1.59.1
+ARG CHROMIUM_REVISION=1217
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
+RUN npm install -g playwright-core@${PLAYWRIGHT_VERSION} playwright@${PLAYWRIGHT_VERSION} && \
+    mkdir -p "${PLAYWRIGHT_BROWSERS_PATH}" && \
+    npx --yes playwright@${PLAYWRIGHT_VERSION} install --with-deps chromium chromium-headless-shell && \
+    test -d "${PLAYWRIGHT_BROWSERS_PATH}/chromium-${CHROMIUM_REVISION}" \
+      || (echo "FATAL: pinned chromium-${CHROMIUM_REVISION} not found under ${PLAYWRIGHT_BROWSERS_PATH}; check playwright-core@${PLAYWRIGHT_VERSION}'s browsers.json" >&2; exit 1) && \
+    chmod -R a+rX "${PLAYWRIGHT_BROWSERS_PATH}"
+
 WORKDIR /app
 
 # Local /app/node_modules holds deps our extensions import (zod). Node's
@@ -58,8 +86,11 @@ WORKDIR /app
 RUN npm init -y >/dev/null && \
     npm install --omit=dev zod@4
 
-# Bake our 9 extensions into the image. Paths inside the container:
+# Bake our 10 extensions into the image. Paths inside the container:
 #   /app/extensions/<id>/{index.ts,openclaw.plugin.json,package.json,...}
+# `extensions/browser/` is vendored from upstream openclaw at the SHA
+# recorded in extensions/browser/UPSTREAM. See AUDIT_LOG.md for the per-
+# plugin audit verdict that gated this image.
 COPY extensions/ /app/extensions/
 
 # Strip any host-side node_modules that may have come along; we use /app/node_modules.

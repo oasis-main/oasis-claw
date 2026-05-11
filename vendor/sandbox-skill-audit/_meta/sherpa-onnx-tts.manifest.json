@@ -1,0 +1,23 @@
+{
+  "source": "github.com/openclaw/openclaw/tree/main/skills/sherpa-onnx-tts",
+  "downloadedAt": "2026-05-06T19:16:24Z",
+  "tool": "gh api raw",
+  "files": [
+    {
+      "path": "AUDIT_VERDICT.json",
+      "size": 1180,
+      "sha256": "854f612cdd416082acfcbf815781c3512ffe7ce41aaad9f69ba3113c10aa35f3"
+    },
+    {
+      "path": "SKILL.md",
+      "size": 3750,
+      "sha256": "57392104e663f08a391e325870ebb0591aecb3c64ceda488394505f7f43cf296"
+    },
+    {
+      "path": "bin-sherpa-onnx-tts.txt",
+      "size": 4811,
+      "sha256": "542d46f42f5ff8d22ed71f58ca052e4e525a337d90bd25664a6237b6da56fd2a"
+    }
+  ],
+  "note": "Static audit only. Not executed."
+}

@@ -49,6 +49,13 @@ services:
       # Unset means openclaw uses its own default (localhost:11434 inside container,
       # which is wrong — that's why extra_hosts + this forwarding are both needed).
       OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      # gog (Gmail/Calendar/Drive CLI) writes its OAuth keyring to
+      # $XDG_CONFIG_HOME/gogcli/ and the manual-flow auth state to
+      # $XDG_STATE_HOME/gogcli/. The container is read_only:true, so default
+      # ~/.config and ~/.local/state are unwritable — point both at the
+      # persistent .openclaw volume.
+      XDG_CONFIG_HOME: /home/node/.openclaw/config
+      XDG_STATE_HOME: /home/node/.openclaw/state
 
     # Host-side mapping is loopback-only. Other devices on your Wi-Fi
     # cannot reach this port through your Mac's LAN IP.

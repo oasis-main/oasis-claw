@@ -95,6 +95,8 @@ const repoRoot = path.resolve(__dirname, "..");
 const sandboxRoot = path.join(repoRoot, "vendor/sandbox-skill-audit");
 const live = process.argv.includes("--live");
 const inspect = process.argv.includes("--inspect");
+const onlyArg = process.argv.find((a) => a.startsWith("--only="));
+const onlyId = onlyArg ? onlyArg.slice("--only=".length) : null;
 const apiKey = process.env.ANTHROPIC_API_KEY ?? "";
 const model = process.env.AUDIT_MODEL ?? "claude-opus-4-7";
 
@@ -114,12 +116,17 @@ if (inspect) {
   }
 }
 
-const skills = findAllSkills([sandboxRoot], { maxBytesPerFile: 65_536, maxFilesPerSkill: 25 });
-if (skills.length === 0) {
+const allSkills = findAllSkills([sandboxRoot], { maxBytesPerFile: 65_536, maxFilesPerSkill: 25 });
+const skills = onlyId ? allSkills.filter((s) => s.skillId === onlyId) : allSkills;
+if (allSkills.length === 0) {
   console.error(`No skills under ${sandboxRoot}`);
   process.exit(1);
 }
-console.log(`Found ${skills.length} skill(s) under ${sandboxRoot}`);
+if (onlyId && skills.length === 0) {
+  console.error(`--only=${onlyId} matched no skills (have: ${allSkills.map((s) => s.skillId).join(", ")})`);
+  process.exit(1);
+}
+console.log(`Found ${allSkills.length} skill(s) under ${sandboxRoot}${onlyId ? ` — auditing only '${onlyId}'` : ""}`);
 console.log(`Mode: ${live ? "LIVE" : "DRY-RUN"}${inspect ? " + INSPECT" : ""}  Model: ${live ? model : "(not called)"}`);
 if (inspectorRoot) console.log(`Inspect root: ${path.relative(repoRoot, inspectorRoot)}`);
 console.log(`Metadata → ${path.relative(repoRoot, metaDir)} (kept out of snapshot scope)\n`);
@@ -135,13 +142,18 @@ for (const snap of skills) {
     for (const r of snap.externalRefs) console.log(`    - ${r}`);
   }
 
-  // Per-skill inspector. Budget: 10 files, 256KB total, 32KB per file.
+  // Per-skill inspector. Budget: 10 files, 512KB total, 96KB per file.
+  // Bumped from 32KB→96KB per-file because pw-tools-core.interactions.ts
+  // (the browser plugin's evaluate gating) is ~100KB and was being
+  // truncated mid-file, hiding the gating wrapper from the auditor
+  // (CLAW-014 evaluate-slice audit, 2026-05-09). Total bumped 256→512KB
+  // proportionally.
   const inspector = inspectorRoot
     ? new Inspector({
         inspectRoots: [inspectorRoot],
         maxFiles: 10,
-        maxTotalBytes: 256 * 1024,
-        maxBytesPerFile: 32 * 1024,
+        maxTotalBytes: 512 * 1024,
+        maxBytesPerFile: 96 * 1024,
         auditableExt: DEFAULT_AUDITABLE_EXT,
       })
     : null;

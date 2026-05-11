@@ -1,0 +1,76 @@
+{
+  "verdict": "pass",
+  "risk_score": 17,
+  "summary": "Audit-narrowed read-only skill that scopes a security review of indirect evaluate() reach across the openclaw browser plugin's AI-loop, act-policy, and client-actions surfaces. SKILL.md is descriptive auditor guidance with no executable behavior. Spot-inspected pw-ai.ts, pw-ai-module.ts, act-policy.ts, and client-actions-core.ts — all are benign (re-exports, dynamic-import wrapper, timeout normalization, HTTP client wrappers). No injection, exfiltration, or pre-baked verdicts.",
+  "findings": [],
+  "coverage": {
+    "audited_files": 1,
+    "declared_external_refs": [
+      "plugin:browser",
+      "sibling:extensions/browser"
+    ],
+    "unaudited_paths": [
+      {
+        "path": "extensions/browser/src/browser/pw-tools-core.interactions.ts",
+        "reason": "Large file; not opened in this pass — main subject of skill's audit-focus but not needed to clear the skill itself.",
+        "severity": "low"
+      },
+      {
+        "path": "extensions/browser/src/browser/pw-ai-state.ts",
+        "reason": "Referenced as state-carrier; skipped since pw-ai.ts is just re-exports.",
+        "severity": "low"
+      },
+      {
+        "path": "extensions/browser/src/browser/client-actions.ts",
+        "reason": "Companion dispatch file; client-actions-core.ts inspected and benign.",
+        "severity": "low"
+      }
+    ],
+    "pct_visible": 70
+  },
+  "inspections": [
+    {
+      "requestedPath": "browser/src/browser/pw-ai.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 1771,
+      "totalSize": 1771,
+      "truncated": false,
+      "reason": "SKILL.md says verify AI-loop doesn't bypass evaluate gate.",
+      "ts": "2026-05-10T01:29:50.259Z"
+    },
+    {
+      "requestedPath": "browser/src/browser/pw-ai-module.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 1431,
+      "totalSize": 1431,
+      "truncated": false,
+      "reason": "AI-loop module flagged as medium-risk indirect evaluate path.",
+      "ts": "2026-05-10T01:29:50.265Z"
+    },
+    {
+      "requestedPath": "browser/src/browser/act-policy.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 1486,
+      "totalSize": 1486,
+      "truncated": false,
+      "reason": "Verify act-policy gates evaluate.",
+      "ts": "2026-05-10T01:29:54.440Z"
+    },
+    {
+      "requestedPath": "browser/src/browser/client-actions-core.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 5057,
+      "totalSize": 5057,
+      "truncated": false,
+      "reason": "Check action dispatch fall-throughs into evaluate.",
+      "ts": "2026-05-10T01:29:54.443Z"
+    }
+  ],
+  "auditModel": "claude-opus-4-7",
+  "auditedAt": "2026-05-10T01:29:46.808Z",
+  "latencyMs": 18801
+}

@@ -1,0 +1,16 @@
+{
+  "source": "AUDIT-NARROWED snapshot derived from extensions/browser/skills/browser-automation/SKILL.md",
+  "vendoredFromSha": "e3b919fd0759a7c3399ff8841b46dbfb4fd2bbde",
+  "downloadedAt": "2026-05-09T00:00:00Z",
+  "tool": "hand-authored audit slice (CLAW-014 second-pass)",
+  "files": [
+    {
+      "path": "SKILL.md",
+      "size": 3908,
+      "sha256": "21618995f429f364dcbb3e3e04911ef160ab2c59abc3454a2d980396885b46b3"
+    }
+  ],
+  "note": "Static audit only. Not a real installable skill — this is an audit-narrowing snapshot that points the auditor at the LOCAL-BRIDGE AUTH SURFACE of the openclaw browser plugin (bridge-server.ts, control-auth.ts, csrf.ts, bridge-auth-registry.ts, server.auth-fail-closed.test.ts, server.auth-token-gates-http.test.ts). Companion snapshots: browser-ssrf, browser-evaluate. Together they raise pct_visible above the 55% from the initial broad pass.",
+  "auditTask": "CLAW-014 (second pass — auth surface)",
+  "inspectorRoot": "vendor/openclaw-source/extensions"
+}

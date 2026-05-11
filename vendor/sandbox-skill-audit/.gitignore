@@ -1,0 +1,5 @@
+# Quarantine — do not check downloaded third-party skills into oasis-claw history
+voice-call/
+sherpa-onnx-tts/
+clawphone-phone/
+!*/MANIFEST.json

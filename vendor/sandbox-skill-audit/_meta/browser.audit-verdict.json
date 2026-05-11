@@ -1,0 +1,97 @@
+{
+  "verdict": "pass",
+  "risk_score": 19,
+  "summary": "SKILL.md is a documentation-only operating guide for the bundled `browser` plugin (Chromium/Playwright automation). No prompt injection, exfiltration, persistence, or destructive patterns. Plugin entry, registration, and control-auth code inspected and align with described behavior (control-token-gated bridge, evaluate gated, profile management). No executable code shipped in the skill itself.",
+  "findings": [],
+  "coverage": {
+    "audited_files": 1,
+    "declared_external_refs": [
+      "install-download:https://example.com",
+      "plugin:browser",
+      "sibling:extensions/browser"
+    ],
+    "unaudited_paths": [
+      {
+        "path": "install-download:https://example.com",
+        "reason": "Placeholder install-download URL declared in coverage hint; SKILL.md does not actually invoke any download. Likely registry artifact.",
+        "severity": "info"
+      },
+      {
+        "path": "extensions/browser/src/browser/bridge-server.ts",
+        "reason": "Mentioned in SKILL.md auditor pointer; not inspected to conserve budget. Local bridge with control-auth — auth code reviewed separately.",
+        "severity": "low"
+      },
+      {
+        "path": "extensions/browser/src/browser/request-policy.ts",
+        "reason": "SSRF/request policy module noted by skill; not inspected.",
+        "severity": "low"
+      },
+      {
+        "path": "extensions/browser/src/browser/cdp-reachability-policy.ts",
+        "reason": "CDP reachability policy not inspected.",
+        "severity": "low"
+      },
+      {
+        "path": "extensions/browser/src/browser/navigation-guard.ts",
+        "reason": "Navigation guard not inspected.",
+        "severity": "low"
+      },
+      {
+        "path": "extensions/browser/src/browser/csrf.ts",
+        "reason": "CSRF module not inspected.",
+        "severity": "low"
+      },
+      {
+        "path": "extensions/browser/src/browser/pw-tools-core.interactions.ts",
+        "reason": "Contains the gated evaluate() path; not inspected this round but skill describes it as default-off.",
+        "severity": "low"
+      },
+      {
+        "path": "extensions/browser/src/browser/browser-profiles.ts",
+        "reason": "Profile management not inspected.",
+        "severity": "low"
+      },
+      {
+        "path": "extensions/browser/register.runtime.ts",
+        "reason": "Lazy-loaded runtime entry referenced by plugin-registration; not inspected.",
+        "severity": "low"
+      }
+    ],
+    "pct_visible": 55
+  },
+  "inspections": [
+    {
+      "requestedPath": "browser/index.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 532,
+      "totalSize": 532,
+      "truncated": false,
+      "reason": "Verify plugin entry point matches skill description and check for risky behavior",
+      "ts": "2026-05-09T15:00:14.378Z"
+    },
+    {
+      "requestedPath": "browser/plugin-registration.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 4991,
+      "totalSize": 4991,
+      "truncated": false,
+      "reason": "Check plugin registration to confirm it matches the skill",
+      "ts": "2026-05-09T15:00:17.754Z"
+    },
+    {
+      "requestedPath": "browser/src/browser/control-auth.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 5972,
+      "totalSize": 5972,
+      "truncated": false,
+      "reason": "Skill highlights control-auth as security boundary",
+      "ts": "2026-05-09T15:00:17.758Z"
+    }
+  ],
+  "auditModel": "claude-opus-4-7",
+  "auditedAt": "2026-05-09T15:00:11.525Z",
+  "latencyMs": 23074
+}

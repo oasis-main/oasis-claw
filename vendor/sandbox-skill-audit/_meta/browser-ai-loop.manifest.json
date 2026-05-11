@@ -1,0 +1,16 @@
+{
+  "source": "AUDIT-NARROWED snapshot derived from extensions/browser/skills/browser-automation/SKILL.md",
+  "vendoredFromSha": "e3b919fd0759a7c3399ff8841b46dbfb4fd2bbde",
+  "downloadedAt": "2026-05-09T00:00:00Z",
+  "tool": "hand-authored audit slice (CLAW-014 follow-up — AI-loop / indirect evaluate)",
+  "files": [
+    {
+      "path": "SKILL.md",
+      "size": 5554,
+      "sha256": "606af3c452ff6cfd591894560bc3cddde82becd19bce3a880e05ce27fccfa031"
+    }
+  ],
+  "note": "Static audit only. Follow-up to browser-evaluate audit slice. Hunts indirect evaluate() reach via the AI-loop (pw-ai.ts / pw-ai-module.ts), the act-policy layer, and the client-actions dispatch surface. Inspector budget bumped 32KB→96KB per-file specifically so pw-tools-core.interactions.ts (~100KB) fits without truncation.",
+  "auditTask": "CLAW-014 (third pass — AI-loop / indirect evaluate)",
+  "inspectorRoot": "vendor/openclaw-source/extensions"
+}

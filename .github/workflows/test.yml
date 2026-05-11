@@ -1,0 +1,132 @@
+# Merge-blocking CI for oasis-claw.
+#
+# Runs on every PR to `dev` or `main`, and on push to either branch.
+# Three jobs (test / smoke / typecheck) — ALL must pass before merge to
+# `main` (enforced via branch protection in repo settings, not here).
+# `dev` is not protected: failures are visible but don't block.
+#
+# Doesn't run live LLM audits — those happen pre-PR locally, and
+# re-audit on a refresh of vendored upstream code in refresh-browser.yml.
+# CI here is for code-correctness gates, not security-review gates.
+
+name: test
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+
+# Cancel superseded runs on the same branch — saves minutes on rapid pushes.
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pnpm test (all extensions)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Submodules contain vendor/openclaw (pinned tag). The audit
+          # script auto-clones vendor/openclaw-source on demand; we don't
+          # need it for unit tests.
+          submodules: recursive
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Test all extensions
+        run: pnpm -r run test
+
+  smoke:
+    name: plugin registration smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # Direct node + tsx invocation, not `make smoke` — skips the docker
+      # compose build (~30s saved) while exercising the same code path.
+      # The runner loads each plugin's index.ts against a mock OpenClawPluginApi
+      # and asserts register() doesn't throw and that declared tools / hooks
+      # / memory supplements actually register.
+      - name: Run smoke
+        run: node --import tsx/esm scripts/smoke-runner.mjs
+
+  typecheck:
+    name: tsc --noEmit (per-extension)
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # Each extension with its own tsconfig.json runs `tsc --noEmit`.
+      # Packages without one are skipped (we don't fail the matrix on
+      # missing tsconfig — vendored extensions may not have local
+      # ts setup until we add it ourselves).
+      - name: Typecheck each extension
+        run: |
+          set -e
+          rc=0
+          for pkg in extensions/*; do
+            if [ -f "$pkg/tsconfig.json" ]; then
+              echo "::group::typecheck $pkg"
+              if ! (cd "$pkg" && npx --yes -p typescript@5 tsc --noEmit); then
+                echo "::error::typecheck failed for $pkg"
+                rc=1
+              fi
+              echo "::endgroup::"
+            else
+              echo "  skip $pkg (no tsconfig.json)"
+            fi
+          done
+          exit $rc

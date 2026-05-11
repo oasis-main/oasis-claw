@@ -1,0 +1,91 @@
+# Image-build smoke CI for oasis-claw.
+#
+# INFORMATIONAL ONLY — does not block merge. The test.yml workflow is the
+# merge gate; this one just gives PRs that touch Dockerfile / entrypoint /
+# extensions a visible signal that the runtime image still builds.
+#
+# Path-filtered so doc-only PRs don't burn ~5 minutes of runner time on
+# a build that won't have changed. Posts image size + detected Chromium
+# revision back to the PR via the step summary.
+
+name: image-build
+
+on:
+  pull_request:
+    branches: [dev, main]
+    paths:
+      - "Dockerfile.runtime"
+      - "Dockerfile.smoke"
+      - "scripts/runtime-entrypoint.sh"
+      - "extensions/**"
+      - ".github/workflows/image-build.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: image-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  runtime-image:
+    name: Build runtime image (verify pins)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # We build the full runtime image. The Dockerfile contains a
+      # `test -d "${PLAYWRIGHT_BROWSERS_PATH}/chromium-${CHROMIUM_REVISION}"`
+      # assertion that fails the build loud if Playwright lays the Chromium
+      # binary down at a different revision than UPSTREAM pins. That's the
+      # property we're checking here — a silent CHROMIUM_REVISION drift
+      # trips this workflow, not a deploy.
+      - name: Build oasis-claw-runtime
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.runtime
+          tags: oasis-claw-runtime:ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image size + pins summary
+        run: |
+          set -e
+          size_bytes=$(docker image inspect oasis-claw-runtime:ci --format='{{.Size}}')
+          size_mb=$(( size_bytes / 1024 / 1024 ))
+          # Sanity-check the pinned Chromium revision actually landed.
+          # Grep UPSTREAM for the expected revision; assert the dir exists
+          # in the built image at /opt/playwright.
+          pinned_rev=$(grep -E '^chromium_revision:' extensions/browser/UPSTREAM | awk '{print $2}')
+          if docker run --rm --entrypoint=/bin/sh oasis-claw-runtime:ci -c "test -d /opt/playwright/chromium-${pinned_rev}"; then
+            chromium_status="✅ chromium-${pinned_rev} present"
+          else
+            chromium_status="❌ chromium-${pinned_rev} MISSING (build assertion should have caught this)"
+            exit 1
+          fi
+          # Detect what Playwright thinks the version is.
+          chromium_version=$(grep -E '^chromium_browser_version:' extensions/browser/UPSTREAM | awk '{print $2}')
+
+          # Step summary surfaces everything in the PR's Checks tab.
+          {
+            echo "# Runtime image build"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Image size | ${size_mb} MB |"
+            echo "| Chromium revision (pinned) | \`${pinned_rev}\` |"
+            echo "| Chromium browser version | \`${chromium_version}\` |"
+            echo "| Pin assertion | ${chromium_status} |"
+            echo
+            echo "Built from \`Dockerfile.runtime\` at $(git rev-parse --short HEAD)."
+            echo
+            echo "See [AUDIT_LOG.md](../blob/${GITHUB_SHA}/AUDIT_LOG.md) for the per-plugin audit verdicts gating this image."
+          } >> "$GITHUB_STEP_SUMMARY"

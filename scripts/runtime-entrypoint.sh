@@ -3,7 +3,7 @@
 # Container entrypoint for oasis-claw-runtime.
 #
 # 1. Ensure ~/.openclaw exists; mint a gateway auth token if not provided.
-# 2. Run `openclaw plugins install --link --force` for each of our 6 baked-in
+# 2. Run `openclaw plugins install --link --force` for each of our 10 baked-in
 #    extensions so the loader registers them in the persisted plugin registry
 #    that lives in ~/.openclaw (volume-persisted).
 # 3. Pin gateway.bind / gateway.mode / token / Control UI allowlist + per-plugin
@@ -56,7 +56,7 @@ if [[ ! -f "${CONFIG_DIR}/.swarm/queue.md" ]]; then
 MD
 fi
 
-# ---- install our 9 extensions via the openclaw plugin registry ---------
+# ---- install our 10 extensions via the openclaw plugin registry --------
 # `--link` points the registry at /app/extensions/<id>/ (read-only image) so
 # we don't duplicate code. `--force` is incompatible with --link, so we skip
 # install if the plugin is already in the registry from a prior boot.
@@ -65,6 +65,12 @@ fi
 # which is the intentional Playwright form-fill path that keeps plaintext out
 # of tool-call history). We pass --dangerously-force-unsafe-install only for
 # that plugin because it's our code and we accept the override.
+#
+# `browser` is vendored from upstream openclaw (extensions/browser/UPSTREAM
+# records the pinned SHA + playwright-core + chromium revision). It ships
+# with `evaluateEnabled` forced to `false` at the top-level config block
+# below — that's the load-bearing override identified by the CLAW-014
+# evaluate-slice audit (see AUDIT_LOG.md). Per-session opt-in only.
 declare -A PLUGINS=(
   [prompt-injection-reporting]=""
   [secrets-vault]="--dangerously-force-unsafe-install"
@@ -75,6 +81,7 @@ declare -A PLUGINS=(
   [clawhub-skill-audit]=""
   [model-switcher]=""
   [oasis-voice]=""
+  [browser]=""
 )
 
 # Probe what's already registered so re-runs don't fail.
@@ -262,6 +269,41 @@ if oasis_voice_bearer:
     oasis_voice_cfg["bearer_token"] = oasis_voice_bearer
 merge_config("oasis-voice", oasis_voice_cfg)
 
+# browser: vendored openclaw `browser` plugin (extensions/browser/).
+# Manifest declares `onConfigPaths: ["browser"]`, so this plugin reads its
+# runtime config from the TOP-LEVEL `browser` key in openclaw.json — NOT
+# from `plugins.entries.browser.config`. The merge_config() call above
+# only flips `enabled: true` on the entry; the actual plugin config is
+# written below.
+#
+# The single load-bearing setting is `browser.evaluateEnabled = false`.
+# The CLAW-014 evaluate-slice audit confirmed in source that
+# `DEFAULT_BROWSER_EVALUATE_ENABLED = true` upstream
+# (extensions/browser/src/browser/constants.ts), and that the gates at
+# pw-tools-core.interactions.ts:1367/1385 honor `evaluateEnabled` to
+# block both `act:evaluate` and `wait --fn`. Without this override, an
+# agent could `evaluate()` arbitrary JS in pages by default — the worst-
+# case mode of the plugin. Per-session opt-in to evaluate would be a
+# follow-on (CLAW-015) and must come with a mandatory JSONL audit log
+# + Playwright trace.
+#
+# We also pin browser-side data dirs under the persistent volume so
+# profile/cookie data survives image rebuilds; binaries themselves live
+# at /opt/playwright (set in Dockerfile.runtime) which is read-only and
+# image-baked.
+merge_config("browser", {})  # entries.browser.enabled = true
+config.setdefault("browser", {})
+config["browser"]["enabled"] = True
+# The override. Do NOT remove without re-running the evaluate-slice audit
+# and writing CLAW-015's per-session opt-in + audit-log patches first.
+config["browser"]["evaluateEnabled"] = False
+# Profile/download/trash dirs live on the persistent volume so user data
+# (cookies, login state) survives a rebuild. Binary stays on the read-only
+# image at $PLAYWRIGHT_BROWSERS_PATH=/opt/playwright.
+browser_data_dir = home / ".openclaw/browser"
+browser_data_dir.mkdir(parents=True, exist_ok=True)
+config["browser"].setdefault("dataDir", str(browser_data_dir))
+
 # ---- default LLM model (OPENCLAW_DEFAULT_MODEL env var) ----------------
 # Set via .env + make recreate, or live via `openclaw config set` + make restart.
 # Provider strings: "anthropic/claude-sonnet-4-6", "gemini/gemini-2.0-flash",
@@ -295,7 +337,8 @@ cat <<BANNER
    plugins        : prompt-injection-reporting, secrets-vault,
                     approval-gate, session-history, dot-swarm,
                     agent-primitives, clawhub-skill-audit,
-                    model-switcher, oasis-voice
+                    model-switcher, oasis-voice, browser
+   browser eval   : disabled (per CLAW-014 audit; per-session opt-in only)
    config file    : ${CONFIG_FILE}
 ==============================================================
 BANNER

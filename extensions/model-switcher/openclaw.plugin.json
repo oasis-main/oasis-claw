@@ -1,0 +1,16 @@
+{
+  "id": "model-switcher",
+  "name": "Model Switcher",
+  "description": "Self-referencing LLM swap. Registers two agent tools (switch_model, current_model) so the agent can change its own active language model mid-turn, plus a /setmodel slash command that bypasses the LLM so the operator can recover when generation is broken from the start (e.g. missing/invalid provider key). Writes through api.runtime.config.replaceConfigFile with afterWrite.mode=auto so the gateway hot-reloads on the next turn.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "allowedProviders": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Optional allow-list of provider prefixes (e.g. [\"anthropic\", \"openai\", \"gemini\", \"ollama\"]). Empty/unset means no restriction beyond the <provider>/<model> shape check."
+      }
+    }
+  }
+}

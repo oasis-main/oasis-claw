@@ -1,0 +1,86 @@
+{
+  "verdict": "pass",
+  "risk_score": 19,
+  "summary": "SKILL.md is a benign, non-user-invocable audit-narrowing description that points reviewers at the openclaw browser plugin's SSRF/navigation-guard surface. No instructions attempt to manipulate the agent, disable other plugins, exfiltrate data, or bypass approvals. Inspected request-policy, navigation-guard, cdp-reachability-policy, and ssrf-policy-helpers source — they implement defense-in-depth SSRF checks (redirect chain re-validation, IP-literal requirement under strict mode, hostname pinning) consistent with the skill's stated focus.",
+  "findings": [],
+  "coverage": {
+    "audited_files": 1,
+    "declared_external_refs": [
+      "plugin:browser",
+      "sibling:extensions/browser"
+    ],
+    "unaudited_paths": [
+      {
+        "path": "browser/src/browser/cdp-proxy-bypass.ts",
+        "reason": "Referenced as SSRF surface; not inspected this round.",
+        "severity": "low"
+      },
+      {
+        "path": "browser/src/browser/url-pattern.ts",
+        "reason": "Pattern-matching helpers — not inspected.",
+        "severity": "low"
+      },
+      {
+        "path": "browser/src/browser/chrome.loopback-ssrf.integration.test.ts",
+        "reason": "Integration test — out of scope for behavior audit.",
+        "severity": "info"
+      },
+      {
+        "path": "browser/src/browser/pw-tools-core.browser-ssrf-guard.test.ts",
+        "reason": "Unit test — informational only.",
+        "severity": "info"
+      },
+      {
+        "path": "browser/src/infra/net/ssrf.ts",
+        "reason": "Underlying SSRF policy implementation referenced via imports; not opened.",
+        "severity": "low"
+      }
+    ],
+    "pct_visible": 55
+  },
+  "inspections": [
+    {
+      "requestedPath": "browser/src/browser/request-policy.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 1428,
+      "totalSize": 1428,
+      "truncated": false,
+      "reason": "Core SSRF outbound-request policy referenced by skill.",
+      "ts": "2026-05-10T01:22:15.592Z"
+    },
+    {
+      "requestedPath": "browser/src/browser/navigation-guard.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 6318,
+      "totalSize": 6318,
+      "truncated": false,
+      "reason": "Pre-navigation URL filter — check redirect re-check behavior.",
+      "ts": "2026-05-10T01:22:15.597Z"
+    },
+    {
+      "requestedPath": "browser/src/browser/cdp-reachability-policy.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 1296,
+      "totalSize": 1296,
+      "truncated": false,
+      "reason": "Defense-in-depth CDP-layer policy.",
+      "ts": "2026-05-10T01:22:15.600Z"
+    },
+    {
+      "requestedPath": "browser/src/browser/ssrf-policy-helpers.ts",
+      "resolvedRoot": "/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/vendor/openclaw-source/extensions",
+      "ok": true,
+      "bytesReturned": 301,
+      "totalSize": 301,
+      "truncated": false,
+      "reason": "IP/hostname classification helpers.",
+      "ts": "2026-05-10T01:22:15.603Z"
+    }
+  ],
+  "auditModel": "claude-opus-4-7",
+  "auditedAt": "2026-05-10T01:22:10.464Z",
+  "latencyMs": 17730
+}
