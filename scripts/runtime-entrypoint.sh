@@ -253,10 +253,22 @@ if allowed_providers_env:
     ]
 merge_config("model-switcher", model_switcher_cfg)
 
-# oasis-voice: speech (TTS) + realtime STT backed by the oasis-voice sidecar.
-# Lite tier runs at 127.0.0.1:8731 (Piper TTS + Moonshine STT, CPU-only).
-# Cloud/GPU tiers: set OASIS_VOICE_ENDPOINT + OASIS_VOICE_BEARER_TOKEN.
-oasis_voice_endpoint = os.environ.get("OASIS_VOICE_ENDPOINT", "").strip() or "http://127.0.0.1:8731"
+# oasis-voice: speech (TTS) + media-understanding audio (inbound voice
+# messages from Telegram / iMessage) + realtime streaming STT (for future
+# telephony / WebRTC) backed by the oasis-voice sidecar.
+#
+# Default endpoint is the docker-compose service name `oasis-voice:8731`
+# (sibling container on the oasis_runtime bridge network — see
+# docker-compose.runtime.yml). Falls back to 127.0.0.1:8731 if someone is
+# running the gateway directly on a host with oasis-voice in a venv (dev
+# convenience only; production always uses the sidecar).
+#
+# Cloud/GPU tiers (CLAW-013): set OASIS_VOICE_ENDPOINT to the hosted URL
+# and OASIS_VOICE_BEARER_TOKEN to the auth token, both in `.env`.
+oasis_voice_endpoint = (
+    os.environ.get("OASIS_VOICE_ENDPOINT", "").strip()
+    or "http://oasis-voice:8731"
+)
 oasis_voice_bearer = os.environ.get("OASIS_VOICE_BEARER_TOKEN", "").strip() or None
 oasis_voice_tts_voice = (
     os.environ.get("OASIS_VOICE_TTS_VOICE", "").strip() or "piper:en_US-lessac-high"
@@ -268,6 +280,32 @@ oasis_voice_cfg: dict = {
 if oasis_voice_bearer:
     oasis_voice_cfg["bearer_token"] = oasis_voice_bearer
 merge_config("oasis-voice", oasis_voice_cfg)
+
+# ---- audio media-understanding routing (CLAW-021) ----------------------
+# Telegram (and future iMessage) voice-message inbound: when a user sends
+# a voice note, openclaw's media-understanding pipeline picks ONE audio
+# provider to transcribe it. Force-pin oasis-voice as that provider so
+# the lite-tier local sidecar handles it — not whatever cloud STT provider
+# happens to be registered (deepgram / google / groq / etc., none of which
+# we want for Nimbus's voice-in path).
+#
+# Also pin baseUrl so the openclaw `MediaUnderstandingProvider` framework
+# passes the right URL to our `transcribeAudio` (see
+# extensions/oasis-voice/media-understanding-provider.ts). The plugin
+# defaults to the same URL but plumbing it through config lets a future
+# `openclaw config set` rotate it without touching env.
+config.setdefault("tools", {})
+config["tools"].setdefault("media", {})
+config["tools"]["media"].setdefault("audio", {})
+config["tools"]["media"]["audio"]["enabled"] = True
+config["tools"]["media"]["audio"]["provider"] = "oasis-voice"
+
+config.setdefault("models", {})
+config["models"].setdefault("providers", {})
+config["models"]["providers"].setdefault("oasis-voice", {})
+config["models"]["providers"]["oasis-voice"]["baseUrl"] = oasis_voice_endpoint
+if oasis_voice_bearer:
+    config["models"]["providers"]["oasis-voice"]["apiKey"] = oasis_voice_bearer
 
 # browser: vendored openclaw `browser` plugin (extensions/browser/).
 # Manifest declares `onConfigPaths: ["browser"]`, so this plugin reads its

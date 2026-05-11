@@ -101,6 +101,73 @@ services:
       retries: 5
       start_period: 20s
 
+    # The oasis-voice sidecar starts in parallel; openclaw doesn't need it
+    # to be UP at boot (the plugin tolerates a not-yet-listening endpoint
+    # and retries), but adding a `depends_on` makes `docker compose up`
+    # bring them together by default.
+    depends_on:
+      - oasis-voice
+
+  # ─── oasis-voice sidecar (CLAW-021) ──────────────────────────────────
+  # Speech-in / speech-out service. Runs the same image the cloud-MVP
+  # path (CLAW-013) will deploy to ECS — keeping it as a sibling container
+  # NOW means the lift-to-cloud step later is a `docker compose` profile
+  # change, not a refactor.
+  #
+  # The openclaw container talks to this service by docker DNS name
+  # ("oasis-voice") on the oasis_runtime bridge network. No host port
+  # mapping — the sidecar is not reachable from the Mac. That's
+  # intentional: oasis-voice has no auth (the plugin trusts the network
+  # boundary), so we keep it inside the network.
+  #
+  # Build (one-time, after pulling new oasis-voice source):
+  #   (cd ../oasis-voice && docker build -f docker/Dockerfile.cpu -t oasis-voice:cpu .)
+  #
+  # Weights are downloaded into a named volume on first boot. They take
+  # ~50MB (Piper voice + Moonshine ONNX); rebuilding the image doesn't
+  # wipe them.
+  oasis-voice:
+    image: oasis-voice:cpu
+    container_name: oasis-voice
+    init: true
+    restart: unless-stopped
+    environment:
+      # Lite tier = Piper TTS + Moonshine STT on CPU. The whole point of
+      # CLAW-021 MVP is "in-container locally, no oasis-cloud dep" — see
+      # AUDIT_LOG.md change-log row for the gate decision.
+      VOICE_STT_TIER: lite
+      VOICE_TTS_TIER: lite
+      # Skip the warmup blocking-load on boot — backends lazy-load on
+      # first request. Trades a slow first-call (~200-500ms extra) for a
+      # fast container start (otherwise we'd need a longer healthcheck
+      # grace period).
+      VOICE_SKIP_WARMUP: "1"
+      # Weights cache lives on the volume below.
+      XDG_CACHE_HOME: /srv/weights
+    volumes:
+      # Persist Piper voices + Moonshine ONNX across image rebuilds.
+      - oasis_voice_weights:/srv/weights
+    networks:
+      - oasis_runtime
+    # No `ports:` block on purpose — sidecar is reachable only from the
+    # oasis_runtime bridge network, i.e. only from the openclaw container.
+    user: "1000:1000"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      # /v1/tiers is a cheap meta endpoint — no model invocation required.
+      test:
+        - "CMD-SHELL"
+        - "curl -fsS http://127.0.0.1:8731/v1/tiers >/dev/null"
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      # Lite-tier first request can take a moment to warm Piper +
+      # Moonshine if VOICE_SKIP_WARMUP=1 ate the boot warmup.
+      start_period: 30s
+
 networks:
   oasis_runtime:
     # Default bridge driver. No driver_opts to expose externally — the
@@ -110,3 +177,5 @@ networks:
 volumes:
   oasis_openclaw_home:
     name: oasis_openclaw_home
+  oasis_voice_weights:
+    name: oasis_voice_weights

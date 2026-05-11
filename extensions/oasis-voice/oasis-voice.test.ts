@@ -1,4 +1,8 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import {
+  buildOasisVoiceMediaUnderstandingProvider,
+  transcribeOasisVoiceAudio,
+} from "./media-understanding-provider.js";
 import { buildOasisVoiceSpeechProvider } from "./speech-provider.js";
 import { buildOasisVoiceRealtimeTranscriptionProvider } from "./realtime-transcription-provider.js";
 
@@ -178,5 +182,145 @@ describe("buildOasisVoiceRealtimeTranscriptionProvider", () => {
     expect(sentChunks[0]).toEqual(chunk);
 
     vi.unstubAllGlobals();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Media understanding provider (inbound voice messages — Telegram, iMessage)
+// ---------------------------------------------------------------------------
+
+describe("buildOasisVoiceMediaUnderstandingProvider", () => {
+  const provider = buildOasisVoiceMediaUnderstandingProvider();
+
+  it("declares the audio capability and oasis-voice id", () => {
+    expect(provider.id).toBe("oasis-voice");
+    expect(provider.capabilities).toEqual(["audio"]);
+    expect(provider.defaultModels?.audio).toBe("moonshine-base");
+  });
+
+  it("ranks itself ahead of the cloud providers via autoPriority", () => {
+    // Lower priority = preferred. We're at 10; deepgram/google/groq are 20-30.
+    expect(provider.autoPriority?.audio).toBeLessThan(20);
+  });
+
+  it("registers a transcribeAudio handler", () => {
+    expect(typeof provider.transcribeAudio).toBe("function");
+  });
+});
+
+describe("transcribeOasisVoiceAudio", () => {
+  function makeRequest(
+    overrides: Partial<Parameters<typeof transcribeOasisVoiceAudio>[0]> = {},
+  ): Parameters<typeof transcribeOasisVoiceAudio>[0] {
+    return {
+      buffer: Buffer.from([0xff, 0xfe, 0xfd]),
+      fileName: "voice.ogg",
+      mime: "audio/ogg",
+      apiKey: "",
+      timeoutMs: 5000,
+      ...overrides,
+    } as Parameters<typeof transcribeOasisVoiceAudio>[0];
+  }
+
+  it("POSTs multipart/form-data to /v1/stt/transcribe and returns the text", async () => {
+    const fetchSpy = vi.fn(async () =>
+      new Response(JSON.stringify({ text: "hello nimbus" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    const result = await transcribeOasisVoiceAudio(
+      makeRequest({ fetchFn: fetchSpy as unknown as typeof fetch }),
+    );
+
+    expect(result.text).toBe("hello nimbus");
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("http://127.0.0.1:8731/v1/stt/transcribe");
+    expect(init.method).toBe("POST");
+    expect(init.body).toBeInstanceOf(FormData);
+    // We MUST NOT set Content-Type ourselves — fetch derives the boundary.
+    const hdrs = (init.headers ?? {}) as Record<string, string>;
+    expect(hdrs["Content-Type"]).toBeUndefined();
+    expect(hdrs["content-type"]).toBeUndefined();
+  });
+
+  it("uses baseUrl when provided (cloud-tier hop)", async () => {
+    const fetchSpy = vi.fn(async () =>
+      new Response(JSON.stringify({ text: "" }), { status: 200 }),
+    );
+    await transcribeOasisVoiceAudio(
+      makeRequest({
+        baseUrl: "https://voice.oasis-cloud.example",
+        fetchFn: fetchSpy as unknown as typeof fetch,
+      }),
+    );
+    const [url] = fetchSpy.mock.calls[0] as [string];
+    expect(url).toBe("https://voice.oasis-cloud.example/v1/stt/transcribe");
+  });
+
+  it("strips a trailing slash on baseUrl", async () => {
+    const fetchSpy = vi.fn(async () =>
+      new Response(JSON.stringify({ text: "" }), { status: 200 }),
+    );
+    await transcribeOasisVoiceAudio(
+      makeRequest({
+        baseUrl: "https://voice.oasis-cloud.example/",
+        fetchFn: fetchSpy as unknown as typeof fetch,
+      }),
+    );
+    const [url] = fetchSpy.mock.calls[0] as [string];
+    expect(url).toBe("https://voice.oasis-cloud.example/v1/stt/transcribe");
+  });
+
+  it("sends Authorization: Bearer when apiKey is non-empty", async () => {
+    const fetchSpy = vi.fn(async () =>
+      new Response(JSON.stringify({ text: "" }), { status: 200 }),
+    );
+    await transcribeOasisVoiceAudio(
+      makeRequest({
+        apiKey: "sk-cloud-token",
+        fetchFn: fetchSpy as unknown as typeof fetch,
+      }),
+    );
+    const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    const hdrs = (init.headers ?? {}) as Record<string, string>;
+    expect(hdrs.Authorization).toBe("Bearer sk-cloud-token");
+  });
+
+  it("omits Authorization when apiKey is empty (local lite tier)", async () => {
+    const fetchSpy = vi.fn(async () =>
+      new Response(JSON.stringify({ text: "" }), { status: 200 }),
+    );
+    await transcribeOasisVoiceAudio(
+      makeRequest({ apiKey: "", fetchFn: fetchSpy as unknown as typeof fetch }),
+    );
+    const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    const hdrs = (init.headers ?? {}) as Record<string, string>;
+    expect(hdrs.Authorization).toBeUndefined();
+  });
+
+  it("throws with status + body excerpt on non-OK response", async () => {
+    const fetchSpy = vi.fn(async () =>
+      new Response("unsupported audio format: garbage", {
+        status: 415,
+      }),
+    );
+    await expect(
+      transcribeOasisVoiceAudio(
+        makeRequest({ fetchFn: fetchSpy as unknown as typeof fetch }),
+      ),
+    ).rejects.toThrow(/415.*unsupported audio format/);
+  });
+
+  it("treats missing text field as empty transcript", async () => {
+    const fetchSpy = vi.fn(async () =>
+      new Response(JSON.stringify({}), { status: 200 }),
+    );
+    const result = await transcribeOasisVoiceAudio(
+      makeRequest({ fetchFn: fetchSpy as unknown as typeof fetch }),
+    );
+    expect(result.text).toBe("");
   });
 });
