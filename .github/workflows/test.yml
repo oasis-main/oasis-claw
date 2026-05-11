@@ -111,13 +111,31 @@ jobs:
 
       # Each extension with its own tsconfig.json runs `tsc --noEmit`.
       # Packages without one are skipped (we don't fail the matrix on
-      # missing tsconfig — vendored extensions may not have local
-      # ts setup until we add it ourselves).
+      # missing tsconfig — first-party plugins don't yet have local ts
+      # setup).
+      #
+      # extensions/browser is VENDORED (see extensions/browser/UPSTREAM)
+      # and excluded from our pnpm workspace because its package.json
+      # references upstream-monorepo-only deps (`@openclaw/plugin-sdk:
+      # workspace:*`). Its types resolve at runtime via the global
+      # `openclaw` install in Dockerfile.runtime, not from our
+      # /app/node_modules — so standalone `tsc --noEmit` against it
+      # would error on every `from "openclaw/plugin-sdk/..."` import.
+      # The audit cohort (AUDIT_LOG.md) is the real correctness gate
+      # for that plugin; typecheck regression here would be a false
+      # positive. Refresh-CI re-audits on every upstream bump.
       - name: Typecheck each extension
         run: |
           set -e
           rc=0
           for pkg in extensions/*; do
+            base=$(basename "$pkg")
+            case "$base" in
+              browser)
+                echo "  skip $pkg (vendored; types resolve at runtime via global openclaw)"
+                continue
+                ;;
+            esac
             if [ -f "$pkg/tsconfig.json" ]; then
               echo "::group::typecheck $pkg"
               if ! (cd "$pkg" && npx --yes -p typescript@5 tsc --noEmit); then

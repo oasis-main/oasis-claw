@@ -6,7 +6,12 @@
   "type": "module",
   "scripts": {
     "test": "pnpm -r run test",
-    "test:watch": "pnpm -r run test:watch"
+    "test:watch": "pnpm -r run test:watch",
+    "smoke": "node --import tsx/esm scripts/smoke-runner.mjs"
+  },
+  "devDependencies": {
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
   },
   "engines": {
     "node": ">=20.0.0",

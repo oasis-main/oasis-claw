@@ -1,3 +1,12 @@
 packages:
   - extensions/*
   - packages/*
+  # extensions/browser is vendored from upstream openclaw (see
+  # extensions/browser/UPSTREAM). Its package.json declares
+  # `@openclaw/plugin-sdk: workspace:*` which only resolves inside the
+  # upstream monorepo. In oasis-claw, the plugin's runtime deps come in
+  # via the global `npm install -g openclaw` step in Dockerfile.runtime,
+  # so we don't need pnpm to manage them. Excluding here keeps the
+  # vendored package.json byte-identical to upstream (which is the
+  # invariant scripts/refresh-browser-plugin.sh CLAW-016 protects).
+  - "!extensions/browser"
