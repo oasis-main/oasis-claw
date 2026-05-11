@@ -157,10 +157,11 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      # /v1/tiers is a cheap meta endpoint — no model invocation required.
+      # /healthz is a cheap liveness probe — no model invocation required.
+      # /v1/tiers also exists but /healthz is the canonical liveness route.
       test:
         - "CMD-SHELL"
-        - "curl -fsS http://127.0.0.1:8731/v1/tiers >/dev/null"
+        - "curl -fsS http://127.0.0.1:8731/healthz >/dev/null"
       interval: 30s
       timeout: 5s
       retries: 5

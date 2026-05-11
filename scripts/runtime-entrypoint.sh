@@ -131,7 +131,9 @@ declare -A PLUGINS=(
   [clawhub-skill-audit]="--dangerously-force-unsafe-install"
   [model-switcher]=""
   [oasis-voice]=""
-  [browser]=""
+  # browser vendored from upstream openclaw; ships legitimate child_process
+  # usage for Chromium launch — same false-positive shape as secrets-vault.
+  [browser]="--dangerously-force-unsafe-install"
 )
 
 # Always run install --link. The command is idempotent (a no-op when
