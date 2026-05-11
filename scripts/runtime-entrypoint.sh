@@ -56,6 +56,51 @@ if [[ ! -f "${CONFIG_DIR}/.swarm/queue.md" ]]; then
 MD
 fi
 
+# ---- pre-install: scrub known-bad keys from the persisted config -----
+# Each `openclaw plugins install --link` below validates the existing
+# config before linking. If a prior boot wrote a key the current schema
+# rejects (e.g. our own d081484 -> f8f4e9e fix removed
+# `tools.media.audio.provider`; the persisted file still had it), the
+# install fails and the plugin doesn't link. The Python merge block at
+# the END of this script would clean things up, but only AFTER all the
+# installs have already errored. So: do a minimal pre-pass HERE to
+# remove keys we know to be stale, BEFORE the install loop runs.
+#
+# This is idempotent and append-only safe: keys not present in the
+# config are silently ignored.
+python3 - "${CONFIG_FILE}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+if not config_path.exists():
+    sys.exit(0)
+try:
+    config = json.loads(config_path.read_text())
+except json.JSONDecodeError:
+    sys.exit(0)
+
+# Known schema-invalid keys from prior boots:
+audio = config.get("tools", {}).get("media", {}).get("audio")
+if isinstance(audio, dict):
+    audio.pop("provider", None)
+
+browser = config.get("browser")
+if isinstance(browser, dict):
+    browser.pop("dataDir", None)
+
+# models.providers.<id> requires a `models` array per strict zod schema
+# (zod-schema.core.ts:352). Backfill an empty array if missing.
+providers = config.get("models", {}).get("providers", {})
+if isinstance(providers, dict):
+    for pid, pcfg in providers.items():
+        if isinstance(pcfg, dict) and "models" not in pcfg:
+            pcfg["models"] = []
+
+config_path.write_text(json.dumps(config, indent=2) + "\n")
+PY
+
 # ---- install our 10 extensions via the openclaw plugin registry --------
 # `--link` points the registry at /app/extensions/<id>/ (read-only image) so
 # we don't duplicate code. `--force` is incompatible with --link, so we skip
@@ -78,21 +123,28 @@ declare -A PLUGINS=(
   [session-history]=""
   [dot-swarm]=""
   [agent-primitives]=""
-  [clawhub-skill-audit]=""
+  # clawhub-skill-audit's audit-prompt.ts intentionally contains the
+  # exact "dynamic code execution" string patterns the auditor looks
+  # FOR in third-party skills. openclaw's install-time scanner reads
+  # those patterns and refuses to install. False positive on our own
+  # auditor's source — same shape as the secrets-vault override.
+  [clawhub-skill-audit]="--dangerously-force-unsafe-install"
   [model-switcher]=""
   [oasis-voice]=""
   [browser]=""
 )
 
-# Probe what's already registered so re-runs don't fail.
-INSTALLED_LIST="$(openclaw plugins list 2>/dev/null || true)"
-
+# Always run install --link. The command is idempotent (a no-op when
+# the registry record already matches), and our previous "already
+# linked" probe was matching CONFIG entries from openclaw.json that
+# had no corresponding registry record — silently skipping a plugin
+# whose actual install had failed on a prior boot. Bug history:
+# without this loop, oasis-voice + clawhub-skill-audit appeared in
+# the CLI's plugin list (because their entries.* config blocks lived
+# in openclaw.json) yet never got loaded by the gateway. Running
+# install --link unconditionally costs 1-2s per plugin at boot but
+# makes the "is this plugin actually wired up" question deterministic.
 for p in "${!PLUGINS[@]}"; do
-  if printf '%s\n' "${INSTALLED_LIST}" | grep -qE "^[│| ]+${p}[ │|]" 2>/dev/null \
-     || printf '%s\n' "${INSTALLED_LIST}" | grep -q "/app/extensions/${p}"; then
-    echo "[entrypoint] plugin already linked: ${p}"
-    continue
-  fi
   echo "[entrypoint] linking plugin: ${p}"
   # shellcheck disable=SC2086
   if ! openclaw plugins install --link ${PLUGINS[$p]} "/app/extensions/${p}" 2>&1 | tail -3; then
@@ -166,14 +218,27 @@ entries = plugins.setdefault("entries", {})
 
 TELEGRAM_KEYS = {"telegramBotToken", "telegramChatId", "telegramAlertChatId"}
 
+# Keys that should ALWAYS reflect the current env, never the persisted
+# value. Use this when a config field semantically belongs to the
+# deployment topology (docker-compose layout, sidecar URL, etc.) rather
+# than to operator preference. Persisted prior-boot values can otherwise
+# pin a stale endpoint forever — bug history: oasis-voice's `endpoint`
+# was setdefault'd, so a config written when the default was
+# 127.0.0.1:8731 stuck after we changed the default to
+# http://oasis-voice:8731 (sibling container), and the plugin kept
+# resolving to the openclaw container's own loopback (no listener).
+TOPOLOGY_KEYS = {"endpoint"}
+
 def merge_config(plugin_id, defaults, hooks=None):
     entry = entries.setdefault(plugin_id, {})
     entry["enabled"] = entry.get("enabled", True)
     cfg = entry.setdefault("config", {})
     for k, v in defaults.items():
-        # Telegram creds always reflect current env (so rotating creds via
-        # `.env` + recreate works). Other keys are user-overridable defaults.
-        if k in TELEGRAM_KEYS:
+        # Telegram creds + topology fields always reflect current env (so
+        # rotating creds via `.env` + recreate works, and so that changing
+        # the compose layout doesn't leave plugins pointing at the prior
+        # endpoint). Other keys are user-overridable defaults.
+        if k in TELEGRAM_KEYS or k in TOPOLOGY_KEYS:
             cfg[k] = v
         else:
             cfg.setdefault(k, v)
@@ -302,6 +367,10 @@ config.setdefault("tools", {})
 config["tools"].setdefault("media", {})
 config["tools"]["media"].setdefault("audio", {})
 config["tools"]["media"]["audio"]["enabled"] = True
+# Strip stale `provider` key from prior boots — see above for why this
+# key isn't valid in the audio-config schema. Idempotent merge alone
+# wouldn't clean up a once-broken config file on the persistent volume.
+config["tools"]["media"]["audio"].pop("provider", None)
 
 # Provider baseUrl + apiKey hand-off. The openclaw
 # MediaUnderstandingProvider framework reads these from
@@ -310,10 +379,18 @@ config["tools"]["media"]["audio"]["enabled"] = True
 # (http://127.0.0.1:8731) which is wrong inside the openclaw container
 # (no sidecar at loopback); the docker-DNS name we set above is the
 # right value.
+#
+# zod-schema.core.ts:352 declares ModelProviderSchema as strict with
+# `models: z.array(ModelDefinitionSchema)` REQUIRED — even when the
+# provider doesn't offer LLM models (we're a media-understanding-only
+# provider, not a chat model provider). Pass an empty array to satisfy
+# the schema; the framework only consults this list for chat-model
+# selection, which is irrelevant for our STT capability.
 config.setdefault("models", {})
 config["models"].setdefault("providers", {})
 config["models"]["providers"].setdefault("oasis-voice", {})
 config["models"]["providers"]["oasis-voice"]["baseUrl"] = oasis_voice_endpoint
+config["models"]["providers"]["oasis-voice"].setdefault("models", [])
 if oasis_voice_bearer:
     config["models"]["providers"]["oasis-voice"]["apiKey"] = oasis_voice_bearer
 
@@ -368,12 +445,16 @@ config["browser"]["enabled"] = True
 # The override. Do NOT remove without re-running the evaluate-slice audit
 # and writing CLAW-015's per-session opt-in + audit-log patches first.
 config["browser"]["evaluateEnabled"] = False
-# Profile/download/trash dirs live on the persistent volume so user data
-# (cookies, login state) survives a rebuild. Binary stays on the read-only
-# image at $PLAYWRIGHT_BROWSERS_PATH=/opt/playwright.
-browser_data_dir = home / ".openclaw/browser"
-browser_data_dir.mkdir(parents=True, exist_ok=True)
-config["browser"].setdefault("dataDir", str(browser_data_dir))
+# Persistent profile data — the browser plugin handles its own user-data
+# directory routing through `profiles` (BrowserProfileConfig). The top-
+# level `BrowserConfig` type has no `dataDir` key; an earlier cut wrote
+# one here and the strict-schema validator (zod-schema.core.ts) rejected
+# the whole `browser` block. Profile-level configuration is left to the
+# plugin's own defaults for now; if we need to override the user-data dir
+# we'd add a `profiles` map below per types.browser.ts:81.
+# Strip any stale `dataDir` from prior boots so the config stops failing
+# validation on the persisted file.
+config["browser"].pop("dataDir", None)
 
 # ---- default LLM model (OPENCLAW_DEFAULT_MODEL env var) ----------------
 # Set via .env + make recreate, or live via `openclaw config set` + make restart.

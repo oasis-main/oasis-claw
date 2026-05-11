@@ -4,7 +4,19 @@
   "description": "TTS and streaming STT via oasis-voice sidecar (Piper TTS + Moonshine STT on the lite tier; GPU tiers available on the hosted endpoint).",
   "contracts": {
     "speechProviders": ["oasis-voice"],
-    "realtimeTranscriptionProviders": ["oasis-voice"]
+    "realtimeTranscriptionProviders": ["oasis-voice"],
+    "mediaUnderstandingProviders": ["oasis-voice"]
+  },
+  "mediaUnderstandingProviderMetadata": {
+    "oasis-voice": {
+      "capabilities": ["audio"],
+      "defaultModels": {
+        "audio": "moonshine-base"
+      },
+      "autoPriority": {
+        "audio": 10
+      }
+    }
   },
   "configSchema": {
     "type": "object",
