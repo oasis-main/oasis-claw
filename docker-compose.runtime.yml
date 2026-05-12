@@ -120,8 +120,8 @@ services:
   # intentional: oasis-voice has no auth (the plugin trusts the network
   # boundary), so we keep it inside the network.
   #
-  # Build (one-time, after pulling new oasis-voice source):
-  #   (cd ../oasis-voice && docker build -f docker/Dockerfile.cpu -t oasis-voice:cpu .)
+  # Build (one-time, after bumping the vendor/oasis-voice submodule pin):
+  #   (cd vendor/oasis-voice && docker build -f docker/Dockerfile.cpu -t oasis-voice:cpu .)
   #
   # Weights are downloaded into a named volume on first boot. They take
   # ~50MB (Piper voice + Moonshine ONNX); rebuilding the image doesn't

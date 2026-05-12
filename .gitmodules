@@ -4,3 +4,13 @@
 	# Pinned to v2026.4.26 (commit be8c24633a). Bump deliberately by checking
 	# out a new tag in vendor/openclaw and committing the submodule pointer.
 	# See README.md "Bumping the openclaw pin" for the procedure.
+[submodule "vendor/oasis-voice"]
+	path = vendor/oasis-voice
+	url = https://github.com/oasis-main/oasis-voice.git
+	branch = dev
+	# Pinned to commit e6bd8b8 (TTS opus support — CLAW-021 outbound).
+	# The oasis-voice:cpu image is built from this submodule; the openclaw
+	# runtime talks to it over the oasis_runtime bridge network as the
+	# `oasis-voice` sidecar (see docker-compose.runtime.yml). Bump the pin
+	# deliberately: `cd vendor/oasis-voice && git fetch && git checkout <sha>`,
+	# rebuild the cpu image, then commit the new submodule pointer.
