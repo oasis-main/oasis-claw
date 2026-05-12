@@ -2,11 +2,8 @@
   "id": "oasis-voice",
   "name": "Oasis Voice",
   "description": "TTS and streaming STT via oasis-voice sidecar (Piper TTS + Moonshine STT on the lite tier; GPU tiers available on the hosted endpoint).",
-  "contracts": {
-    "speechProviders": ["oasis-voice"],
-    "realtimeTranscriptionProviders": ["oasis-voice"],
-    "mediaUnderstandingProviders": ["oasis-voice"]
-  },
+  "enabledByDefault": true,
+  "_contracts_NOTE": "We intentionally do NOT declare a `contracts` block here. The openclaw 2026.4.26 loader's `hasRuntimeContractSurface()` flips `startup.sidecar` to false when ANY of speechProviders/mediaUnderstandingProviders/etc. is declared — meaning the gateway never eager-loads the plugin at startup, and it only lazy-loads when a provider lookup hits the registry. For upstream provider plugins (openai, deepgram, etc.) that lazy-load works because they're bundled and the loader has a dedicated path; for our /app/extensions/-mounted plugin it never actually fires. Skipping the contracts declaration makes `startup.sidecar=true`, so register() runs at boot and registerSpeechProvider/registerMediaUnderstandingProvider/registerRealtimeTranscriptionProvider populate the provider registries eagerly. The actual capability resolution still picks us via autoPriority (10) — see speech-provider.ts + media-understanding-provider.ts.",
   "mediaUnderstandingProviderMetadata": {
     "oasis-voice": {
       "capabilities": ["audio"],

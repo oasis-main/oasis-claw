@@ -337,9 +337,8 @@ oasis_voice_endpoint = (
     or "http://oasis-voice:8731"
 )
 oasis_voice_bearer = os.environ.get("OASIS_VOICE_BEARER_TOKEN", "").strip() or None
-oasis_voice_tts_voice = (
-    os.environ.get("OASIS_VOICE_TTS_VOICE", "").strip() or "piper:en_US-lessac-high"
-)
+oasis_voice_tts_voice_env = os.environ.get("OASIS_VOICE_TTS_VOICE", "").strip()
+oasis_voice_tts_voice = oasis_voice_tts_voice_env or "piper:en_US-lessac-high"
 oasis_voice_cfg: dict = {
     "endpoint": oasis_voice_endpoint,
     "tts_voice": oasis_voice_tts_voice,
@@ -347,6 +346,12 @@ oasis_voice_cfg: dict = {
 if oasis_voice_bearer:
     oasis_voice_cfg["bearer_token"] = oasis_voice_bearer
 merge_config("oasis-voice", oasis_voice_cfg)
+# When the operator explicitly sets OASIS_VOICE_TTS_VOICE in .env, that's an
+# override of any previously-persisted plugin config — the setdefault path in
+# merge_config would otherwise leave a stale voice from an earlier boot
+# pinned forever. Force-overwrite only when the env var is explicitly set.
+if oasis_voice_tts_voice_env:
+    entries["oasis-voice"]["config"]["tts_voice"] = oasis_voice_tts_voice_env
 
 # ---- audio media-understanding routing (CLAW-021) ----------------------
 # Telegram (and future iMessage) voice-message inbound: when a user sends
