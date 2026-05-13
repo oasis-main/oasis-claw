@@ -3,6 +3,11 @@ import { z } from "zod";
 
 const configSchema = z.object({
   allowedProviders: z.array(z.string()).optional(),
+  // When true (default), on plugin load every TIER_CATALOG entry is
+  // ensured-present in agents.defaults.models so the upstream `/models` and
+  // `/model` channel menus surface the full light/medium/heavy ladder for
+  // each foundation provider. Set false to keep the allowlist hand-curated.
+  autoAllowlistTiers: z.boolean().default(true),
 });
 
 export type ModelSwitcherConfig = z.infer<typeof configSchema>;
@@ -14,6 +19,11 @@ const MODEL_REF_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_./:-]*$
 // pick "anthropic:heavy" without remembering today's exact model id. Update
 // the model ids here when a provider's family rolls forward; the alias surface
 // stays stable.
+//
+// Every id here is verified against the openclaw model catalog (`openclaw
+// models list --all --json`). If you add a new tier or provider, run the same
+// command and pin against an entry that actually exists — otherwise the menu
+// will show a button that 404s on switch.
 type Tier = "light" | "medium" | "heavy";
 type TierRow = Readonly<Record<Tier, string>> & { label: string };
 const TIER_CATALOG: Readonly<Record<string, TierRow>> = {
@@ -25,14 +35,18 @@ const TIER_CATALOG: Readonly<Record<string, TierRow>> = {
   },
   openai: {
     label: "OpenAI (GPT)",
-    light: "openai/gpt-5.5-mini",
+    light: "openai/gpt-5.4-mini",
     medium: "openai/gpt-5.5",
     heavy: "openai/gpt-5.5-pro",
   },
   google: {
+    // gemini-3.1-flash-lite is GA as of 2026-05; using it (not the older
+    // -preview variant from the local catalog dump) keeps the light tier on
+    // the same 3.1 generation as the heavy tier so the ladder reads as one
+    // family. Medium stays on 3-pro-preview until 3.1-pro hits GA.
     label: "Google (Gemini)",
-    light: "google/gemini-3.1-flash",
-    medium: "google/gemini-3.1-pro",
+    light: "google/gemini-3.1-flash-lite",
+    medium: "google/gemini-3-pro-preview",
     heavy: "google/gemini-3.1-pro-preview",
   },
 };
@@ -102,6 +116,43 @@ function applyPrimary(cfg: AnyConfig, modelRef: string): AnyConfig {
   return next;
 }
 
+// Build the set of model refs the tier menu wants in the allowlist, filtered
+// by allowedProviders if set. Returns the refs to ensure-present.
+function tierAllowlistRefs(allowedProviders: readonly string[] | undefined): string[] {
+  const refs: string[] = [];
+  for (const [provider, row] of Object.entries(TIER_CATALOG)) {
+    if (allowedProviders && allowedProviders.length > 0 && !allowedProviders.includes(provider)) {
+      continue;
+    }
+    refs.push(row.light, row.medium, row.heavy);
+  }
+  return refs;
+}
+
+// Returns { next, added } — `next` has any missing tier refs ensured-present
+// in agents.defaults.models with a `{}` value (which is the same shape
+// applyPrimary uses for entries it adds). `added` is the list of refs that
+// weren't already there. Empty `added` ⇒ caller can skip the config write.
+function ensureTiersInAllowlist(
+  cfg: AnyConfig,
+  allowedProviders: readonly string[] | undefined,
+): { next: AnyConfig; added: string[] } {
+  const wanted = tierAllowlistRefs(allowedProviders);
+  const existing = cfg.agents?.defaults?.models ?? {};
+  const missing = wanted.filter((ref) => !(ref in existing));
+  if (missing.length === 0) {
+    return { next: cfg, added: [] };
+  }
+  const next = structuredClone(cfg) as AnyConfig;
+  const agents = (next.agents ??= {} as NonNullable<AnyConfig["agents"]>);
+  const defaults = (agents.defaults ??= {} as NonNullable<NonNullable<AnyConfig["agents"]>["defaults"]>);
+  const models = (defaults.models ??= {} as Record<string, unknown>);
+  for (const ref of missing) {
+    models[ref] = {};
+  }
+  return { next, added: missing };
+}
+
 function reply(payload: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }] };
 }
@@ -159,6 +210,36 @@ const plugin = {
         }) => Promise<unknown>;
       };
     };
+
+    // ── Auto-allowlist tier models ───────────────────────────────────
+    // The upstream `/models` and `/model` channel menus surface entries from
+    // agents.defaults.models. Without this the tier ladder is invocable via
+    // /setmodel but invisible in the menu — confusing for operators who
+    // discover models through the buttons. Run-once-per-boot: idempotent and
+    // a no-op when the user has set autoAllowlistTiers=false.
+    if (cfg.autoAllowlistTiers) {
+      // Fire-and-forget so register() stays sync. If it fails we log but
+      // keep the rest of the plugin functional — the tier shortcut still
+      // works via /setmodel even with no menu surfacing.
+      void (async () => {
+        try {
+          const current = runtime.config.current();
+          const { next, added } = ensureTiersInAllowlist(current, allowedProviders);
+          if (added.length === 0) {
+            return;
+          }
+          await runtime.config.replaceConfigFile({
+            nextConfig: next,
+            afterWrite: { mode: "auto" },
+          });
+          api.logger.info("model-switcher: auto-allowlisted tier models", { added });
+        } catch (err) {
+          api.logger.warn("model-switcher: tier auto-allowlist failed", {
+            error: (err as Error).message,
+          });
+        }
+      })();
+    }
 
     async function performSwitch(target: string): Promise<
       | { ok: true; previous: string | null; model: string; noop?: boolean }
