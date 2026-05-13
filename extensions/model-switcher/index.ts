@@ -10,6 +10,64 @@ export type ModelSwitcherConfig = z.infer<typeof configSchema>;
 // "<provider>/<model>" — model segment may itself contain "/" (e.g. openrouter/moonshotai/kimi-k2).
 const MODEL_REF_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_./:-]*$/;
 
+// Tier matrix — light/medium/heavy per foundation provider. Lets the operator
+// pick "anthropic:heavy" without remembering today's exact model id. Update
+// the model ids here when a provider's family rolls forward; the alias surface
+// stays stable.
+type Tier = "light" | "medium" | "heavy";
+type TierRow = Readonly<Record<Tier, string>> & { label: string };
+const TIER_CATALOG: Readonly<Record<string, TierRow>> = {
+  anthropic: {
+    label: "Anthropic (Claude)",
+    light: "anthropic/claude-haiku-4-5",
+    medium: "anthropic/claude-sonnet-4-6",
+    heavy: "anthropic/claude-opus-4-7",
+  },
+  openai: {
+    label: "OpenAI (GPT)",
+    light: "openai/gpt-5.5-mini",
+    medium: "openai/gpt-5.5",
+    heavy: "openai/gpt-5.5-pro",
+  },
+  google: {
+    label: "Google (Gemini)",
+    light: "google/gemini-3.1-flash",
+    medium: "google/gemini-3.1-pro",
+    heavy: "google/gemini-3.1-pro-preview",
+  },
+};
+const TIER_ALIASES: Readonly<Record<string, string>> = {
+  gemini: "google",
+  claude: "anthropic",
+  gpt: "openai",
+};
+const VALID_TIERS: readonly Tier[] = ["light", "medium", "heavy"];
+
+function resolveTierShortcut(raw: string): string | null {
+  const trimmed = raw.trim().toLowerCase();
+  // Accept "<provider>:<tier>" or "<provider> <tier>".
+  const m = trimmed.match(/^([a-z0-9_-]+)[\s:]+([a-z]+)$/);
+  if (!m) return null;
+  const provider = TIER_ALIASES[m[1]!] ?? m[1]!;
+  const tier = m[2] as Tier;
+  if (!VALID_TIERS.includes(tier)) return null;
+  const row = TIER_CATALOG[provider];
+  return row ? row[tier] : null;
+}
+
+function renderTierMenu(allowed: readonly string[] | undefined): string {
+  const lines: string[] = ["Provider tier menu (light / medium / heavy):"];
+  for (const [provider, row] of Object.entries(TIER_CATALOG)) {
+    if (allowed && allowed.length > 0 && !allowed.includes(provider)) continue;
+    lines.push(`  ${provider.padEnd(10)} ${row.label}`);
+    lines.push(`    light  → ${row.light}`);
+    lines.push(`    medium → ${row.medium}`);
+    lines.push(`    heavy  → ${row.heavy}`);
+  }
+  lines.push("Usage: /setmodel <provider>:<tier>  (e.g. /setmodel anthropic:heavy)");
+  return lines.join("\n");
+}
+
 type AnyConfig = Record<string, unknown> & {
   agents?: {
     defaults?: {
@@ -52,11 +110,13 @@ function validateModelRef(
   raw: string,
   allowedProviders: readonly string[] | undefined,
 ): { ok: true; ref: string } | { ok: false; error: string } {
-  const ref = raw.trim();
+  // Tier shortcut ("<provider>:<tier>") is sugar; expand before shape-checking.
+  const expanded = resolveTierShortcut(raw) ?? raw;
+  const ref = expanded.trim();
   if (!MODEL_REF_RE.test(ref)) {
     return {
       ok: false,
-      error: `Invalid model reference "${raw}". Expected "<provider>/<model>" (e.g. anthropic/claude-sonnet-4-6).`,
+      error: `Invalid model reference "${raw}". Expected "<provider>/<model>" (e.g. anthropic/claude-sonnet-4-6) or a tier shortcut like "anthropic:heavy".`,
     };
   }
   if (allowedProviders && allowedProviders.length > 0) {
@@ -127,9 +187,10 @@ const plugin = {
       description: [
         "Swap the default LLM the agent runs on. Persists to ~/.openclaw/openclaw.json",
         "and triggers a hot config reload, so the next turn (and every turn after)",
-        "uses the new model. Format: \"<provider>/<model>\".",
-        "Examples: anthropic/claude-sonnet-4-6, openai/gpt-4o, gemini/gemini-2.0-flash,",
-        "openai-codex/gpt-5.5, ollama/llama3.3.",
+        "uses the new model. Accepts either an explicit \"<provider>/<model>\" ref or",
+        "a tier shortcut \"<provider>:<tier>\" (tier in light|medium|heavy).",
+        "Examples: anthropic/claude-opus-4-7, anthropic:heavy, openai:medium,",
+        "google:light, openai-codex/gpt-5.5, ollama/llama3.3.",
         "Provider auth (API key or OAuth profile) must already be configured —",
         "this tool only changes the routing target; it does not provision creds.",
       ].join(" "),
@@ -183,6 +244,22 @@ const plugin = {
       },
     });
 
+    // ── Agent tool: tier catalog ─────────────────────────────────────
+    api.registerTool({
+      name: "list_model_tiers",
+      description:
+        "List the light/medium/heavy tier mapping per foundation provider that switch_model accepts as a shortcut. Useful when deciding which tier to escalate to.",
+      parameters: { type: "object", additionalProperties: false, properties: {} },
+      async execute() {
+        const filtered = Object.fromEntries(
+          Object.entries(TIER_CATALOG).filter(
+            ([k]) => !allowedProviders?.length || allowedProviders.includes(k),
+          ),
+        );
+        return reply({ tiers: filtered });
+      },
+    });
+
     // ── Slash command: bypasses the LLM entirely ─────────────────────
     // Plugin commands are processed before the agent runs (see
     // OpenClawPluginCommandDefinition docs in vendor/openclaw/src/plugins/types.ts),
@@ -220,13 +297,21 @@ const plugin = {
           return {
             text: [
               `Current model: ${cur ?? "<unset>"}`,
-              "Usage: /setmodel <provider>/<model>",
-              "Examples:",
-              "  /setmodel anthropic/claude-sonnet-4-6",
-              "  /setmodel openai/gpt-4o",
-              "  /setmodel gemini/gemini-2.0-flash",
+              "Usage: /setmodel <provider>/<model>  |  /setmodel <provider>:<tier>  |  /setmodel menu",
+              "",
+              renderTierMenu(allowedProviders),
+              "",
+              "Explicit examples:",
+              "  /setmodel anthropic/claude-opus-4-7",
+              "  /setmodel openai/gpt-5.5",
+              "  /setmodel google/gemini-3.1-pro-preview",
               "  /setmodel ollama/llama3.3",
             ].join("\n") + allowedHint,
+          };
+        }
+        if (arg === "menu" || arg === "list" || arg === "tiers") {
+          return {
+            text: `Current model: ${cur ?? "<unset>"}\n${renderTierMenu(allowedProviders)}`,
           };
         }
         const validation = validateModelRef(arg, allowedProviders);
@@ -251,9 +336,10 @@ const plugin = {
     });
 
     api.logger.info("model-switcher plugin loaded", {
-      tools: ["switch_model", "current_model"],
+      tools: ["switch_model", "current_model", "list_model_tiers"],
       commands: ["/setmodel"],
       allowedProviders: allowedProviders ?? "(unrestricted)",
+      tierProviders: Object.keys(TIER_CATALOG),
     });
   },
 };

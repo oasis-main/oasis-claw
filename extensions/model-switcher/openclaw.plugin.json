@@ -1,7 +1,7 @@
 {
   "id": "model-switcher",
   "name": "Model Switcher",
-  "description": "Self-referencing LLM swap. Registers two agent tools (switch_model, current_model) so the agent can change its own active language model mid-turn, plus a /setmodel slash command that bypasses the LLM so the operator can recover when generation is broken from the start (e.g. missing/invalid provider key). Writes through api.runtime.config.replaceConfigFile with afterWrite.mode=auto so the gateway hot-reloads on the next turn.",
+  "description": "Self-referencing LLM swap. Registers three agent tools (switch_model, current_model, list_model_tiers) so the agent can change its own active language model mid-turn, plus a /setmodel slash command that bypasses the LLM so the operator can recover when generation is broken from the start (e.g. missing/invalid provider key). Accepts explicit provider/model refs or a light/medium/heavy tier shortcut per foundation provider (anthropic, openai, google). Writes through api.runtime.config.replaceConfigFile with afterWrite.mode=auto so the gateway hot-reloads on the next turn.",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
