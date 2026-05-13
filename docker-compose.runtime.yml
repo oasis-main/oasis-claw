@@ -142,8 +142,18 @@ services:
       # fast container start (otherwise we'd need a longer healthcheck
       # grace period).
       VOICE_SKIP_WARMUP: "1"
-      # Weights cache lives on the volume below.
+      # Default Piper voice — UK Alan (medium) per Mike's preference.
+      # Overrides the upstream-hardcoded en_US-lessac-high default in piper.py.
+      VOICE_PIPER_DEFAULT_VOICE: en_GB-alan-medium
+      # Weights live on the volume below. Both XDG_CACHE_HOME (used by
+      # huggingface/onnxruntime caches) and XDG_DATA_HOME (used by piper.py
+      # and the download_weights script to resolve voice files) point to it.
+      # Originally only XDG_CACHE_HOME was set — that worked while warmup was
+      # being skipped entirely, but once lazy-load actually fired, piper
+      # couldn't find its voice file. Both vars now to keep the search paths
+      # consistent.
       XDG_CACHE_HOME: /srv/weights
+      XDG_DATA_HOME: /srv/weights
     volumes:
       # Persist Piper voices + Moonshine ONNX across image rebuilds.
       - oasis_voice_weights:/srv/weights
