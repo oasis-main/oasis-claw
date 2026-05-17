@@ -1,6 +1,6 @@
 # oasis-claw
 
-Vanilla [openclaw](https://github.com/openclaw/openclaw) is a capable AI gateway, but it ships without answers to four production concerns: **what happens when the model is manipulated**, **where credentials go when the user pastes them**, **how you audit what the agent actually did**, and **what stops a malicious skill from the registry running before you ever look at it**. oasis-claw is a thin plugin layer that fills exactly those gaps — no fork, no divergence from upstream, ten focused extensions on top of the standard plugin SDK. Seven are the security/observability surface; three (`oasis-voice`, `model-switcher`, `browser`) ship voice + LLM-routing + headless-browser capability. Anything we vendor in from upstream (currently just `browser`) is pinned, audited, and refresh-gated — see [AUDIT_LOG.md](./AUDIT_LOG.md).
+Vanilla [openclaw](https://github.com/openclaw/openclaw) is a capable AI gateway, but it ships without answers to four production concerns: **what happens when the model is manipulated**, **where credentials go when the user pastes them**, **how you audit what the agent actually did**, and **what stops a malicious skill from the registry running before you ever look at it**. oasis-claw is a thin plugin layer that fills exactly those gaps — no fork, no divergence from upstream, nine focused extensions on top of the standard plugin SDK. Six are the security/observability surface; three (`oasis-voice`, `model-switcher`, `browser`) ship voice + LLM-routing + headless-browser capability. Private long-term memory is the bundled upstream `memory-core` plugin, enabled and configured (not forked) with nightly dreaming consolidation on by default. Anything we vendor in from upstream (currently just `browser`) is pinned, audited, and refresh-gated — see [AUDIT_LOG.md](./AUDIT_LOG.md).
 
 ## What this adds over vanilla openclaw
 
@@ -10,8 +10,8 @@ Vanilla [openclaw](https://github.com/openclaw/openclaw) is a capable AI gateway
 | Credentials land in plaintext in LLM context | `secrets-vault` | AES-256-GCM at-rest vault; agent gets an opaque handle, not plaintext; redaction hook strips secrets before any JSONL write |
 | Sensitive actions execute without human sign-off | `approval-gate` | `forward_captcha` tool routes CAPTCHA images through Telegram and returns the operator's typed solution; API approval policy hooks for HTTP requests |
 | No immutable session transcript | `session-history` | Append-only JSONL at `llm_input`, `llm_output`, and `tool_call` events; sandbox invariant tests verify the writer never escapes its `logDir` |
-| Agent loses all context on session reset | `dot-swarm` | Injects `.swarm/state.md`, `.swarm/queue.md`, and peer files into every session's memory section via `registerMemoryPromptSupplement`; agent always knows where it left off |
-| No explicit agent lifecycle signals | `agent-primitives` | `sleep`, `dream`, and `compact` tools let the agent voluntarily yield, consolidate memory, and hand off cleanly at context ceiling |
+| Agent loses all context on session reset | `dot-swarm` | Shared `.swarm/` stigmergy: injects `state.md` + `queue.md` into every session's memory section via `registerMemoryPromptSupplement`, provides the `swarm_read` + `compact` tools, and registers the `swarm-compact` CompactionProvider so context-ceiling compaction resumes from the agent's own handoff note |
+| Memory never consolidates — agent forgets recent work | `memory-core` (bundled, configured) | Vanilla openclaw ships `memory-core` with `dreaming` off; oasis-claw enables it by default — a nightly light→REM→deep sweep promotes recent recalls into durable `MEMORY.md` and writes a Dream Diary |
 | Clawhub skills install with zero security review | `clawhub-skill-audit` | Auto-fires an Opus 4.7 audit on every newly installed skill (SKILL.md + bundled scripts), writes an immutable JSON trail, and optionally quarantines `block`-verdict skills before they're loaded by an agent |
 | LLM provider is hardcoded per session | `model-switcher` | `setmodel` agent tool + `/setmodel` slash command for hot-swapping the active model without a recreate; optional `allowedProviders` lock-down |
 | No native voice (TTS / streaming STT) | `oasis-voice` | Registers as openclaw `SpeechProvider` + `RealtimeTranscriptionProvider`; lite tier is Piper TTS + Moonshine STT, runnable on a laptop CPU |
@@ -27,17 +27,17 @@ openclaw's upstream `external-content.ts` runs regex patterns on inbound content
 
 ### Explainability
 
-Every LLM input, output, and tool call is written to an append-only JSONL file by `session-history`. This is structural transparency: the transcript exists regardless of what the model says it did or didn't do. `agent-primitives` adds behavioural transparency: when the agent sleeps, consolidates memory, or hands off, it writes a structured event to `.swarm/trail.log` with the reason and parameters — a complete ledger of agent lifecycle decisions.
+Every LLM input, output, and tool call is written to an append-only JSONL file by `session-history`. This is structural transparency: the transcript exists regardless of what the model says it did or didn't do.
 
 ### Auditability
 
-`dot-swarm` makes cross-session state observable. `.swarm/state.md`, `.swarm/queue.md`, and `.swarm/memory.md` are human-readable files you can inspect, diff, and version-control. The agent reads from them and writes to them via structured tools — there is no hidden state. Combined with `session-history`'s JSONL transcripts, you have a full audit trail: what the agent knew (memory supplement), what it did (tool calls + transcript), and what it decided to carry forward (compact handoff note).
+`dot-swarm` makes cross-session coordination state observable. `.swarm/state.md` and `.swarm/queue.md` are human-readable files you can inspect, diff, and version-control. The agent reads and writes them via structured tools (`swarm_read`, `compact`) — there is no hidden state. Combined with `session-history`'s JSONL transcripts and `memory-core`'s durable `MEMORY.md`, you have a full audit trail: what the agent knew (memory supplement + memory-core recall), what it did (tool calls + transcript), and what it decided to carry forward (compact handoff note).
 
 ---
 
 ## Running with Docker
 
-The runtime image bakes all ten extensions in at build time. Credentials come from `.env`. The build also pulls in pinned Chromium + Playwright via the `browser` plugin (~400MB on top of bookworm-slim). See [AUDIT_LOG.md](./AUDIT_LOG.md) for the per-plugin audit verdicts that gate every release.
+The runtime image bakes all nine extensions in at build time. Credentials come from `.env`. The build also pulls in pinned Chromium + Playwright via the `browser` plugin (~400MB on top of bookworm-slim). See [AUDIT_LOG.md](./AUDIT_LOG.md) for the per-plugin audit verdicts that gate every release.
 
 ```sh
 cp .env.example .env
@@ -222,32 +222,29 @@ Configuration:
 
 `anthropicApiKey` falls back to the `ANTHROPIC_API_KEY` env var if unset (so you don't have to copy the key into `openclaw.json`). `auditModel` defaults to `claude-opus-4-7` — the strong audit model is the point of the plugin, only override for cost-trial. With `quarantineDir` unset, the plugin is audit-only: it will log and alert but never move files.
 
-### `extensions/agent-primitives`
+### Memory & lifecycle — `memory-core` + `dot-swarm`
 
-Three lifecycle tools — `sleep`, `dream`, `compact` — each tool-call shaped, no core loop changes required. Current state: filesystem-side fully wired, host integration is a stub pending ORG-050.
+Private memory and shared coordination are deliberately separate concerns.
 
-| Tool | What the stub does | Host-integration TODO (ORG-050) |
-|---|---|---|
-| `sleep(reason, resumeAfterMs)` | Writes a SLEEP event to `.swarm/trail.log`, returns the scheduled `resumeAt` | Pause the agent loop and schedule re-invocation via cron / systemd-timer |
-| `dream(topic?, maxFiles?)` | Reads recent JSONL session files from `historyDir`, appends a DREAM section to `.swarm/memory.md` | Sub-agent invocation that actually distills transcripts into prose |
-| `compact(handoffNote, sessionTag?)` | Appends a HANDOFF section to `.swarm/state.md`, writes a COMPACT event | Signal harness to finish the turn and start a fresh session — once dot-swarm is enabled, the new session reads state.md back automatically |
-
-The split is deliberate: agent-primitives owns the *content* of each lifecycle event (what gets written where), and host integration owns the *lifecycle* (when to actually pause/restart). This matches the Claude Code compact pattern — the tool emits the snapshot, the harness handles the reset.
-
-Configuration:
+**Private memory** is the bundled upstream `memory-core` plugin — openclaw's default `memory` slot. It indexes `MEMORY.md` + `memory/*.md` and exposes `memory_search` / `memory_get`. oasis-claw enables its `dreaming` sweep (off in vanilla openclaw) so consolidation actually runs:
 
 ```json
 {
   "plugins": {
     "entries": {
-      "agent-primitives": {
-        "swarmDir": "/path/to/repo/.swarm",
-        "historyDir": "~/.openclaw/logs/history"
+      "memory-core": {
+        "config": {
+          "dreaming": { "enabled": true, "frequency": "0 3 * * *", "timezone": "America/New_York" }
+        }
       }
     }
   }
 }
 ```
+
+The nightly light→REM→deep sweep ranks recent recalls, promotes durable ones into `MEMORY.md`, and writes a Dream Diary. Without it, recall works but memory never grows — the agent "forgets" recent work.
+
+**Shared coordination** is `dot-swarm` — the `.swarm/` stigmergy surface. Beyond injecting `state.md` + `queue.md` into the memory prompt, it provides the `compact` tool and the `swarm-compact` `CompactionProvider`: the agent writes a handoff note into `.swarm/state.md`, and at the context ceiling openclaw's compaction serves that note back instead of a generic summary. Activated by `agents.defaults.compaction.provider: "swarm-compact"`, which the runtime entrypoint pins.
 
 ### Configuration reference
 
@@ -332,8 +329,7 @@ oasis-claw/
     secrets-vault/               # AES-256-GCM at-rest store + deposit_secret + redaction hook
     approval-gate/               # forward_captcha tool + API approval library code
     session-history/             # append-only JSONL transcripts + sandbox-isolation invariants
-    dot-swarm/                   # memory prompt supplement: injects .swarm/ files into context
-    agent-primitives/            # sleep / dream / compact lifecycle tools (stubs, FS side wired)
+    dot-swarm/                   # .swarm/ stigmergy: prompt supplement + swarm_read/compact tools + swarm-compact CompactionProvider
     clawhub-skill-audit/         # Opus 4.7 auto-audit of newly installed skills + JSON audit trail
     model-switcher/              # setmodel tool + /setmodel slash; hot-swap LLM provider mid-session
     oasis-voice/                 # speech + realtime-STT provider (Piper TTS + Moonshine STT lite tier)

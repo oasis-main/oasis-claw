@@ -33,8 +33,7 @@ completeness so the log captures the full deployed surface.
 | `secrets-vault` | first-party | unit + redaction-hook tests | AES-256-GCM at rest, no plaintext in transcript |
 | `approval-gate` | first-party | unit tests | `forward_captcha` + library code for API approval |
 | `session-history` | first-party | sandbox-isolation invariants | Append-only JSONL; logDir-escape tests pass |
-| `dot-swarm` | first-party | unit tests | Non-exclusive memory supplement |
-| `agent-primitives` | first-party | unit tests | sleep / dream / compact, FS side wired |
+| `dot-swarm` | first-party | unit tests | Non-exclusive memory supplement + `swarm_read`/`compact` tools + `swarm-compact` CompactionProvider |
 | `clawhub-skill-audit` | first-party | 23 unit tests | The auditor itself; commit `02538e1` |
 | `model-switcher` | first-party | unit tests | `setmodel` + `/setmodel`; CLAW-006 fix landed |
 | `oasis-voice` | first-party | 11 unit tests | Speech + realtime-STT provider; CLAW-003 |

@@ -1,6 +1,5 @@
 import fs from "node:fs";
 import path from "node:path";
-import { appendTrailEvent } from "../trail.js";
 
 export type CompactToolConfig = {
   swarmDir: string;
@@ -9,24 +8,16 @@ export type CompactToolConfig = {
 /**
  * compact tool — graceful handoff at context-ceiling.
  *
- * FS-side (done):
- *   - Appends a HANDOFF section to .swarm/state.md with the agent-supplied
- *     handoff note + ISO timestamp
- *   - Writes a COMPACT event to .swarm/trail.log
- *   - Returns the snapshot path so the caller (or operator) can verify
+ * Appends a HANDOFF section to .swarm/state.md with the agent-supplied handoff
+ * note + ISO timestamp. The SwarmCompactionProvider (compaction-provider.ts)
+ * reads that section back at compaction time, so when openclaw's context limit
+ * triggers auto-compaction the fresh context starts from the agent's own
+ * snapshot instead of a generic summarizeInStages() summary. dot-swarm also
+ * injects state.md into the memory prompt each turn, so the handoff is visible
+ * to the next session regardless of compaction.
  *
- * Host integration (done via SwarmCompactionProvider in compaction-provider.ts):
- *   - api.registerCompactionProvider(createSwarmCompactionProvider({ swarmDir }))
- *     is called in index.ts — this wires the openclaw compaction pipeline to read
- *     from state.md instead of running default summarizeInStages()
- *   - When openclaw's context limit triggers auto-compaction, it calls our provider
- *     which serves back the latest HANDOFF section from state.md
- *   - Remaining: explicit "finish this turn + start fresh session" signal when the
- *     agent calls compact() proactively. Once dot-swarm is wired, the new session
- *     picks up state.md automatically via registerMemoryPromptSupplement.
- *
- * The split is deliberate: agent-primitives owns the *content* of the handoff
- * (what to write where), and host integration owns the *lifecycle* (when to reset).
+ * The split is deliberate: this tool owns the *content* of the handoff (what to
+ * write), the compaction provider owns serving it back at the *lifecycle* moment.
  */
 export function createCompactTool(config: CompactToolConfig) {
   return {
@@ -66,14 +57,6 @@ export function createCompactTool(config: CompactToolConfig) {
         snapshotError = err instanceof Error ? err.message : String(err);
       }
 
-      const trail = appendTrailEvent(config.swarmDir, {
-        kind: "COMPACT",
-        sessionTag: tag,
-        handoffNoteBytes: args.handoffNote.length,
-        snapshotPath: statePath,
-        snapshotWritten,
-      });
-
       const result = {
         status: snapshotWritten ? "snapshot_written" : "snapshot_failed",
         snapshotPath: statePath,
@@ -81,9 +64,8 @@ export function createCompactTool(config: CompactToolConfig) {
         timestamp: ts,
         snapshotWritten,
         snapshotError,
-        trailWritten: trail.written,
-        hostIntegrationNote:
-          "This stub writes the snapshot but does NOT signal the runtime to reset context. Wire the harness reset per oasis-x ORG-050. Once dot-swarm is enabled, the next session will pick up state.md automatically via registerMemoryPromptSupplement.",
+        note:
+          "Handoff written to .swarm/state.md. The swarm-compact compaction provider serves this section back when openclaw auto-compacts at the context ceiling, and dot-swarm injects state.md into the memory prompt each turn.",
       };
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     },
@@ -97,7 +79,7 @@ function renderHandoffSection(tag: string, ts: string, body: string): string {
     "",
     `## Handoff Note — ${tag}`,
     "",
-    `*Compacted at ${ts} via agent-primitives \`compact\` tool.*`,
+    `*Compacted at ${ts} via the dot-swarm \`compact\` tool.*`,
     "",
     body.trim(),
     "",

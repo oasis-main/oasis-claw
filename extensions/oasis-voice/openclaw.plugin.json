@@ -3,7 +3,7 @@
   "name": "Oasis Voice",
   "description": "TTS and streaming STT via oasis-voice sidecar (Piper TTS + Moonshine STT on the lite tier; GPU tiers available on the hosted endpoint).",
   "enabledByDefault": true,
-  "_contracts_NOTE": "We intentionally do NOT declare a `contracts` block here. The openclaw 2026.4.26 loader's `hasRuntimeContractSurface()` flips `startup.sidecar` to false when ANY of speechProviders/mediaUnderstandingProviders/etc. is declared — meaning the gateway never eager-loads the plugin at startup, and it only lazy-loads when a provider lookup hits the registry. For upstream provider plugins (openai, deepgram, etc.) that lazy-load works because they're bundled and the loader has a dedicated path; for our /app/extensions/-mounted plugin it never actually fires. Skipping the contracts declaration makes `startup.sidecar=true`, so register() runs at boot and registerSpeechProvider/registerMediaUnderstandingProvider/registerRealtimeTranscriptionProvider populate the provider registries eagerly. The actual capability resolution still picks us via autoPriority (10) — see speech-provider.ts + media-understanding-provider.ts.",
+  "_contracts_NOTE": "We intentionally do NOT declare a `contracts` block here. Declaring contracts.{speechProviders,mediaUnderstandingProviders,realtimeTranscriptionProviders} makes the loader treat this plugin as lazy/capability-triggered, and that lazy load never fires for an /app/extensions/-mounted (non-bundled) plugin — so register() never runs and the provider registries stay empty. VERIFIED 2026-05-16: adding the contracts block (even alongside `activation.onStartup: true`, which did NOT override the behavior) dropped oasis-voice from the gateway plugin tally entirely (16 plugins -> 15, no `oasis-voice plugin loaded` log line). Without contracts, register() runs eagerly at boot and registerSpeechProvider/registerMediaUnderstandingProvider/registerRealtimeTranscriptionProvider populate the runtime registries. The cost: oasis-voice is absent from the manifest-metadata registry that drives media-understanding autoPriority resolution (media-understanding/manifest-metadata.ts skips providers not in contracts.mediaUnderstandingProviders). So inbound-audio routing canNOT be left to autoPriority — it MUST be pinned explicitly via `tools.media.audio.models` in config (the runtime entrypoint does exactly this; see scripts/runtime-entrypoint.sh). Outbound TTS is likewise pinned via `messages.tts.provider`. Properly fixing the contracts-vs-eager-load conflict needs an upstream openclaw loader change and is tracked separately.",
   "mediaUnderstandingProviderMetadata": {
     "oasis-voice": {
       "capabilities": ["audio"],
@@ -25,7 +25,7 @@
       },
       "tts_voice": {
         "type": "string",
-        "description": "Default TTS voice passed to oasis-voice (e.g. piper:en_US-lessac-high). Default: piper:en_US-lessac-high"
+        "description": "Default TTS voice passed to oasis-voice (e.g. piper:en_GB-alan-medium). Default: piper:en_GB-alan-medium"
       },
       "bearer_token": {
         "type": "string",

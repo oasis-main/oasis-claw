@@ -1,7 +1,7 @@
 {
   "id": "dot-swarm",
   "name": "Dot-Swarm",
-  "description": "Memory prompt supplement that injects .swarm/state.md + queue.md (and any configured peer files) into the agent's memory section. Coexists with memory-core / memory-lancedb / active-memory rather than replacing them — registers via registerMemoryPromptSupplement, not as a kind:\"memory\" backend.",
+  "description": "Shared .swarm/ stigmergy plugin. Injects .swarm/state.md + queue.md (and any configured peer files) into the agent's memory section via registerMemoryPromptSupplement (non-exclusive — coexists with the memory-core kind:\"memory\" backend, does not replace it). Also provides the swarm_read + compact agent tools and the swarm-compact CompactionProvider (handoff-driven context compaction backed by .swarm/state.md).",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

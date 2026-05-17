@@ -3,9 +3,10 @@
 # Container entrypoint for oasis-claw-runtime.
 #
 # 1. Ensure ~/.openclaw exists; mint a gateway auth token if not provided.
-# 2. Run `openclaw plugins install --link --force` for each of our 10 baked-in
+# 2. Run `openclaw plugins install --link --force` for each of our 9 baked-in
 #    extensions so the loader registers them in the persisted plugin registry
-#    that lives in ~/.openclaw (volume-persisted).
+#    that lives in ~/.openclaw (volume-persisted). memory-core is bundled with
+#    openclaw (not in /app/extensions) — it is configured, not installed.
 # 3. Pin gateway.bind / gateway.mode / token / Control UI allowlist + per-plugin
 #    config under plugins.entries.<id>.config (no `path` key — that's handled by
 #    the install registry the previous step populated).
@@ -44,7 +45,7 @@ if [[ ! -f "${CONFIG_DIR}/.swarm/state.md" ]]; then
 # oasis-claw swarm state
 
 First-boot placeholder. Replace with current handoff state, or let
-agent-primitives' `compact` tool overwrite this on its next run.
+dot-swarm's `compact` tool append a handoff section on its next run.
 MD
 fi
 if [[ ! -f "${CONFIG_DIR}/.swarm/queue.md" ]]; then
@@ -98,10 +99,29 @@ if isinstance(providers, dict):
         if isinstance(pcfg, dict) and "models" not in pcfg:
             pcfg["models"] = []
 
+# Stale plugin references from prior boots. When a plugin is removed from
+# the image (e.g. agent-primitives, retired into dot-swarm), the persisted
+# config still carries it: a plugins.load.paths entry AND a plugins.entries
+# block. The load.paths entry is FATAL — `openclaw plugins install --link`
+# validates the whole config first, and a load path that no longer exists
+# on disk aborts EVERY install in the loop below. Prune load.paths entries
+# whose directory is missing (self-healing for any future plugin removal),
+# and drop orphaned entries blocks that have no matching install path.
+plugins_cfg = config.get("plugins")
+if isinstance(plugins_cfg, dict):
+    load = plugins_cfg.get("load")
+    if isinstance(load, dict) and isinstance(load.get("paths"), list):
+        load["paths"] = [
+            p for p in load["paths"] if isinstance(p, str) and Path(p).exists()
+        ]
+    entries = plugins_cfg.get("entries")
+    if isinstance(entries, dict):
+        entries.pop("agent-primitives", None)
+
 config_path.write_text(json.dumps(config, indent=2) + "\n")
 PY
 
-# ---- install our 10 extensions via the openclaw plugin registry --------
+# ---- install our 9 extensions via the openclaw plugin registry --------
 # `--link` points the registry at /app/extensions/<id>/ (read-only image) so
 # we don't duplicate code. `--force` is incompatible with --link, so we skip
 # install if the plugin is already in the registry from a prior boot.
@@ -122,7 +142,6 @@ declare -A PLUGINS=(
   [approval-gate]=""
   [session-history]=""
   [dot-swarm]=""
-  [agent-primitives]=""
   # clawhub-skill-audit's audit-prompt.ts intentionally contains the
   # exact "dynamic code execution" string patterns the auditor looks
   # FOR in third-party skills. openclaw's install-time scanner reads
@@ -229,7 +248,7 @@ TELEGRAM_KEYS = {"telegramBotToken", "telegramChatId", "telegramAlertChatId"}
 # 127.0.0.1:8731 stuck after we changed the default to
 # http://oasis-voice:8731 (sibling container), and the plugin kept
 # resolving to the openclaw container's own loopback (no listener).
-TOPOLOGY_KEYS = {"endpoint"}
+TOPOLOGY_KEYS = {"endpoint", "tts_voice"}
 
 def merge_config(plugin_id, defaults, hooks=None):
     entry = entries.setdefault(plugin_id, {})
@@ -282,10 +301,18 @@ merge_config("dot-swarm", {
     "swarmDir": str(home / ".openclaw/.swarm"),
     "registerSwarmReadTool": True,
 })
-merge_config("agent-primitives", {
-    "swarmDir": str(home / ".openclaw/.swarm"),
-    "historyDir": str(home / ".openclaw/logs/history"),
-})
+# compaction strategy — pin the swarm-compact provider. dot-swarm registers a
+# CompactionProvider (id "swarm-compact") that, at the context ceiling, serves
+# back the latest HANDOFF section the agent wrote into .swarm/state.md via the
+# `compact` tool — instead of a generic summarizeInStages() summary. The
+# provider is inert unless this key names it. Hard-set (like
+# messages.tts.provider): a deliberate topology choice. If dot-swarm is ever
+# removed, drop this key too, or the safeguard hook logs "configured but not
+# registered". `compaction.mode` (e.g. "safeguard") is left untouched.
+config.setdefault("agents", {})
+config["agents"].setdefault("defaults", {})
+config["agents"]["defaults"].setdefault("compaction", {})
+config["agents"]["defaults"]["compaction"]["provider"] = "swarm-compact"
 
 # clawhub-skill-audit: Opus 4.7 security review on every newly installed skill,
 # trail at ~/.openclaw/logs/skill-audits. ANTHROPIC_API_KEY is read by the
@@ -320,6 +347,30 @@ if allowed_providers_env:
     ]
 merge_config("model-switcher", model_switcher_cfg)
 
+# memory-core: the agent's private long-term memory. It is a BUNDLED
+# upstream plugin and the default `memory` slot (vendor/openclaw-source/
+# src/plugins/slots.ts), so it already loads at startup and serves
+# memory_search / memory_get + workspace/MEMORY.md with no config at all —
+# it is NOT in the install --link loop above (that loop is for our 9
+# /app/extensions plugins only).
+#
+# The one capability off by default is `dreaming`: the scheduled
+# consolidation sweep that ranks recent recalls, promotes durable ones
+# into MEMORY.md, and writes a Dream Diary. Without it, recall works but
+# memory never consolidates — recent context is never made durable, which
+# is the "agent forgets things" symptom. We enable it out of the box: a
+# nightly 3 AM local light/REM/deep sweep. The plugin config schema
+# (openclaw.plugin.json, additionalProperties:false) accepts ONLY the
+# `dreaming` object. setdefault semantics — operators can retune frequency
+# or disable via openclaw.json without the next boot stomping it.
+merge_config("memory-core", {
+    "dreaming": {
+        "enabled": True,
+        "frequency": "0 3 * * *",
+        "timezone": "America/New_York",
+    },
+})
+
 # oasis-voice: speech (TTS) + media-understanding audio (inbound voice
 # messages from Telegram / iMessage) + realtime streaming STT (for future
 # telephony / WebRTC) backed by the oasis-voice sidecar.
@@ -338,7 +389,7 @@ oasis_voice_endpoint = (
 )
 oasis_voice_bearer = os.environ.get("OASIS_VOICE_BEARER_TOKEN", "").strip() or None
 oasis_voice_tts_voice_env = os.environ.get("OASIS_VOICE_TTS_VOICE", "").strip()
-oasis_voice_tts_voice = oasis_voice_tts_voice_env or "piper:en_US-lessac-high"
+oasis_voice_tts_voice = oasis_voice_tts_voice_env or "piper:en_GB-alan-medium"
 oasis_voice_cfg: dict = {
     "endpoint": oasis_voice_endpoint,
     "tts_voice": oasis_voice_tts_voice,
@@ -359,24 +410,37 @@ if oasis_voice_tts_voice_env:
 # provider to transcribe it. The valid config schema for this section is
 # enumerated in vendor/openclaw-source/src/config/media-audio-field-metadata.ts
 # — `tools.media.audio.provider` is NOT a valid key (which caused a config
-# validation failure on the first boot of d081484). The right route is:
-#   - Just enable the section: `tools.media.audio.enabled = true`
-#   - Let provider selection happen via the registered providers'
-#     autoPriority — our oasis-voice plugin sets
-#     `autoPriority: { audio: 10 }` which ranks ahead of the cloud
-#     providers (deepgram/google/groq at 20-30). So when oasis-voice is
-#     reachable, it wins; if it's down, an explicitly-configured cloud
-#     provider takes over.
-#   - If we ever NEED to hard-force (e.g. cloud STT key is configured
-#     but we still want local), add `tools.media.audio.models = [...]`
-#     with our model id first. Not needed today.
+# validation failure on the first boot of d081484); the ordered fallback
+# list `tools.media.audio.models` IS the valid route.
+#
+# We HARD-PIN oasis-voice first here. autoPriority cannot be relied on:
+# oasis-voice deliberately ships WITHOUT a manifest `contracts` block (see
+# extensions/oasis-voice/openclaw.plugin.json _contracts_NOTE — declaring
+# contracts breaks eager-load for this /app/extensions/-mounted plugin),
+# and media-understanding's autoPriority registry only contains providers
+# that DO declare contracts. So oasis-voice is invisible to autoPriority
+# and inbound audio silently falls through to the cloud providers
+# (openai/google). An explicit `tools.media.audio.models` pin is the only
+# route that makes the media-understanding runner attempt oasis-voice's
+# (runtime-registered) provider first.
+#
+# Order = fallback order: oasis-voice (local Moonshine) first; openai
+# (gpt-4o-transcribe) second so a sidecar outage degrades to cloud rather
+# than failing the transcription outright. Drop the openai entry if you
+# want strict local-only. This is the inbound counterpart of the
+# `messages.tts.provider` outbound pin below, and is hard-overwritten on
+# every boot for the same reason that pin is.
 config.setdefault("tools", {})
 config["tools"].setdefault("media", {})
 config["tools"]["media"].setdefault("audio", {})
 config["tools"]["media"]["audio"]["enabled"] = True
-# Strip stale `provider` key from prior boots — see above for why this
-# key isn't valid in the audio-config schema. Idempotent merge alone
-# wouldn't clean up a once-broken config file on the persistent volume.
+config["tools"]["media"]["audio"]["models"] = [
+    {"provider": "oasis-voice", "model": "moonshine-base"},
+    {"provider": "openai", "model": "gpt-4o-transcribe"},
+]
+# Strip stale `provider` key from prior boots — that key isn't valid in
+# the audio-config schema. Idempotent merge alone wouldn't clean up a
+# once-broken config file on the persistent volume.
 config["tools"]["media"]["audio"].pop("provider", None)
 
 # Provider baseUrl + apiKey hand-off. The openclaw
@@ -398,15 +462,25 @@ config["models"].setdefault("providers", {})
 config["models"]["providers"].setdefault("oasis-voice", {})
 config["models"]["providers"]["oasis-voice"]["baseUrl"] = oasis_voice_endpoint
 config["models"]["providers"]["oasis-voice"].setdefault("models", [])
-if oasis_voice_bearer:
-    config["models"]["providers"]["oasis-voice"]["apiKey"] = oasis_voice_bearer
+# apiKey is REQUIRED for the media-understanding pipeline to route here:
+# its provider-auth resolver hard-fails ("No API key found for provider
+# oasis-voice") before ever calling transcribeAudio if the key is absent,
+# even though the local lite tier needs no credentials. The plugin's
+# transcribe path treats the literal "anonymous" as "send no Authorization
+# header" (media-understanding-provider.ts buildAuthHeaders), so we seed
+# that sentinel for the local tier. A real bearer (hosted/GPU tier, CLAW-013)
+# overrides it. Hard-overwrite, not setdefault: a stale "anonymous" left by a
+# prior boot must yield to a bearer added later via .env, and vice versa.
+config["models"]["providers"]["oasis-voice"]["apiKey"] = (
+    oasis_voice_bearer if oasis_voice_bearer else "anonymous"
+)
 
 # ---- outbound voice (CLAW-021): voice-in → voice-out ------------------
 # Three knobs together make this work:
 #   1. `messages.tts.provider = "oasis-voice"` — when openclaw decides to
 #      TTS a reply, it asks our SpeechProvider (not deepgram/elevenlabs/
 #      anything else that may register later). This is the OUTBOUND
-#      counterpart of the inbound `tools.media.audio.provider` pin above.
+#      counterpart of the inbound `tools.media.audio.models` pin above.
 #   2. `messages.tts.auto = "inbound"` — only TTS the reply when the
 #      INBOUND message was itself audio. Text-in → text-out (cheap path).
 #      Voice-note-in → voice-note-out (Nimbus speaks back). Other modes:
@@ -495,8 +569,8 @@ cat <<BANNER
    gateway token  : ${masked}
    plugins        : prompt-injection-reporting, secrets-vault,
                     approval-gate, session-history, dot-swarm,
-                    agent-primitives, clawhub-skill-audit,
-                    model-switcher, oasis-voice, browser
+                    clawhub-skill-audit, model-switcher,
+                    oasis-voice, browser (+ bundled memory-core)
    browser eval   : disabled (per CLAW-014 audit; per-session opt-in only)
    config file    : ${CONFIG_FILE}
 ==============================================================

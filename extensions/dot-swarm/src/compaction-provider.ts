@@ -9,18 +9,21 @@
  *      starts from the agent's own carefully-written state snapshot
  *   3. Falls back to a digest of the conversation messages if no HANDOFF exists
  *
- * This means the `compact` tool (FS-write) + this provider (context-lifecycle) are
- * two halves of the same feature. The agent writes the snapshot, the provider serves
- * it back to the runtime at compaction time.
+ * The `compact` tool (FS-write) + this provider (context-lifecycle) are two
+ * halves of the same feature: the agent writes the snapshot, the provider serves
+ * it back to the runtime at compaction time. Both live in dot-swarm because both
+ * operate on the .swarm/ stigmergy surface.
  *
- * Registered in: index.ts via api.registerCompactionProvider()
+ * Only active when agents.defaults.compaction.provider = "swarm-compact" is set
+ * in config (registration alone does not activate it). Registered in index.ts
+ * via api.registerCompactionProvider().
  */
 
 import fs from "node:fs";
 import path from "node:path";
 
 // ---------------------------------------------------------------------------
-// Provider interface (mirrors openclaw's CompactionProvider from compaction-provider.ts)
+// Provider interface (mirrors openclaw's CompactionProvider)
 // ---------------------------------------------------------------------------
 
 export type CompactionParams = {
@@ -128,7 +131,7 @@ export function createSwarmCompactionProvider(
 
   return {
     id: "swarm-compact",
-    label: "Swarm State Compaction (oasis-claw/agent-primitives)",
+    label: "Swarm State Compaction (oasis-claw/dot-swarm)",
 
     async summarize(params: CompactionParams): Promise<string> {
       // 1. Try to read the agent's own handoff note
@@ -140,7 +143,7 @@ export function createSwarmCompactionProvider(
           handoff,
           "",
           `---`,
-          `*Compaction source: .swarm/state.md — written by agent-primitives \`compact\` tool.*`,
+          `*Compaction source: .swarm/state.md — written by the dot-swarm \`compact\` tool.*`,
         ].join("\n");
       }
 

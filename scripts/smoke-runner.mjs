@@ -184,13 +184,7 @@ const PLUGINS = [
     id: "dot-swarm",
     path: path.join(ROOT, "extensions/dot-swarm/index.ts"),
     config: { swarmDir: SMOKE_SWARM },
-    expect: { memorySupplement: true, minTools: 1 },
-  },
-  {
-    id: "agent-primitives",
-    path: path.join(ROOT, "extensions/agent-primitives/index.ts"),
-    config: { swarmDir: SMOKE_SWARM },
-    expect: { minTools: 3, compactionProvider: true },
+    expect: { memorySupplement: true, minTools: 2, compactionProvider: true },
   },
   {
     id: "clawhub-skill-audit",
