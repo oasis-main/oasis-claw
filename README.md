@@ -60,6 +60,34 @@ make smoke          # plugin registration smoke test (mock API, no live LLM)
 | `make smoke` | Plugin smoke test | After plugin code changes |
 | `make token` | Print gateway auth token | Needed for direct API calls |
 | `make healthz` | Authenticated healthz probe | Verify gateway is up |
+| `make assets-list` | Per-bot avatar inventory (size, dims, hash) | Checking which face each bot wears |
+| `make assets-set BOT=x AVATAR=f.png` | Swap a bot's avatar + reload | Giving a bot a new face (add `RELOAD=0` to defer) |
+| `make assets-show BOT=x` | Open a bot's current avatar | Eyeballing before/after a swap |
+
+### Managing bot avatars
+
+Each bot's face is an image under `workspace/avatars/`, referenced from the
+`- **Avatar:** avatars/<file>` line in its `IDENTITY.md`. The
+[`scripts/claw-assets`](scripts/claw-assets) CLI (wrapped by the `assets-*`
+targets above) keeps the three copies of that fact consistent:
+
+- **Running bot** — writes the image into the live volume *as the `node` user*
+  (the container drops `CAP_DAC_OVERRIDE`, so a plain `docker cp` lands files
+  the gateway can't read), repoints `IDENTITY.md` if the file extension
+  changed, and restarts the gateway so the persona reload takes effect.
+- **Stopped persona bot** — stages the image + `IDENTITY.md` edit into the
+  gitignored `bots/<name>/workspace/` overlay instead; the next
+  `make -C bots up BOT=<name>` / `seed` applies it. Nimbus has no overlay —
+  its volume is the source of record.
+- **Telegram profile photo** — `scripts/claw-assets telegram-photo <bot>`
+  validates the current avatar against Telegram's limits (square, ≥512px,
+  <5 MB, static) and hands off to BotFather `/setuserpic`; the Bot API cannot
+  set a bot's own photo, so that last click stays manual.
+
+`scripts/claw-assets theme <bot>` probes the pinned openclaw build for
+theme/appearance config keys and reports honestly when there are none (the
+current pin exposes no UI theming — personality lives in the avatar plus
+`IDENTITY.md`/`SOUL.md`).
 
 ---
 

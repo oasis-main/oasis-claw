@@ -5,7 +5,7 @@
 
 COMPOSE := docker compose -f docker-compose.runtime.yml
 
-.PHONY: help up restart recreate rebuild down logs status token healthz shell smoke
+.PHONY: help up restart recreate rebuild down logs status token healthz shell smoke creds-list creds-refresh assets-list assets-set assets-show
 
 help:
 	@awk 'BEGIN{FS=":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -47,6 +47,28 @@ shell: ## interactive shell inside the runtime container
 
 smoke: ## run plugin-registration smoke test (mock API, no live LLM)
 	docker compose -f docker-compose.smoke.yml up --build --abort-on-container-exit
+
+creds-list: ## list gog OAuth accounts across every bot (PROBE=1 for live probe)
+	@./scripts/claw-creds list $(if $(PROBE),--probe,)
+
+creds-refresh: ## refresh OAuth creds (BOTS='nimbus kolmogorov' or BOTS=--all; optional ACCOUNT=email, PASTE=1)
+	@./scripts/claw-creds refresh $(BOTS) \
+	    $(if $(ACCOUNT),--account $(ACCOUNT),) \
+	    $(if $(PASTE),--paste,)
+
+assets-list: ## list per-bot avatar inventory (name, size, dims, hash)
+	@./scripts/claw-assets list
+
+assets-set: ## set a bot's avatar (BOT=<name> AVATAR=<path>; optional NAME=<file>, RELOAD=0)
+	@test -n "$(BOT)"    || { echo "BOT=<name> required";    exit 2; }
+	@test -n "$(AVATAR)" || { echo "AVATAR=<path> required"; exit 2; }
+	@./scripts/claw-assets set $(BOT) --avatar "$(AVATAR)" \
+	    $(if $(NAME),--name "$(NAME)",) \
+	    $(if $(filter 0 no false,$(RELOAD)),--no-reload,)
+
+assets-show: ## open a bot's current avatar (BOT=<name>)
+	@test -n "$(BOT)" || { echo "BOT=<name> required"; exit 2; }
+	@./scripts/claw-assets show $(BOT)
 
 wait-ready:
 	@until $(COMPOSE) logs --since=30s openclaw 2>&1 | grep -q "\[gateway\] ready"; do sleep 1; done

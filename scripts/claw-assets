@@ -1,0 +1,621 @@
+#!/usr/bin/env python3
+"""
+claw-assets — inventory and swap per-bot presentation assets across oasis-claw bots.
+
+Sibling of `claw-creds`: lives on the deployment management machine (your Mac),
+discovers bots compose-driven, and talks to them via `docker`. Where claw-creds
+rotates OAuth credentials, claw-assets manages the *face* each bot presents —
+the workspace avatar the agent references, plus the surfaces that give a
+deployed assistant its own personality.
+
+  claw-assets list                          # per-bot avatar inventory (name, size, dims, hash)
+  claw-assets set nimbus --avatar face.gif  # push a new avatar → volume → reload
+  claw-assets set nimbus --avatar f.png --no-reload   # copy only, don't restart the gateway
+  claw-assets set house --avatar h.jpg --name mug.jpg # force the on-disk filename
+  claw-assets show nimbus                    # open the bot's current avatar in Preview
+  claw-assets theme nimbus                   # report theme-capable config keys (probe only)
+  claw-assets telegram-photo nimbus          # validate the avatar + hand off to BotFather
+
+The avatar the agent treats as its face is whatever `workspace/IDENTITY.md`
+points at (`- **Avatar:** avatars/<file>`). `set` writes the new image into the
+bot's `workspace/avatars/`, reconciles that IDENTITY reference when the file
+extension changes, mirrors the asset back into the gitignored `bots/<name>/`
+overlay so a future `make seed`/rebuild keeps it, and restarts the gateway so
+the persona reload takes effect (skip with --no-reload).
+
+Discovery is compose-driven: every service that uses the `oasis-claw-runtime:local`
+image is a bot. Display names map `openclaw` → `nimbus`; bot overlay services
+keep their declared name. Nimbus has no `bots/nimbus/` overlay — its workspace
+volume is the source of record, so mirroring is skipped for it.
+"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+RUNTIME_COMPOSE = REPO_ROOT / "docker-compose.runtime.yml"
+BOTS_COMPOSE = REPO_ROOT / "bots" / "docker-compose.bots.yml"
+RUNTIME_IMAGE = "oasis-claw-runtime:local"
+
+# `openclaw` is the root-compose runtime container; everyone calls it Nimbus.
+SERVICE_DISPLAY_NAMES = {"openclaw": "nimbus"}
+
+WORKSPACE = "/home/node/.openclaw/workspace"
+AVATAR_SUBDIR = "avatars"
+ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+
+# Telegram profile-photo constraints (Bot API can't set a bot's own avatar —
+# that's BotFather /setuserpic — but we validate against the same limits so the
+# hand-off is a clean upload, not a rejected one).
+TELEGRAM_MAX_BYTES = 5 * 1024 * 1024
+TELEGRAM_MIN_DIM = 512
+
+
+# ── shared helpers (kept in lockstep with claw-creds) ──────────────────────
+
+def color(s, c):
+    if not sys.stdout.isatty():
+        return s
+    codes = {"red": 31, "green": 32, "yellow": 33, "cyan": 36, "dim": 90}
+    return f"\033[{codes[c]}m{s}\033[0m"
+
+
+def visible_len(s):
+    out, i = 0, 0
+    while i < len(s):
+        if s[i] == "\x1b":
+            while i < len(s) and s[i] != "m":
+                i += 1
+            i += 1
+        else:
+            out += 1
+            i += 1
+    return out
+
+
+def compose_base():
+    cmd = ["docker", "compose", "-f", str(RUNTIME_COMPOSE)]
+    if BOTS_COMPOSE.exists():
+        cmd += ["-f", str(BOTS_COMPOSE)]
+    cmd += ["--project-directory", str(REPO_ROOT)]
+    return cmd
+
+
+def discover_bots():
+    """Return [(display, service, container)] for every bot, nimbus first."""
+    cmd = compose_base() + ["config", "--format", "json"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+    except FileNotFoundError:
+        sys.exit("docker not found on PATH")
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"docker compose config failed:\n{e.stderr}")
+    services = json.loads(out).get("services", {})
+    bots = []
+    for svc, cfg in services.items():
+        if cfg.get("image") != RUNTIME_IMAGE:
+            continue
+        bots.append((SERVICE_DISPLAY_NAMES.get(svc, svc),
+                     svc, cfg.get("container_name", svc)))
+    bots.sort(key=lambda b: (b[0] != "nimbus", b[0]))
+    return bots
+
+
+def container_state(container):
+    r = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Running}}", container],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return "absent"
+    return "running" if r.stdout.strip() == "true" else "stopped"
+
+
+def resolve_bot(name):
+    """Map a display name to (display, service, container) or exit."""
+    bots = discover_bots()
+    by_display = {d: (d, s, c) for d, s, c in bots}
+    if name not in by_display:
+        sys.exit(f"Unknown bot '{name}'. Known: "
+                 f"{', '.join(d for d, _, _ in bots)}")
+    return by_display[name]
+
+
+# ── container plumbing ─────────────────────────────────────────────────────
+
+def dexec(container, script, check=False):
+    """Run `sh -lc <script>` inside the container."""
+    return subprocess.run(
+        ["docker", "exec", container, "sh", "-lc", script],
+        capture_output=True, text=True, check=check,
+    )
+
+
+def dwrite_bytes(container, dest, data: bytes):
+    """Write bytes to <dest> inside the container as the node user.
+
+    We stream through `docker exec` (not `docker cp`) on purpose: cp runs as
+    host-root against the volume and lands files owned by the host UID with the
+    source's mode, which the node-run gateway can't reliably read. `cat > dest`
+    under the container's default user yields a node-owned, umask-644 file the
+    gateway can read. The container drops CAP_DAC_OVERRIDE, so there's no
+    root-side chown/chmod fallback — writing as node is the only correct path.
+
+    We stage to a sibling temp and `mv` over the target rather than `cat >
+    dest` directly: truncating an existing file needs write permission on the
+    *file*, which fails if a prior `docker cp` left it owned by another UID.
+    `mv` only needs write on the *directory* (node owns the workspace), and the
+    renamed temp keeps its node ownership — so a replace always lands node:node.
+    """
+    tmp = f"{dest}.claw-tmp"
+    subprocess.run(
+        ["docker", "exec", "-i", container, "sh", "-c",
+         f'cat > "{tmp}" && mv -f "{tmp}" "{dest}"'],
+        input=data, capture_output=True, check=True,
+    )
+
+
+def dcp_out(container, src, dest: Path):
+    subprocess.run(["docker", "cp", f"{container}:{src}", str(dest)],
+                   capture_output=True, text=True, check=True)
+
+
+def read_identity(container):
+    r = dexec(container, f'cat "{WORKSPACE}/IDENTITY.md" 2>/dev/null')
+    return r.stdout if r.returncode == 0 and r.stdout else None
+
+
+AVATAR_LINE_RE = re.compile(
+    r'([\w./-]+\.(?:jpg|jpeg|png|gif|webp))', re.IGNORECASE)
+
+
+def declared_from_text(text):
+    """The avatar path an IDENTITY.md body points at, e.g. 'avatars/nimbus.jpg'."""
+    if not text:
+        return None
+    for line in text.splitlines():
+        if "avatar" in line.lower():
+            m = AVATAR_LINE_RE.search(line)
+            if m:
+                return m.group(1)
+    return None
+
+
+def declared_avatar(container):
+    """The avatar path the container's IDENTITY.md points at."""
+    return declared_from_text(read_identity(container))
+
+
+def avatar_stat(container, rel):
+    """(exists, size, mtime_epoch, sha8) for WORKSPACE/<rel>, one exec."""
+    script = (
+        f'cd "{WORKSPACE}" && '
+        f'if [ -f "{rel}" ]; then '
+        f'stat -c "%s %Y" "{rel}"; sha256sum "{rel}" | cut -c1-8; '
+        f'else echo MISSING; fi'
+    )
+    r = dexec(container, script)
+    lines = [l for l in r.stdout.splitlines() if l.strip()]
+    if not lines or lines[0] == "MISSING":
+        return (False, 0, 0, "")
+    try:
+        size, mtime = lines[0].split()
+        sha8 = lines[1] if len(lines) > 1 else ""
+        return (True, int(size), int(mtime), sha8)
+    except (ValueError, IndexError):
+        return (False, 0, 0, "")
+
+
+def list_avatar_files(container):
+    r = dexec(container, f'ls -1 "{WORKSPACE}/{AVATAR_SUBDIR}" 2>/dev/null')
+    return [l for l in r.stdout.splitlines() if l.strip()]
+
+
+# ── dependency-free image dimension sniffing (png / gif / jpeg) ─────────────
+
+def image_dims(path: Path):
+    """Return (w, h) from the file header, or None. Stdlib only."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(2)
+            if head == b"\xff\xd8":                       # JPEG
+                f.seek(0)
+                return _jpeg_dims(f)
+            rest = head + f.read(30)
+        if rest[:8] == b"\x89PNG\r\n\x1a\n":              # PNG
+            w = int.from_bytes(rest[16:20], "big")
+            h = int.from_bytes(rest[20:24], "big")
+            return (w, h)
+        if rest[:6] in (b"GIF87a", b"GIF89a"):            # GIF
+            w = int.from_bytes(rest[6:8], "little")
+            h = int.from_bytes(rest[8:10], "little")
+            return (w, h)
+        if rest[:4] == b"RIFF" and rest[8:12] == b"WEBP":  # WEBP (VP8X only)
+            if rest[12:16] == b"VP8X":
+                w = int.from_bytes(rest[24:27], "little") + 1
+                h = int.from_bytes(rest[27:30], "little") + 1
+                return (w, h)
+    except OSError:
+        return None
+    return None
+
+
+def _jpeg_dims(f):
+    f.read(2)  # skip SOI
+    while True:
+        b = f.read(1)
+        if not b:
+            return None
+        if b != b"\xff":
+            continue
+        marker = f.read(1)
+        while marker == b"\xff":       # skip fill bytes
+            marker = f.read(1)
+        if not marker:
+            return None
+        m = marker[0]
+        if 0xC0 <= m <= 0xCF and m not in (0xC4, 0xC8, 0xCC):
+            f.read(3)                  # length(2) + precision(1)
+            h = int.from_bytes(f.read(2), "big")
+            w = int.from_bytes(f.read(2), "big")
+            return (w, h)
+        seg = f.read(2)
+        if len(seg) < 2:
+            return None
+        f.read(int.from_bytes(seg, "big") - 2)
+
+
+# ── presentation helpers ───────────────────────────────────────────────────
+
+def human_size(n):
+    if n < 1024:
+        return f"{n}B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.0f}K"
+    return f"{n / (1024 * 1024):.1f}M"
+
+
+def human_age(epoch):
+    if not epoch:
+        return "?"
+    secs = int((datetime.now(timezone.utc)
+                - datetime.fromtimestamp(epoch, timezone.utc)).total_seconds())
+    if secs < 90:
+        return f"{secs}s ago"
+    if secs < 5400:
+        return f"{secs // 60}m ago"
+    if secs < 172800:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
+
+
+def print_table(rows):
+    widths = [max(visible_len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    for r in rows:
+        print("  ".join(cell + " " * (widths[i] - visible_len(cell))
+                        for i, cell in enumerate(r)))
+
+
+def reload_bot(display, service):
+    print(color(f"  reloading {display} (gateway restart)…", "dim"))
+    subprocess.run(compose_base() + ["restart", service],
+                   capture_output=True, text=True)
+    # Match the Makefile wait-ready contract.
+    import time
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        r = subprocess.run(
+            compose_base() + ["logs", "--since=30s", service],
+            capture_output=True, text=True)
+        if "[gateway] ready" in (r.stdout + r.stderr):
+            print(color("  ✓ gateway ready", "green"))
+            return
+        time.sleep(1)
+    print(color("  ! gateway didn't report ready within 60s "
+                "(check `make -C bots logs BOT=%s`)" % display, "yellow"))
+
+
+def overlay_dir(display):
+    """Host-side overlay for a bot, or None (nimbus has no bots/ overlay)."""
+    d = REPO_ROOT / "bots" / display / "workspace"
+    return d if d.is_dir() else None
+
+
+# ── commands ────────────────────────────────────────────────────────────────
+
+def cmd_list(args):
+    bots = discover_bots()
+    rows = [("BOT", "STATE", "AVATAR", "SIZE", "DIMS", "HASH", "UPDATED", "IDENTITY")]
+    for display, _, container in bots:
+        state = container_state(container)
+        if state != "running":
+            rows.append((display, color(state, "yellow"),
+                         "—", "—", "—", "—", "—", "—"))
+            continue
+        declared = declared_avatar(container)
+        files = list_avatar_files(container)
+        if not declared and not files:
+            rows.append((display, color("running", "green"),
+                         color("(none)", "dim"), "—", "—", "—", "—",
+                         color("no avatar", "dim")))
+            continue
+        rel = declared or f"{AVATAR_SUBDIR}/{files[0]}"
+        exists, size, mtime, sha8 = avatar_stat(container, rel)
+        # dims: pull the file out once and sniff its header
+        dims = "?"
+        if exists:
+            with tempfile.NamedTemporaryFile(suffix=Path(rel).suffix) as tmp:
+                try:
+                    dcp_out(container, f"{WORKSPACE}/{rel}", Path(tmp.name))
+                    d = image_dims(Path(tmp.name))
+                    if d:
+                        dims = f"{d[0]}x{d[1]}"
+                except subprocess.CalledProcessError:
+                    pass
+        id_note = (color("ok", "green") if declared and exists
+                   else color("dangling", "red") if declared and not exists
+                   else color("undeclared", "yellow"))
+        rows.append((
+            display, color("running", "green"),
+            Path(rel).name,
+            human_size(size) if exists else color("MISSING", "red"),
+            dims, sha8 or "—", human_age(mtime), id_note,
+        ))
+    print_table(rows)
+    extra = REPO_ROOT  # hint footer
+    print(color(f"\n  source overlays under {extra}/bots/<name>/workspace/avatars/ "
+                "(nimbus: volume is source of record)", "dim"))
+
+
+def cmd_set(args):
+    src = Path(args.avatar).expanduser()
+    if not src.is_file():
+        sys.exit(f"avatar not found: {src}")
+    ext = src.suffix.lower()
+    if ext not in ALLOWED_EXT:
+        sys.exit(f"unsupported extension {ext!r}; allowed: "
+                 f"{', '.join(sorted(ALLOWED_EXT))}")
+
+    display, service, container = resolve_bot(args.bot)
+    state = container_state(container)
+    running = state == "running"
+    overlay = overlay_dir(display)   # host bots/<name>/workspace, or None (nimbus)
+
+    # We write through the running container (as node) and/or the host overlay.
+    # A stopped bot with no overlay has neither surface — bail early.
+    if not running and not overlay:
+        sys.exit(f"[{display}] is {state} and has no bots/{display}/ overlay to "
+                 f"stage into — start it first "
+                 f"(`make up` / `make -C bots up BOT={display}`)")
+
+    # Source-of-truth for the current avatar name: the overlay's IDENTITY.md
+    # when there is one (that's what `seed` pushes), else the live container's.
+    overlay_id = (overlay / "IDENTITY.md") if overlay else None
+    overlay_id_text = overlay_id.read_text() if overlay_id and overlay_id.is_file() else None
+    declared = (declared_from_text(overlay_id_text) if overlay_id_text
+                else (declared_avatar(container) if running else None))
+
+    # Decide the on-disk target name.
+    if args.name:
+        name = args.name if Path(args.name).suffix else args.name + ext
+        target_rel = f"{AVATAR_SUBDIR}/{name}"
+    elif declared and Path(declared).suffix.lower() == ext:
+        target_rel = declared                       # overwrite in place
+    elif declared:
+        target_rel = f"{AVATAR_SUBDIR}/{Path(declared).stem}{ext}"
+    else:
+        target_rel = f"{AVATAR_SUBDIR}/{display}{ext}"
+
+    dims = image_dims(src)
+    size = src.stat().st_size
+    data = src.read_bytes()
+    print(color(f"[{display}] setting avatar → {target_rel}", "cyan"))
+    print(f"  source: {src}  ({human_size(size)}"
+          + (f", {dims[0]}x{dims[1]}" if dims else "") + ")")
+
+    # ── durable overlay (source of record for persona bots) ──────────────
+    if overlay:
+        (overlay / AVATAR_SUBDIR).mkdir(parents=True, exist_ok=True)
+        (overlay / target_rel).write_bytes(data)
+        print(color(f"  ✓ staged to bots/{display}/workspace/{target_rel}", "green"))
+        od = declared_from_text(overlay_id_text)
+        if od and od != target_rel and overlay_id_text and od in overlay_id_text:
+            overlay_id.write_text(overlay_id_text.replace(od, target_rel))
+            print(color(f"  ✓ updated bots/{display}/workspace/IDENTITY.md "
+                        f"({od} → {target_rel})", "green"))
+        elif not overlay_id_text:
+            print(color(f"  ! bots/{display}/workspace/IDENTITY.md has no Avatar "
+                        f"line — add `- **Avatar:** {target_rel}`", "yellow"))
+
+    # ── live volume (apply-now on the running gateway) ───────────────────
+    if running:
+        dexec(container, f'mkdir -p "{WORKSPACE}/{AVATAR_SUBDIR}"')
+        try:
+            dwrite_bytes(container, f"{WORKSPACE}/{target_rel}", data)
+        except subprocess.CalledProcessError as e:
+            sys.exit(f"  write failed: "
+                     f"{(e.stderr or b'').decode(errors='replace').strip() or e}")
+        exists, wsize, _, sha8 = avatar_stat(container, target_rel)
+        if not exists:
+            sys.exit("  write reported success but file is missing — aborting")
+        print(color(f"  ✓ written to live volume ({human_size(wsize)}, sha {sha8})",
+                    "green"))
+        # Reconcile the container's own IDENTITY.md reference.
+        ctext = read_identity(container)
+        cdeclared = declared_from_text(ctext)
+        if cdeclared and cdeclared != target_rel and ctext and cdeclared in ctext:
+            dwrite_bytes(container, f"{WORKSPACE}/IDENTITY.md",
+                         ctext.replace(cdeclared, target_rel).encode())
+            print(color(f"  ✓ IDENTITY.md reference {cdeclared} → {target_rel}",
+                        "green"))
+        elif not cdeclared and not overlay:
+            print(color(f"  ! IDENTITY.md has no Avatar line — add "
+                        f"`- **Avatar:** {target_rel}` to reference it", "yellow"))
+        if args.reload:
+            reload_bot(display, service)
+        else:
+            print(color("  · --no-reload: gateway not restarted "
+                        "(avatar applies on next reload)", "dim"))
+    else:
+        print(color(f"  · {display} is {state}; overlay staged — apply with "
+                    f"`make -C bots up BOT={display}` (or `seed` if already up)",
+                    "dim"))
+
+
+def cmd_show(args):
+    display, _, container = resolve_bot(args.bot)
+    if container_state(container) == "absent":
+        sys.exit(f"[{display}] container does not exist")
+    declared = declared_avatar(container)
+    files = list_avatar_files(container)
+    rel = declared or (f"{AVATAR_SUBDIR}/{files[0]}" if files else None)
+    if not rel:
+        sys.exit(f"[{display}] no avatar to show")
+    out = Path(tempfile.gettempdir()) / f"claw-avatar-{display}-{Path(rel).name}"
+    try:
+        dcp_out(container, f"{WORKSPACE}/{rel}", out)
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"  docker cp failed: {e.stderr or e}")
+    dims = image_dims(out)
+    print(f"[{display}] {rel}  ({human_size(out.stat().st_size)}"
+          + (f", {dims[0]}x{dims[1]}" if dims else "") + f")\n  {out}")
+    if sys.platform == "darwin":
+        subprocess.run(["open", str(out)])
+    else:
+        print(color("  (open it manually — auto-open is macOS-only)", "dim"))
+
+
+def cmd_theme(args):
+    """Probe-only: report theme-capable config keys on this openclaw build.
+
+    openclaw per-instance theming isn't a documented key on the pinned build,
+    so this stays a detector, not a setter, until a real key is confirmed.
+    """
+    display, service, container = resolve_bot(args.bot)
+    if container_state(container) != "running":
+        sys.exit(f"[{display}] not running")
+    r = dexec(container,
+              'f="$HOME/.openclaw/openclaw.json"; '
+              '[ -f "$f" ] && python3 -c '
+              '"import json,sys;d=json.load(open(sys.argv[1]));'
+              'ks=[];'
+              'w=lambda o,p=\\"\\":[ (ks.append(p+\\".\\"+k) if any(t in k.lower() '
+              'for t in (\\"theme\\",\\"color\\",\\"appearance\\")) else None) '
+              'or w(o[k],p+\\".\\"+k) for k in o] if isinstance(o,dict) else None;'
+              'w(d);print(chr(10).join(ks))" "$f"')
+    found = [l for l in r.stdout.splitlines() if l.strip()]
+    if found:
+        print(color(f"[{display}] theme-capable config keys:", "cyan"))
+        for k in found:
+            print(f"  {k.lstrip('.')}")
+        print(color("  set with: docker exec %s openclaw config set <key> <value>"
+                     % display, "dim"))
+    else:
+        ver = dexec(container, "openclaw --version 2>/dev/null").stdout.strip()
+        print(color(f"[{display}] no theme/color/appearance key exposed on this "
+                    f"openclaw build ({ver or '?'}).", "yellow"))
+        print(color("  Personality lives in the avatar + IDENTITY.md/SOUL.md for "
+                    "now; revisit if upstream adds UI theming.", "dim"))
+
+
+def cmd_telegram_photo(args):
+    display, _, container = resolve_bot(args.bot)
+    if args.source:
+        src = Path(args.source).expanduser()
+        if not src.is_file():
+            sys.exit(f"source not found: {src}")
+        cleanup = None
+    else:
+        if container_state(container) == "absent":
+            sys.exit(f"[{display}] container does not exist")
+        declared = declared_avatar(container)
+        files = list_avatar_files(container)
+        rel = declared or (f"{AVATAR_SUBDIR}/{files[0]}" if files else None)
+        if not rel:
+            sys.exit(f"[{display}] no avatar to hand off; pass --source")
+        src = Path(tempfile.gettempdir()) / f"claw-tg-{display}-{Path(rel).name}"
+        dcp_out(container, f"{WORKSPACE}/{rel}", src)
+        cleanup = None
+
+    size = src.stat().st_size
+    dims = image_dims(src)
+    print(color(f"[{display}] Telegram profile-photo check", "cyan"))
+    print(f"  file: {src}")
+    print(f"  size: {human_size(size)}"
+          + (f"   dims: {dims[0]}x{dims[1]}" if dims else "   dims: ?"))
+
+    problems = []
+    if size > TELEGRAM_MAX_BYTES:
+        problems.append(f"over 5 MB ({human_size(size)})")
+    if dims:
+        if min(dims) < TELEGRAM_MIN_DIM:
+            problems.append(f"smaller than {TELEGRAM_MIN_DIM}px on a side")
+        if abs(dims[0] - dims[1]) > 2:
+            problems.append("not square (Telegram center-crops to a square)")
+    if src.suffix.lower() == ".gif":
+        problems.append("GIF — Telegram profile photos are static; it'll be flattened")
+
+    if problems:
+        for p in problems:
+            print(color(f"  ! {p}", "yellow"))
+        print(color("  Fix these before uploading for a clean result.", "yellow"))
+    else:
+        print(color("  ✓ meets Telegram's static-avatar constraints", "green"))
+
+    print()
+    print("  The Bot API can't set a bot's own avatar — do it via BotFather:")
+    print("    1. Open a Telegram chat with @BotFather")
+    print(f"    2. Send /setuserpic  → pick the {display} bot")
+    print(f"    3. Upload:  {src}")
+    print(color("  (This is the one asset surface that stays a manual step.)", "dim"))
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="claw-assets",
+        description="Inventory and swap per-bot presentation assets across "
+                    "oasis-claw bots.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pl = sub.add_parser("list", help="per-bot avatar inventory")
+    pl.set_defaults(func=cmd_list)
+
+    ps = sub.add_parser("set", help="set a bot's avatar image")
+    ps.add_argument("bot", help="bot name (e.g. nimbus)")
+    ps.add_argument("--avatar", required=True, metavar="PATH",
+                    help="image file to install (jpg/png/gif/webp)")
+    ps.add_argument("--name", metavar="FILENAME",
+                    help="force the on-disk filename under avatars/ "
+                         "(default: keep IDENTITY's name, or <bot>.<ext>)")
+    ps.add_argument("--no-reload", dest="reload", action="store_false",
+                    help="copy only; don't restart the gateway")
+    ps.set_defaults(func=cmd_set, reload=True)
+
+    psh = sub.add_parser("show", help="open a bot's current avatar")
+    psh.add_argument("bot", help="bot name")
+    psh.set_defaults(func=cmd_show)
+
+    pt = sub.add_parser("theme", help="probe theme-capable config keys")
+    pt.add_argument("bot", help="bot name")
+    pt.set_defaults(func=cmd_theme)
+
+    pg = sub.add_parser("telegram-photo",
+                        help="validate an avatar and hand off to BotFather")
+    pg.add_argument("bot", help="bot name")
+    pg.add_argument("--source", metavar="PATH",
+                    help="image to check (default: the bot's current avatar)")
+    pg.set_defaults(func=cmd_telegram_photo)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
