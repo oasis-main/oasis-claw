@@ -56,6 +56,30 @@ creds-refresh: ## refresh OAuth creds (BOTS='nimbus kolmogorov' or BOTS=--all; o
 	    $(if $(ACCOUNT),--account $(ACCOUNT),) \
 	    $(if $(PASTE),--paste,)
 
+git-list: ## list per-bot GitHub token + push allowlist (PROBE=1 for live gh api)
+	@./scripts/claw-git list $(if $(PROBE),--probe,)
+
+git-check: ## live-check one bot's GitHub token (BOT=<name>)
+	@test -n "$(BOT)" || { echo "BOT=<name> required"; exit 2; }
+	@./scripts/claw-git check $(BOT)
+
+git-set: ## store a bot's PAT + scope (BOT=<name>; prompts for token; REPOS='o/a o/b', NAME=, EMAIL=)
+	@test -n "$(BOT)" || { echo "BOT=<name> required"; exit 2; }
+	@./scripts/claw-git set $(BOT) \
+	    $(if $(REPOS),--repos "$(REPOS)",) \
+	    $(if $(NAME),--name "$(NAME)",) \
+	    $(if $(EMAIL),--email "$(EMAIL)",)
+
+git-repos: ## edit a bot's push allowlist (BOT=<name>; ADD=o/r or RM=o/r or SET='o/a o/b')
+	@test -n "$(BOT)" || { echo "BOT=<name> required"; exit 2; }
+	@./scripts/claw-git repos $(BOT) \
+	    $(if $(ADD),--add $(ADD),) $(if $(RM),--remove $(RM),) \
+	    $(if $(SET),--set "$(SET)",)
+
+git-rotate: ## open the fine-grained-PAT page then store the new token (BOT=<name>)
+	@test -n "$(BOT)" || { echo "BOT=<name> required"; exit 2; }
+	@./scripts/claw-git rotate $(BOT)
+
 assets-list: ## list per-bot avatar inventory (name, size, dims, hash)
 	@./scripts/claw-assets list
 

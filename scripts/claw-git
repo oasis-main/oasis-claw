@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""
+claw-git — manage per-bot GitHub access (fine-grained PATs + push allowlist)
+across the oasis-claw fleet. Sibling of `claw-creds` (which does gog/OAuth);
+both live on the deployment machine (your Mac) and drive bots via `docker`.
+
+The model: each bot carries its OWN fine-grained PAT in its .env as GH_TOKEN,
+scoped in the GitHub UI to just that bot's repos + permissions. This tool does
+NOT create tokens (GitHub has no API to mint fine-grained PATs — that's a UI
+step; `claw-git rotate` opens the right page). It stores/rotates the token in
+the bot's .env, manages the per-bot push allowlist (OASIS_GIT_REPOS), recreates
+the bot to pick it up, and verifies it live.
+
+  claw-git list                      # per-bot: token?, identity, push allowlist
+  claw-git list --probe              # + live `gh api user` (login + token expiry)
+  claw-git check <bot>               # live: token identity, expiry, sample repos
+  claw-git set <bot> [--repos "o/a o/b"] [--name N] [--email E]
+                                     # prompt for the PAT (no echo), write .env, recreate, verify
+  claw-git repos <bot> --add o/r     # add a repo to the push allowlist
+  claw-git repos <bot> --remove o/r  # remove one
+  claw-git repos <bot> --set "o/a o/b"   # replace the whole allowlist ('*' = all)
+  claw-git rotate <bot>              # open the GitHub fine-grained-PAT page, then set
+  claw-git unset <bot>              # remove GH_TOKEN + git vars, recreate
+
+Guardrail note: destructive git (force-push, ref-delete) is refused inside the
+bot by the baked-in git wrapper + pre-push hook regardless of PAT scope; the PAT
+scope + GitHub branch protection are the real server-side limits. See
+scripts/git-policy/ and the runbook in .swarm/GIT_ACCESS_RUNBOOK.md.
+"""
+
+import argparse
+import getpass
+import json
+import re
+import subprocess
+import sys
+import time
+import webbrowser
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+RUNTIME_COMPOSE = REPO_ROOT / "docker-compose.runtime.yml"
+BOTS_COMPOSE = REPO_ROOT / "bots" / "docker-compose.bots.yml"
+SANDBOX_COMPOSE = REPO_ROOT / "sandbox" / "docker-compose.sandbox-runtime.yml"
+VH_REACH_COMPOSE = REPO_ROOT / "bots" / "docker-compose.vanhelsing-reach.yml"
+RUNTIME_IMAGE = "oasis-claw-runtime:local"
+
+# `openclaw` is the root-compose runtime service; everyone calls it Nimbus.
+SERVICE_DISPLAY_NAMES = {"openclaw": "nimbus"}
+# Bots that run under the sandbox (internal:true) overlay: recreate needs the
+# full 4-file stack or their shared sidecars get detached from the sandbox net.
+SANDBOX_BOTS = {"vanhelsing"}
+
+FGPAT_URL = "https://github.com/settings/personal-access-tokens/new"
+ENV_KEYS = ("GH_TOKEN", "OASIS_GIT_REPOS", "OASIS_GIT_USER_NAME", "OASIS_GIT_USER_EMAIL")
+
+
+def color(s, c):
+    if not sys.stdout.isatty():
+        return s
+    codes = {"red": 31, "green": 32, "yellow": 33, "cyan": 36, "dim": 90, "bold": 1}
+    return f"\033[{codes[c]}m{s}\033[0m"
+
+
+# ── discovery ──────────────────────────────────────────────────────────────
+def discover_bots():
+    """Return [(display, service, container)] for every bot, nimbus first."""
+    cmd = ["docker", "compose", "-f", str(RUNTIME_COMPOSE)]
+    if BOTS_COMPOSE.exists():
+        cmd += ["-f", str(BOTS_COMPOSE)]
+    cmd += ["--project-directory", str(REPO_ROOT), "config", "--format", "json"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+    except FileNotFoundError:
+        sys.exit("docker not found on PATH")
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"docker compose config failed:\n{e.stderr}")
+    services = json.loads(out).get("services", {})
+    bots = []
+    for svc, cfg in services.items():
+        if cfg.get("image") != RUNTIME_IMAGE:
+            continue
+        bots.append((SERVICE_DISPLAY_NAMES.get(svc, svc), svc,
+                     cfg.get("container_name", svc)))
+    bots.sort(key=lambda b: (b[0] != "nimbus", b[0]))
+    return bots
+
+
+def resolve_bot(name):
+    bots = discover_bots()
+    for display, svc, container in bots:
+        if name in (display, svc, container):
+            return display, svc, container
+    known = ", ".join(b[0] for b in bots)
+    sys.exit(f"unknown bot '{name}'. known: {known}")
+
+
+def envfile_for(service):
+    return REPO_ROOT / ".env" if service == "openclaw" else REPO_ROOT / "bots" / service / ".env"
+
+
+def container_state(container):
+    r = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", container],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return "absent"
+    return "running" if r.stdout.strip() == "true" else "stopped"
+
+
+# ── .env read / upsert (preserve structure) ─────────────────────────────────
+def read_env(path):
+    vals = {}
+    if not path.exists():
+        return vals
+    for line in path.read_text().splitlines():
+        m = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$", line)
+        if m and not line.lstrip().startswith("#"):
+            vals[m.group(1)] = m.group(2)
+    return vals
+
+
+def upsert_env(path, updates, remove=()):
+    """Set updates{key:val}, delete keys in remove. Preserves other lines."""
+    lines = path.read_text().splitlines() if path.exists() else []
+    seen, out = set(), []
+    for line in lines:
+        m = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
+        key = m.group(1) if m and not line.lstrip().startswith("#") else None
+        if key in remove:
+            continue
+        if key in updates:
+            out.append(f"{key}={updates[key]}")
+            seen.add(key)
+        else:
+            out.append(line)
+    for key, val in updates.items():
+        if key not in seen:
+            out.append(f"{key}={val}")
+    path.write_text("\n".join(out) + "\n")
+    path.chmod(0o600)
+
+
+# ── docker helpers ──────────────────────────────────────────────────────────
+def dexec(container, argv, check=False):
+    return subprocess.run(["docker", "exec", container, *argv],
+                          capture_output=True, text=True, check=check)
+
+
+def recreate(display, service, container):
+    """Recreate a bot to pick up its .env — with the correct per-bot stack."""
+    if service in SANDBOX_BOTS:
+        files = [RUNTIME_COMPOSE, SANDBOX_COMPOSE, BOTS_COMPOSE, VH_REACH_COMPOSE]
+    elif service == "openclaw":
+        files = [RUNTIME_COMPOSE]
+    else:
+        files = [RUNTIME_COMPOSE, BOTS_COMPOSE]
+    cmd = ["docker", "compose"]
+    for f in files:
+        cmd += ["-f", str(f)]
+    cmd += ["--project-directory", str(REPO_ROOT),
+            "up", "-d", "--no-deps", "--force-recreate", service]
+    print(color(f"  recreating {display} (--no-deps; sidecars untouched)…", "dim"))
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(color(f"  recreate failed:\n{r.stderr}", "red"))
+        return False
+    for _ in range(40):
+        logs = subprocess.run(["docker", "logs", "--since=60s", container],
+                              capture_output=True, text=True)
+        if "[gateway] ready" in (logs.stdout + logs.stderr):
+            print(color(f"  {display} gateway ready", "green"))
+            return True
+        time.sleep(1.5)
+    print(color(f"  {display} recreated but gateway-ready not seen in 60s", "yellow"))
+    return True
+
+
+def gh_identity(container):
+    """Live: ('login', 'expiry-or-?') or (None, reason). Tolerates egress locks."""
+    if container_state(container) != "running":
+        return None, "not running"
+    r = dexec(container, ["sh", "-c", "test -n \"$GH_TOKEN\""])
+    if r.returncode != 0:
+        return None, "no GH_TOKEN"
+    r = dexec(container, ["gh", "api", "-i", "user"])
+    if r.returncode != 0:
+        tail = (r.stderr or r.stdout).strip().splitlines()
+        return None, (tail[-1][:50] if tail else "gh api failed")
+    login, expiry = "?", "?"
+    body_started = False
+    for line in r.stdout.splitlines():
+        low = line.lower()
+        if low.startswith("github-authentication-token-expiration:"):
+            expiry = line.split(":", 1)[1].strip() or "never"
+        if line.strip() == "":
+            body_started = True
+        if body_started and line.strip().startswith('"login"'):
+            try:
+                login = line.split(":", 1)[1].strip().strip(',').strip('"')
+            except Exception:
+                pass
+    return login, expiry
+
+
+# ── commands ────────────────────────────────────────────────────────────────
+def pad(s, w):
+    vis = re.sub(r"\033\[[0-9;]*m", "", s)
+    return s + " " * max(0, w - len(vis))
+
+
+def cmd_list(args):
+    rows = [("BOT", "STATE", "TOKEN", "IDENTITY", "PUSH ALLOWLIST")]
+    for display, service, container in discover_bots():
+        state = container_state(container)
+        env = read_env(envfile_for(service))
+        has_tok = "yes" if env.get("GH_TOKEN") else color("—", "dim")
+        allow = env.get("OASIS_GIT_REPOS", "") or color("(none)", "dim")
+        ident = "—"
+        if args.probe and env.get("GH_TOKEN"):
+            login, expiry = gh_identity(container)
+            if login:
+                ident = color(f"{login} (exp {expiry[:10]})", "green")
+            else:
+                ident = color(expiry, "yellow")
+        st_c = "green" if state == "running" else "yellow"
+        rows.append((display, color(state, st_c), has_tok, ident, allow))
+    widths = [max(len(re.sub(r"\033\[[0-9;]*m", "", r[i])) for r in rows) for i in range(len(rows[0]))]
+    for i, r in enumerate(rows):
+        line = "  ".join(pad(c, widths[j]) for j, c in enumerate(r))
+        print(color(line, "bold") if i == 0 else line)
+
+
+def cmd_check(args):
+    display, service, container = resolve_bot(args.bot)
+    env = read_env(envfile_for(service))
+    print(color(f"── {display} ──", "cyan"))
+    print(f"  .env GH_TOKEN : {'set' if env.get('GH_TOKEN') else color('MISSING', 'red')}")
+    print(f"  push allowlist: {env.get('OASIS_GIT_REPOS') or color('(none — PAT scope only)', 'dim')}")
+    print(f"  commit identity: {env.get('OASIS_GIT_USER_NAME','oasis-claw bot')} <{env.get('OASIS_GIT_USER_EMAIL','bots@oasis-x.io')}>")
+    login, expiry = gh_identity(container)
+    if login:
+        print(f"  live token    : {color('OK', 'green')} → github login {color(login, 'bold')}, expires {expiry}")
+        r = dexec(container, ["gh", "api", "user/repos?per_page=5&sort=pushed",
+                              "--jq", ".[].full_name"])
+        if r.returncode == 0 and r.stdout.strip():
+            print("  sample repos  : " + ", ".join(r.stdout.split()[:5]))
+    else:
+        print(f"  live token    : {color(expiry, 'yellow')}")
+
+
+def _apply_and_recreate(display, service, container, updates, remove=()):
+    path = envfile_for(service)
+    upsert_env(path, updates, remove)
+    print(color(f"  wrote {path.relative_to(REPO_ROOT)}", "dim"))
+    if recreate(display, service, container):
+        login, expiry = gh_identity(container)
+        if login:
+            print(f"  verified: token active → {color(login, 'green')} (expires {expiry})")
+        else:
+            print(color(f"  note: {expiry} (expected for an egress-locked bot; token is set)", "yellow"))
+
+
+def cmd_set(args):
+    display, service, container = resolve_bot(args.bot)
+    updates = {}
+    token = args.token
+    if token is None and not args.keep_token:
+        token = getpass.getpass(f"Paste the fine-grained PAT for {display} (input hidden): ").strip()
+    if token:
+        updates["GH_TOKEN"] = token
+    if args.repos is not None:
+        updates["OASIS_GIT_REPOS"] = args.repos.strip()
+    if args.name:
+        updates["OASIS_GIT_USER_NAME"] = args.name
+    if args.email:
+        updates["OASIS_GIT_USER_EMAIL"] = args.email
+    if not updates:
+        sys.exit("nothing to set (give a token, --repos, --name, or --email)")
+    if args.no_recreate:
+        upsert_env(envfile_for(service), updates)
+        print(color(f"  wrote .env for {display}; recreate to apply: "
+                    f"claw-git set {display} --keep-token", "yellow"))
+        return
+    _apply_and_recreate(display, service, container, updates)
+
+
+def cmd_repos(args):
+    display, service, container = resolve_bot(args.bot)
+    env = read_env(envfile_for(service))
+    cur = (env.get("OASIS_GIT_REPOS", "") or "").split()
+    if args.set is not None:
+        new = args.set.split()
+    else:
+        new = list(cur)
+        for r in (args.add or []):
+            if r not in new:
+                new.append(r)
+        for r in (args.remove or []):
+            new = [x for x in new if x != r]
+    updates = {"OASIS_GIT_REPOS": " ".join(new)}
+    print(f"  {display} push allowlist: {' '.join(cur) or '(none)'} → {color(' '.join(new) or '(none)', 'cyan')}")
+    if args.no_recreate:
+        upsert_env(envfile_for(service), updates)
+        print(color("  wrote .env; recreate to apply.", "yellow"))
+        return
+    _apply_and_recreate(display, service, container, updates)
+
+
+def cmd_rotate(args):
+    display, service, _ = resolve_bot(args.bot)
+    env = read_env(envfile_for(service))
+    allow = env.get("OASIS_GIT_REPOS", "")
+    print(color(f"Rotating {display}'s GitHub PAT.", "cyan"))
+    print(f"  Current push allowlist: {allow or '(none)'}")
+    print(f"  1. Opening {FGPAT_URL}")
+    print(f"     • Resource owner: pick the org/user that owns {display}'s repos")
+    print(f"     • Repository access: only {allow or 'the specific repos this bot needs'}")
+    print(f"     • Permissions: Contents=Read/Write, Metadata=Read;")
+    print(f"       add Actions / Administration ONLY if you're approving workflow/admin access")
+    print(f"  2. Copy the new token, then paste it at the prompt.")
+    try:
+        webbrowser.open(FGPAT_URL)
+    except Exception:
+        pass
+    args.token = None
+    args.keep_token = False
+    args.repos = None
+    args.name = None
+    args.email = None
+    args.no_recreate = False
+    cmd_set(args)
+
+
+def cmd_unset(args):
+    display, service, container = resolve_bot(args.bot)
+    path = envfile_for(service)
+    upsert_env(path, {}, remove=ENV_KEYS)
+    print(color(f"  removed GH_TOKEN + git vars from {path.relative_to(REPO_ROOT)}", "dim"))
+    if not args.no_recreate:
+        recreate(display, service, container)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="claw-git", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("list", help="per-bot token + allowlist overview")
+    s.add_argument("--probe", action="store_true", help="live gh api user per bot")
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("check", help="live check one bot's token")
+    s.add_argument("bot")
+    s.set_defaults(func=cmd_check)
+
+    s = sub.add_parser("set", help="store PAT / repos / identity for a bot")
+    s.add_argument("bot")
+    s.add_argument("--token", help="the PAT (omit to be prompted with no echo)")
+    s.add_argument("--keep-token", action="store_true", help="don't prompt/change the token; only update other fields")
+    s.add_argument("--repos", help="push allowlist, space-separated owner/repo ('*' = all)")
+    s.add_argument("--name", help="git commit user.name")
+    s.add_argument("--email", help="git commit user.email")
+    s.add_argument("--no-recreate", action="store_true", help="write .env only; don't recreate")
+    s.set_defaults(func=cmd_set)
+
+    s = sub.add_parser("repos", help="manage a bot's push allowlist")
+    s.add_argument("bot")
+    s.add_argument("--add", action="append", metavar="OWNER/REPO")
+    s.add_argument("--remove", action="append", metavar="OWNER/REPO")
+    s.add_argument("--set", metavar='"O/A O/B"', help="replace the whole allowlist")
+    s.add_argument("--no-recreate", action="store_true")
+    s.set_defaults(func=cmd_repos)
+
+    s = sub.add_parser("rotate", help="open the PAT page, then store the new token")
+    s.add_argument("bot")
+    s.set_defaults(func=cmd_rotate)
+
+    s = sub.add_parser("unset", help="remove a bot's token + git vars")
+    s.add_argument("bot")
+    s.add_argument("--no-recreate", action="store_true")
+    s.set_defaults(func=cmd_unset)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

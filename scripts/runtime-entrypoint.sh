@@ -867,4 +867,25 @@ fi
 # summary) and keeps a `sleep_deep` TOOL only for manual on-demand resets. See
 # .swarm/KOLMOGOROV_SLEEP_ARCHITECTURE.md for the full rationale.
 
+# ---- git / GitHub access (CLAW-047) -----------------------------------------
+# GIT_CONFIG_GLOBAL points into the VOLUME because the rootfs is read_only —
+# $HOME/.gitconfig is not writable. Exported so the agent's own `git` calls
+# (children of the gateway) inherit the same config. When this bot has a
+# fine-grained PAT (GH_TOKEN in its .env) we wire commit identity + a no-network
+# credential helper (serves GH_TOKEN for github.com https; no boot-time github
+# call, so egress-locked Van Helsing still boots) + the global pre-push
+# guardrail hook. The push allowlist (OASIS_GIT_REPOS) is read LIVE from the env
+# by the `git` wrapper — nothing to materialize. gh reads GH_TOKEN from the env.
+export GIT_CONFIG_GLOBAL="${CONFIG_DIR}/.gitconfig"
+git config --global core.hooksPath /usr/local/lib/oasis-git-policy/hooks 2>/dev/null || true
+git config --global safe.directory '*' 2>/dev/null || true
+if [ -n "${GH_TOKEN:-}" ]; then
+  git config --global user.name  "${OASIS_GIT_USER_NAME:-oasis-claw bot}"
+  git config --global user.email "${OASIS_GIT_USER_EMAIL:-bots@oasis-x.io}"
+  git config --global credential."https://github.com".helper oasis-gh
+  echo "[entrypoint] git+gh wired for GitHub (user='${OASIS_GIT_USER_NAME:-oasis-claw bot}', push allowlist='${OASIS_GIT_REPOS:-<none set>}')"
+else
+  echo "[entrypoint] no GH_TOKEN — git limited to anonymous public reads (no push)"
+fi
+
 exec openclaw gateway --bind "${BIND}" --port "${PORT}"
