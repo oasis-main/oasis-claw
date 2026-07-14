@@ -3,7 +3,7 @@
 # Container entrypoint for oasis-claw-runtime.
 #
 # 1. Ensure ~/.openclaw exists; mint a gateway auth token if not provided.
-# 2. Run `openclaw plugins install --link --force` for each of our 9 baked-in
+# 2. Run `openclaw plugins install --link --force` for each of our 11 baked-in
 #    extensions so the loader registers them in the persisted plugin registry
 #    that lives in ~/.openclaw (volume-persisted). memory-core is bundled with
 #    openclaw (not in /app/extensions) — it is configured, not installed.
@@ -117,11 +117,26 @@ if isinstance(plugins_cfg, dict):
     entries = plugins_cfg.get("entries")
     if isinstance(entries, dict):
         entries.pop("agent-primitives", None)
+        # sleep-cycle: its config schema tightened (additionalProperties:false)
+        # when the setInterval-daemon design was replaced by the cron-driven
+        # tool. A volume-persisted config with the old daemon keys
+        # (idleGraceMinutes, replayQueued, dozeReply, maxDeferMinutes,
+        # idleCheckIntervalMinutes) fails validation and crash-loops the
+        # gateway. Drop any sleep-cycle.config key outside the current schema.
+        sc = entries.get("sleep-cycle")
+        if isinstance(sc, dict) and isinstance(sc.get("config"), dict):
+            allowed = {
+                "enabled", "timezone", "dozeAt", "deepSleepAt", "wakeAt",
+                "sessionMatch", "wakingSummary", "semanticsEndpoint", "semanticsModel",
+            }
+            for k in list(sc["config"]):
+                if k not in allowed:
+                    sc["config"].pop(k, None)
 
 config_path.write_text(json.dumps(config, indent=2) + "\n")
 PY
 
-# ---- install our 9 extensions via the openclaw plugin registry --------
+# ---- install our 11 extensions via the openclaw plugin registry -------
 # `--link` points the registry at /app/extensions/<id>/ (read-only image) so
 # we don't duplicate code. `--force` is incompatible with --link, so we skip
 # install if the plugin is already in the registry from a prior boot.
@@ -150,9 +165,15 @@ declare -A PLUGINS=(
   [clawhub-skill-audit]="--dangerously-force-unsafe-install"
   [model-switcher]=""
   [oasis-voice]=""
+  [oasis-semantics]=""
   # browser vendored from upstream openclaw; ships legitimate child_process
   # usage for Chromium launch — same false-positive shape as secrets-vault.
   [browser]="--dangerously-force-unsafe-install"
+  # sleep-cycle drives gateway RPCs (sessions.compact/reset/send) through the
+  # openclaw CLI via child_process — the CLI already speaks the gateway's WS
+  # protocol correctly, so we spawn it rather than reimplement the handshake.
+  # Same install-scanner false-positive shape as browser.
+  [sleep-cycle]="--dangerously-force-unsafe-install"
 )
 
 # Always run install --link. The command is idempotent (a no-op when
@@ -168,8 +189,12 @@ declare -A PLUGINS=(
 for p in "${!PLUGINS[@]}"; do
   echo "[entrypoint] linking plugin: ${p}"
   # shellcheck disable=SC2086
-  if ! openclaw plugins install --link ${PLUGINS[$p]} "/app/extensions/${p}" 2>&1 | tail -3; then
-    echo "[entrypoint] WARN: failed to link ${p} (continuing)" >&2
+  # `timeout` guards against a plugin whose module import never returns (e.g. a
+  # plugin that starts a persistent timer at register/import time — bit us on
+  # sleep-cycle 2026-07-13). Without it a single hung install wedges the whole
+  # boot before the gateway ever starts. 90s is far above a normal 1-2s link.
+  if ! timeout 90 openclaw plugins install --link ${PLUGINS[$p]} "/app/extensions/${p}" 2>&1 | tail -3; then
+    echo "[entrypoint] WARN: failed to link ${p} (rc=$?, continuing)" >&2
   fi
 done
 
@@ -248,7 +273,7 @@ TELEGRAM_KEYS = {"telegramBotToken", "telegramChatId", "telegramAlertChatId"}
 # 127.0.0.1:8731 stuck after we changed the default to
 # http://oasis-voice:8731 (sibling container), and the plugin kept
 # resolving to the openclaw container's own loopback (no listener).
-TOPOLOGY_KEYS = {"endpoint", "tts_voice"}
+TOPOLOGY_KEYS = {"endpoint", "tts_voice", "reachRoots", "enforce"}
 
 def merge_config(plugin_id, defaults, hooks=None):
     entry = entries.setdefault(plugin_id, {})
@@ -301,6 +326,22 @@ merge_config("dot-swarm", {
     "swarmDir": str(home / ".openclaw/.swarm"),
     "registerSwarmReadTool": True,
 })
+# operating-system-sandbox (CLAW-043 gitignore read-shroud). BUNDLED into
+# openclaw/dist/extensions at image build (NOT in the --link loop) so its
+# tool-result middleware seam is honored — openclaw gates that seam to
+# origin:"bundled". reachRoots + enforce are topology/env-driven (see
+# TOPOLOGY_KEYS): a bot with reach mounts arms the shroud over them (Van Helsing
+# sets OASIS_SHROUD_ROOTS=/reach/runes in its compose), while reach-less bots get
+# just the always-shroud glob floor. OASIS_SHROUD_ENFORCE=0 => audit-only dry-run
+# (record would-shroud events, let contents through) for validating the manifest
+# before arming. The middleware itself logs loudly at boot if the seam is inert.
+shroud_roots = [p.strip() for p in os.environ.get("OASIS_SHROUD_ROOTS", "").split(",") if p.strip()]
+shroud_enforce = os.environ.get("OASIS_SHROUD_ENFORCE", "").strip().lower() not in ("0", "false", "no", "off")
+merge_config("operating-system-sandbox", {
+    "reachRoots": shroud_roots,
+    "enforce": shroud_enforce,
+    "auditPath": str(home / ".openclaw/logs/shroud-audit.jsonl"),
+})
 # compaction strategy — pin the swarm-compact provider. dot-swarm registers a
 # CompactionProvider (id "swarm-compact") that, at the context ceiling, serves
 # back the latest HANDOFF section the agent wrote into .swarm/state.md via the
@@ -313,6 +354,61 @@ config.setdefault("agents", {})
 config["agents"].setdefault("defaults", {})
 config["agents"]["defaults"].setdefault("compaction", {})
 config["agents"]["defaults"]["compaction"]["provider"] = "swarm-compact"
+
+# ---- heartbeat cadence + active-hours (runtime efficiency) --------------
+# openclaw's DEFAULT agent self-wakes every 30m (DEFAULT_HEARTBEAT_EVERY),
+# and each wake reloads the FULL, growing session transcript and re-writes
+# the prompt cache — with the short cache TTL it has expired between wakes,
+# so every wake pays full cache-write price. On this fleet that heartbeat
+# loop is the dominant cost driver (see AUDIT_LOG.md 2026-07-12 efficiency
+# pass: ~97% of Nimbus's monthly spend was cache-write). We rein it in with
+# env-driven defaults:
+#   OASIS_HEARTBEAT_EVERY          duration, default unit minutes (e.g. "2h")
+#   OASIS_HEARTBEAT_ACTIVE_START   "HH:MM" 24h — heartbeats fire only in-window
+#   OASIS_HEARTBEAT_ACTIVE_END     "HH:MM" (or "24:00"); a daytime window == night sleep
+#   OASIS_HEARTBEAT_ACTIVE_TZ      IANA tz / "user" / "local" (default America/New_York)
+#   OASIS_HEARTBEAT_ISOLATED       "1" → run heartbeat in an isolated session (no transcript)
+#   OASIS_HEARTBEAT_LIGHT_CONTEXT  "1" → bootstrap only HEARTBEAT.md
+#   OASIS_HEARTBEAT_SKIP_WHEN_BUSY "1" → defer while subagent/cron lanes are busy
+#
+# activeHours gates ONLY the autonomous heartbeat (isWithinActiveHours in
+# heartbeat-runner) — inbound Telegram replies are a separate path, so the
+# bot still answers you at 3am. isolatedSession + lightContext are what
+# collapse the cache-write cost: the heartbeat re-caches just HEARTBEAT.md
+# instead of the whole transcript.
+#
+# setdefault semantics: these SEED the config, but a live
+# `openclaw config set agents.defaults.heartbeat …` (hot-reloaded, no
+# restart) overrides them and PERSISTS across reboots. The cheap-context
+# fallbacks (isolated/light/skip + 2h) apply even when no env var is set,
+# so a freshly-started persona bot never runs the wasteful 30m full-context
+# loop. activeHours is only seeded when BOTH start+end are provided (a
+# night-sleep window is a per-bot choice — set it in the bot's .env).
+def _hb_envbool(name, default):
+    v = os.environ.get(name)
+    if v is None or v.strip() == "":
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+# Fleet-wide default: ~4 pulses/day (every 5h) inside a 06:30–22:30 ET active
+# window, so every bot sleeps overnight (off-hours 22:30–06:30) unless its .env
+# overrides. openclaw's heartbeat is interval+hash-phase (not clock-pinned), so
+# these land ~5h apart in-window, not exactly on the hour.
+hb = config["agents"]["defaults"].setdefault("heartbeat", {})
+hb.setdefault("every", os.environ.get("OASIS_HEARTBEAT_EVERY", "").strip() or "5h")
+hb.setdefault("isolatedSession", _hb_envbool("OASIS_HEARTBEAT_ISOLATED", True))
+hb.setdefault("lightContext", _hb_envbool("OASIS_HEARTBEAT_LIGHT_CONTEXT", True))
+hb.setdefault("skipWhenBusy", _hb_envbool("OASIS_HEARTBEAT_SKIP_WHEN_BUSY", True))
+_hb_start = os.environ.get("OASIS_HEARTBEAT_ACTIVE_START", "").strip() or "06:30"
+_hb_end = os.environ.get("OASIS_HEARTBEAT_ACTIVE_END", "").strip() or "22:30"
+if _hb_start and _hb_end:
+    _hb_active = hb.setdefault("activeHours", {})
+    _hb_active.setdefault("start", _hb_start)
+    _hb_active.setdefault("end", _hb_end)
+    _hb_active.setdefault(
+        "timezone",
+        os.environ.get("OASIS_HEARTBEAT_ACTIVE_TZ", "").strip() or "America/New_York",
+    )
 
 # clawhub-skill-audit: Opus 4.7 security review on every newly installed skill,
 # trail at ~/.openclaw/logs/skill-audits. ANTHROPIC_API_KEY is read by the
@@ -366,10 +462,136 @@ merge_config("model-switcher", model_switcher_cfg)
 merge_config("memory-core", {
     "dreaming": {
         "enabled": True,
-        "frequency": "0 3 * * *",
+        # Wind-down dream at 22:20 ET — right at the heartbeat sleep boundary
+        # (activeHours ends 22:30), so the day's sessions consolidate into
+        # MEMORY.md/DREAMS.md before overnight sleep (the "-> dream -> sleep"
+        # step). Was 03:00; running bots are staggered a few min apart via
+        # live config. setdefault — retune per bot without a boot stomping it.
+        "frequency": "20 22 * * *",
         "timezone": "America/New_York",
     },
 })
+
+# sleep-cycle: cron-driven nightly session lifecycle (CLAW efficiency track).
+# The plugin registers the `sleep_deep` TOOL (archive+reset the long-lived
+# conversation session so its transcript stops growing — the prompt-cache
+# cost fix) + a waking-summary supplement. The nightly TRIGGER is an openclaw
+# cron (agentTurn -> sleep_deep) auto-installed by the banner-block below —
+# openclaw does NOT run a plugin background timer, so cron is the driver. The
+# dream step stays owned by memory-core's dreaming cron (22:20 above).
+# `enabled` is FORCE-set from OASIS_SLEEP_ENABLED (not setdefault) so toggling
+# the env var authoritatively flips it on recreate.
+merge_config("sleep-cycle", {
+    "timezone": os.environ.get("OASIS_SLEEP_TZ", "").strip() or "America/New_York",
+})
+entries["sleep-cycle"]["config"]["enabled"] = (
+    (os.environ.get("OASIS_SLEEP_ENABLED", "").strip() or "1") == "1"
+)
+
+# tools.alsoAllow: re-admit the `sleep_deep` TOOL past the tools.profile filter.
+# The automatic deep-sleep reset needs no tool (it's openclaw's native session
+# reset — see below), but we keep sleep_deep for MANUAL on-demand resets. The
+# active tool profile (`coding` on this fleet) strips plugin tools before the
+# agent's allowlist resolves, so without this the model can't call sleep_deep
+# even when you ask it to. alsoAllow merges into the profile's allow list
+# (openclaw tool-policy `mergeAlsoAllowPolicy`), exempting exactly this one
+# plugin tool without loosening the profile for anything else. Under a
+# permissive profile (`full`) it's a harmless no-op. Mirror the plugin's
+# enabled flag; preserve any operator-added entries.
+tools_cfg = config.setdefault("tools", {})
+also = tools_cfg.get("alsoAllow")
+also = list(also) if isinstance(also, list) else []
+if entries["sleep-cycle"]["config"]["enabled"]:
+    if "sleep_deep" not in also:
+        also.append("sleep_deep")
+else:
+    also = [x for x in also if x != "sleep_deep"]
+if also:
+    tools_cfg["alsoAllow"] = also
+elif "alsoAllow" in tools_cfg:
+    del tools_cfg["alsoAllow"]
+
+# session.reset — the ACTUAL deep-sleep reset, done the framework's way.
+# openclaw natively resets a long-lived conversation session on a schedule
+# (mode "daily", at `atHour` local): it archives the transcript to
+# `<file>.reset.<ts>` and starts a fresh session — the prompt-cache cost fix —
+# with NO cron, NO agent tool, and NO operator.admin scope. That last point is
+# why a fresh headless bot can do this at all: the CLI `cron add` /
+# `sessions.reset` path is gated behind operator.admin the bot can't self-grant,
+# but the native reset runs in-process on openclaw's own schedule. sleep-cycle's
+# `before_reset` hook rides this reset to stage the waking summary.
+#
+# We set the BASE `session.reset` (not resetByType.direct) so it covers the main
+# session too — the default `dmScope` is "main", so Telegram DMs run IN the main
+# session, and a per-type "direct" rule would miss them.
+#
+# atHour = the daily "day boundary": a session is stale (→ reset on its next
+# message) once it started before today's atHour. Default 23 (11 PM): the day's
+# context is held through all waking hours and rolls over at night, right after
+# the 22:20 memory-core dream (so the day is CONSOLIDATED before it's archived —
+# the boundary must sit AFTER the dream, and hourly granularity makes 23 the
+# tightest slot after a 22:20 dream; do not drop it to 22). NOTE the reset is
+# LAZY — it fires on the first message after the boundary, so an
+# inactive-overnight bot effectively resets at its first morning message; the
+# end state (fresh session + injected handoff) is identical either way. A truly
+# proactive wall-clock reset would need the manual `sleep_deep` tool on a cron
+# (operator.admin). Force-set from OASIS_SESSION_RESET_HOUR; only while
+# sleep-cycle is enabled (its hook is what makes the reset carry continuity).
+if entries["sleep-cycle"]["config"]["enabled"]:
+    try:
+        _reset_hour = int(os.environ.get("OASIS_SESSION_RESET_HOUR", "").strip() or "23")
+    except ValueError:
+        _reset_hour = 23
+    _reset_hour = max(0, min(23, _reset_hour))
+    session_cfg = config.setdefault("session", {})
+    session_cfg["reset"] = {"mode": "daily", "atHour": _reset_hour}
+    # Drop any legacy per-type "direct" seed from older images so the base
+    # policy is authoritative (avoids two rules disagreeing).
+    _rbt = session_cfg.get("resetByType")
+    if isinstance(_rbt, dict):
+        _rbt.pop("direct", None)
+        if not _rbt:
+            session_cfg.pop("resetByType", None)
+
+# oasis-semantics: local-first embedding provider for memory-core, backed by
+# the oasis-semantics sidecar (sentence-transformers text + CLIP/SigLIP
+# multimodal). Same loader gotcha as oasis-voice: no `contracts` block in
+# the manifest, so oasis-semantics is invisible to memory-core's auto-select
+# priority registry. We HARD-PIN it as the default embedding provider here,
+# same pattern as the `messages.tts.provider` pin for oasis-voice.
+#
+# The initial tier choice is load-bearing — switching embedding models
+# invalidates every stored vector and forces a full re-embed of the memory
+# store. "default" = BAAI/bge-small-en-v1.5 (384-d, MIT, English-only).
+# To change: update the model key below AND run the re-embed migration.
+oasis_semantics_endpoint = (
+    os.environ.get("OASIS_SEMANTICS_ENDPOINT", "").strip()
+    or "http://oasis-semantics:8732"
+)
+oasis_semantics_bearer = os.environ.get("OASIS_SEMANTICS_BEARER_TOKEN", "").strip() or None
+oasis_semantics_text_model = (
+    os.environ.get("OASIS_SEMANTICS_TEXT_MODEL", "").strip() or "default"
+)
+oasis_semantics_mm_model = (
+    os.environ.get("OASIS_SEMANTICS_MM_MODEL", "").strip() or "clip-lite"
+)
+oasis_semantics_cfg: dict = {
+    "endpoint": oasis_semantics_endpoint,
+    "default_text_model": oasis_semantics_text_model,
+    "default_mm_model": oasis_semantics_mm_model,
+}
+if oasis_semantics_bearer:
+    oasis_semantics_cfg["bearer_token"] = oasis_semantics_bearer
+merge_config("oasis-semantics", oasis_semantics_cfg)
+
+# Pin memory-core to use oasis-semantics as the embedding provider.
+# Without this, provider defaults to "auto" which iterates by
+# autoSelectPriority — and oasis-semantics has none (same reason as
+# oasis-voice: no contracts block = invisible to auto-select).
+# Hard-overwrite on every boot so the pin survives config edits.
+config["agents"]["defaults"].setdefault("memorySearch", {})
+config["agents"]["defaults"]["memorySearch"]["provider"] = "oasis-semantics"
+config["agents"]["defaults"]["memorySearch"]["model"] = oasis_semantics_text_model
 
 # oasis-voice: speech (TTS) + media-understanding audio (inbound voice
 # messages from Telegram / iMessage) + realtime streaming STT (for future
@@ -389,7 +611,7 @@ oasis_voice_endpoint = (
 )
 oasis_voice_bearer = os.environ.get("OASIS_VOICE_BEARER_TOKEN", "").strip() or None
 oasis_voice_tts_voice_env = os.environ.get("OASIS_VOICE_TTS_VOICE", "").strip()
-oasis_voice_tts_voice = oasis_voice_tts_voice_env or "piper:en_GB-alan-medium"
+oasis_voice_tts_voice = oasis_voice_tts_voice_env or "piper:en_GB-aru-medium"
 oasis_voice_cfg: dict = {
     "endpoint": oasis_voice_endpoint,
     "tts_voice": oasis_voice_tts_voice,
@@ -497,6 +719,21 @@ config["messages"]["tts"]["provider"] = "oasis-voice"
 # default if absent. If someone runs `openclaw config set messages.tts.auto
 # always`, we respect that on the next boot.
 config["messages"]["tts"].setdefault("auto", "inbound")
+# Provider config for the TTS framework. speech-core resolves provider config
+# from `messages.tts.providers.<id>`, NOT from `plugins.entries.<id>.config`.
+# Without this block, synthesize() receives an empty providerConfig, the
+# speech-provider falls back to DEFAULT_ENDPOINT (http://127.0.0.1:8731) which
+# is wrong inside the container (no sidecar at loopback), the request fails,
+# and the framework silently falls through to a cloud TTS provider. This is
+# the bug that caused "US Female default" voice instead of the configured UK voice.
+config["messages"]["tts"].setdefault("providers", {})
+config["messages"]["tts"]["providers"]["oasis-voice"] = {
+    "endpoint": oasis_voice_endpoint,
+    "tts_voice": oasis_voice_tts_voice,
+    "apiKey": oasis_voice_bearer if oasis_voice_bearer else "anonymous",
+}
+if oasis_voice_bearer:
+    config["messages"]["tts"]["providers"]["oasis-voice"]["bearer_token"] = oasis_voice_bearer
 
 # browser: vendored openclaw `browser` plugin (extensions/browser/).
 # Manifest declares `onConfigPaths: ["browser"]`, so this plugin reads its
@@ -542,15 +779,25 @@ config["browser"].pop("dataDir", None)
 # Provider strings: "anthropic/claude-sonnet-4-6", "gemini/gemini-2.0-flash",
 #   "openai/gpt-4o", "bedrock/anthropic.claude-sonnet-4-5-v1:0",
 #   "ollama/llama3.3" (needs host.docker.internal reachable from container).
-# Leave unset to keep whatever openclaw already has configured.
+# Leave unset to keep a model already configured (e.g. hot-swapped via
+# model-switcher and persisted in openclaw.json); if none is configured, fall
+# back to Claude rather than openclaw's openai/gpt-5.5 built-in default.
 default_model = os.environ.get("OPENCLAW_DEFAULT_MODEL", "").strip() or None
+config.setdefault("agents", {})
+config["agents"].setdefault("defaults", {})
+config["agents"]["defaults"].setdefault("model", {})
+existing_primary = config["agents"]["defaults"]["model"].get("primary")
 if default_model:
-    config.setdefault("agents", {})
-    config["agents"].setdefault("defaults", {})
-    config["agents"]["defaults"].setdefault("model", {})
-    # Always reflect env — lets .env rotation change the active model on recreate.
+    # Env always wins — lets .env rotation change the active model on recreate.
     config["agents"]["defaults"]["model"]["primary"] = default_model
     print(f"[entrypoint] default model set to: {default_model}")
+elif not existing_primary:
+    # No env override and nothing already configured (fresh fleet bot): default
+    # to Claude instead of falling through to openclaw's openai/gpt-5.5 built-in,
+    # which needs an OpenAI key no bot has. Overridable via OPENCLAW_DEFAULT_MODEL.
+    fallback_model = "anthropic/claude-sonnet-4-6"
+    config["agents"]["defaults"]["model"]["primary"] = fallback_model
+    print(f"[entrypoint] no OPENCLAW_DEFAULT_MODEL set; defaulting to {fallback_model}")
 
 config_path.parent.mkdir(parents=True, exist_ok=True)
 config_path.write_text(json.dumps(config, indent=2) + "\n")
@@ -575,5 +822,49 @@ cat <<BANNER
    config file    : ${CONFIG_FILE}
 ==============================================================
 BANNER
+
+# ---- heartbeat: keep OFF via an empty HEARTBEAT.md (cron-driven fleet) --
+# Standing decision (2026-07-13): NO autonomous heartbeat until a proxy-signal
+# monitor exists — the daily rhythm is driven entirely by openclaw cron
+# (memory-core dreaming + sleep-cycle deep-sleep).
+#
+# openclaw skips the heartbeat LLM call ONLY when HEARTBEAT.md is "effectively
+# empty" (isHeartbeatContentEffectivelyEmpty: whitespace / #-headers / HTML
+# comments / EMPTY list stubs only). The shipped default template is NOT empty
+# — its "## Related / - [Heartbeat config](…)" footer is a non-empty list item,
+# so the heartbeat fires a real LLM on every wake (verified 2026-07-13: the
+# driver behind YesMan's non-skipped wakes). openclaw's runtime gate
+# (`system heartbeat disable`) is unreliable at boot — it needs a paired/
+# elevated gateway scope that boot tokens don't always have (failed on YesMan/
+# VH, worked on Nimbus). So we guarantee OFF the file way: write a genuinely-
+# empty HEARTBEAT.md (comment/header lines only) so every wake short-circuits
+# to skipReason=empty-heartbeat-file — no LLM, no tokens, no gateway call.
+# Written pre-gateway so the very first wake already sees it. When
+# OASIS_HEARTBEAT_DISABLED=0 (proxy-signal-monitor era) we stop managing the
+# file and let its contents drive wakes again. NOTE: '#'-prefixed lines read as
+# markdown ATX headers, which the empty-check explicitly allows — do not add
+# non-empty '- ' list items here or the heartbeat will start firing again.
+if [[ "${OASIS_HEARTBEAT_DISABLED:-1}" == "1" ]]; then
+  printf '%s\n' \
+    "# Heartbeat intentionally DISABLED (oasis-claw cron-driven fleet)." \
+    "# A file with only comments/headers is 'effectively empty' → openclaw" \
+    "# skips the heartbeat LLM call (skipReason=empty-heartbeat-file)." \
+    "# The daily rhythm runs via openclaw cron: memory-core dreaming +" \
+    "# sleep-cycle deep-sleep. Re-enable by setting OASIS_HEARTBEAT_DISABLED=0" \
+    "# and adding proxy-signal tasks below this line." \
+    > "${CONFIG_DIR}/workspace/HEARTBEAT.md"
+  echo "[entrypoint] heartbeat OFF: wrote empty HEARTBEAT.md (set OASIS_HEARTBEAT_DISABLED=0 to re-enable)"
+fi
+
+# ---- sleep-cycle: NO cron needed --------------------------------------------
+# The deep-sleep reset is openclaw's OWN native session reset (session.reset
+# policy, mode "daily", seeded above under `session.resetByType.direct`). It
+# archives the long-lived transcript and starts a fresh session on schedule
+# with no cron, no agent tool, and no operator.admin scope — which is exactly
+# why a fresh headless bot can do it (the CLI `cron add`/`sessions.reset` path
+# is gated behind operator.admin the bot can't self-grant). The sleep-cycle
+# plugin rides that native reset via its `before_reset` hook (stages the waking
+# summary) and keeps a `sleep_deep` TOOL only for manual on-demand resets. See
+# .swarm/KOLMOGOROV_SLEEP_ARCHITECTURE.md for the full rationale.
 
 exec openclaw gateway --bind "${BIND}" --port "${PORT}"

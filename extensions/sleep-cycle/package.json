@@ -1,0 +1,22 @@
+{
+  "name": "@oasis-claw/sleep-cycle",
+  "version": "0.1.0",
+  "description": "openclaw plugin: biomimetic sleep/wake cycle — doze mutex + wait-until-idle, dream window, deep-sleep session compact+reset, queued-message replay, and a waking summary with vector-ranked memory hits",
+  "type": "module",
+  "devDependencies": {
+    "openclaw": "2026.6.11",
+    "vitest": "^3.0.0"
+  },
+  "scripts": {
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest --passWithNoTests"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "zod": "^4.4.1"
+  }
+}

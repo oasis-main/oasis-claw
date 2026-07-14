@@ -1,0 +1,66 @@
+{
+  "id": "sleep-cycle",
+  "name": "Sleep Cycle",
+  "description": "Waking-summary continuity layer over openclaw's native session reset. The reset itself is openclaw's own scheduled session.reset (mode 'daily') — it archives the long-lived transcript and starts fresh with no cron, no tool, and no operator.admin scope (the prompt-cache cost fix, done the framework's way; seeded by the runtime entrypoint under session.resetByType.direct). This plugin rides that reset via a `before_reset` hook that captures the handoff tail + vector-ranks memories (one oasis-semantics embed burst, zero LLM) and a memory-prompt supplement that injects them into the fresh session. A `sleep_deep` tool is kept for MANUAL on-demand resets (e.g. relieving a rate limit mid-day). The dream step stays owned by memory-core's dreaming cron.",
+  "contracts": {
+    "tools": ["sleep_deep"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean",
+        "description": "Master switch. Default true. Force-set from OASIS_SLEEP_ENABLED by the entrypoint."
+      },
+      "timezone": {
+        "type": "string",
+        "description": "IANA timezone for the waking-summary morning gate + date bookkeeping. Default America/New_York."
+      },
+      "dozeAt": {
+        "type": "string",
+        "description": "Informational (HH:MM) — the wind-down anchor; the dream cron sits between this and deepSleepAt. Not consumed at runtime."
+      },
+      "deepSleepAt": {
+        "type": "string",
+        "description": "Informational (HH:MM). The actual deep-sleep time is the OASIS_SLEEP_DEEP-derived cron the entrypoint installs; keep them in sync."
+      },
+      "wakeAt": {
+        "type": "string",
+        "description": "Informational (HH:MM) — the morning boundary; the waking summary injects until `wakingSummary.injectUntilHour`."
+      },
+      "sessionMatch": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Substring filters selecting which session keys sleep_deep archives + resets. Default [\"telegram:direct\"]."
+      },
+      "wakingSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "memoryHits": {
+            "type": "number",
+            "description": "How many vector-ranked memory chunks to stage for the fresh session. Default 5."
+          },
+          "transcriptPointers": {
+            "type": "number",
+            "description": "How many archived transcript paths to reference. Default 3."
+          },
+          "injectUntilHour": {
+            "type": "number",
+            "description": "Stop injecting the waking summary at/after this local hour (0-24). Default 24 = no clock cutoff; the 20h freshness window is the only gate, so an off-schedule (e.g. mid-day) deep sleep still injects its handoff. Lower it (e.g. 12) for a morning-only cutoff."
+          }
+        }
+      },
+      "semanticsEndpoint": {
+        "type": "string",
+        "description": "oasis-semantics sidecar endpoint used to embed + rank memory chunks. Default http://oasis-semantics:8732."
+      },
+      "semanticsModel": {
+        "type": "string",
+        "description": "Embedding model id passed to oasis-semantics. Default \"default\" (bge-small-en-v1.5) — MUST match the memory-core embedding tier."
+      }
+    }
+  }
+}

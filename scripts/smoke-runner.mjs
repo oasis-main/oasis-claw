@@ -23,7 +23,7 @@ const ROOT = path.resolve(__dirname, "..");
 // Mock OpenClawPluginApi
 // ---------------------------------------------------------------------------
 
-function makeMockApi(pluginId, pluginConfig = {}) {
+function makeMockApi(pluginId, pluginConfig = {}, opts = {}) {
   const registered = {
     tools: [],
     hooks: [],
@@ -69,8 +69,14 @@ function makeMockApi(pluginId, pluginConfig = {}) {
     registerMemoryPromptSupplement(builder) {
       registered.memorySupplement = builder;
       const lines = builder({ availableTools: new Set(registered.tools) });
+      if (!Array.isArray(lines)) throw new Error("supplement must return an array of lines");
       log("MEMORY", pluginId, `supplement produced ${lines.length} lines`);
-      if (lines.length === 0) throw new Error("supplement returned 0 lines");
+      // Some supplements are legitimately empty under smoke conditions
+      // (e.g. sleep-cycle's waking summary before any nightly cycle has
+      // run). Those plugins opt out of the non-empty check explicitly.
+      if (lines.length === 0 && !opts.allowEmptySupplement) {
+        throw new Error("supplement returned 0 lines");
+      }
     },
     registerMemoryCapability(_cap) {
       log("MEMORY", pluginId, "registerMemoryCapability called");
@@ -199,6 +205,18 @@ const PLUGINS = [
     },
     expect: {},
   },
+  {
+    id: "sleep-cycle",
+    path: path.join(ROOT, "extensions/sleep-cycle/index.ts"),
+    // Hybrid: a before_reset HOOK stages the waking summary on openclaw's own
+    // scheduled session reset (the automatic path — no cron, no admin scope) +
+    // a sleep_deep TOOL for on-demand manual resets + the waking-summary
+    // supplement. The supplement is legitimately empty before any reset has
+    // recorded state, hence allowEmptySupplement.
+    config: { timezone: "UTC", sessionMatch: ["telegram:direct"] },
+    expect: { memorySupplement: true, minTools: 1, minHooks: 1 },
+    allowEmptySupplement: true,
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -220,7 +238,9 @@ for (const def of PLUGINS) {
       throw new Error("plugin.register is not a function");
     }
 
-    const { api, registered } = makeMockApi(def.id, def.config);
+    const { api, registered } = makeMockApi(def.id, def.config, {
+      allowEmptySupplement: def.allowEmptySupplement === true,
+    });
     await plugin.register(api);
 
     // Assertions
