@@ -879,13 +879,24 @@ fi
 export GIT_CONFIG_GLOBAL="${CONFIG_DIR}/.gitconfig"
 git config --global core.hooksPath /usr/local/lib/oasis-git-policy/hooks 2>/dev/null || true
 git config --global safe.directory '*' 2>/dev/null || true
-if [ -n "${GH_TOKEN:-}" ]; then
+if [ -n "${GH_APP_ID:-}" ]; then
+  # GitHub App mode (preferred): the oasis-gh-app helper mints a SHORT-LIVED,
+  # per-repo-scoped installation token on demand from GH_APP_PRIVATE_KEY_B64 —
+  # nothing long-lived in .env, centrally revocable. useHttpPath gives the helper
+  # the owner/repo so it can down-scope the token to just that repo.
+  git config --global user.name  "${OASIS_GIT_USER_NAME:-oasis-claw bot}"
+  git config --global user.email "${OASIS_GIT_USER_EMAIL:-bots@oasis-x.io}"
+  git config --global credential."https://github.com".helper oasis-gh-app
+  git config --global credential."https://github.com".useHttpPath true
+  echo "[entrypoint] git wired for GitHub App ${GH_APP_ID} (per-repo tokens on demand; push allowlist='${OASIS_GIT_REPOS:-<none set>}')"
+elif [ -n "${GH_TOKEN:-}" ]; then
+  # PAT fallback: static per-bot fine-grained token served for github.com https.
   git config --global user.name  "${OASIS_GIT_USER_NAME:-oasis-claw bot}"
   git config --global user.email "${OASIS_GIT_USER_EMAIL:-bots@oasis-x.io}"
   git config --global credential."https://github.com".helper oasis-gh
-  echo "[entrypoint] git+gh wired for GitHub (user='${OASIS_GIT_USER_NAME:-oasis-claw bot}', push allowlist='${OASIS_GIT_REPOS:-<none set>}')"
+  echo "[entrypoint] git+gh wired for GitHub PAT (user='${OASIS_GIT_USER_NAME:-oasis-claw bot}', push allowlist='${OASIS_GIT_REPOS:-<none set>}')"
 else
-  echo "[entrypoint] no GH_TOKEN — git limited to anonymous public reads (no push)"
+  echo "[entrypoint] no GH_APP_ID/GH_TOKEN — git limited to anonymous public reads (no push)"
 fi
 
 exec openclaw gateway --bind "${BIND}" --port "${PORT}"

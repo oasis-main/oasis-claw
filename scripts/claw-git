@@ -29,6 +29,7 @@ scripts/git-policy/ and the runbook in .swarm/GIT_ACCESS_RUNBOOK.md.
 """
 
 import argparse
+import base64
 import getpass
 import json
 import re
@@ -52,7 +53,11 @@ SERVICE_DISPLAY_NAMES = {"openclaw": "nimbus"}
 SANDBOX_BOTS = {"vanhelsing"}
 
 FGPAT_URL = "https://github.com/settings/personal-access-tokens/new"
-ENV_KEYS = ("GH_TOKEN", "OASIS_GIT_REPOS", "OASIS_GIT_USER_NAME", "OASIS_GIT_USER_EMAIL")
+ENV_KEYS = ("GH_TOKEN", "GH_APP_ID", "GH_APP_PRIVATE_KEY_B64", "GH_APP_INSTALLATION_ID",
+            "OASIS_GIT_REPOS", "OASIS_GIT_USER_NAME", "OASIS_GIT_USER_EMAIL")
+# Shared GitHub App config (id + key path), stored OUTSIDE the repo so the key
+# never risks a commit. app-set reads it and injects per-bot into bots/<name>/.env.
+APP_CONFIG = Path.home() / ".oasis-claw" / "gh-app.json"
 
 
 def color(s, c):
@@ -209,21 +214,23 @@ def pad(s, w):
 
 
 def cmd_list(args):
-    rows = [("BOT", "STATE", "TOKEN", "IDENTITY", "PUSH ALLOWLIST")]
+    rows = [("BOT", "STATE", "AUTH", "IDENTITY", "PUSH ALLOWLIST")]
     for display, service, container in discover_bots():
         state = container_state(container)
         env = read_env(envfile_for(service))
-        has_tok = "yes" if env.get("GH_TOKEN") else color("—", "dim")
+        if env.get("GH_APP_ID"):
+            auth = color("app", "cyan")
+        elif env.get("GH_TOKEN"):
+            auth = "pat"
+        else:
+            auth = color("—", "dim")
         allow = env.get("OASIS_GIT_REPOS", "") or color("(none)", "dim")
-        ident = "—"
-        if args.probe and env.get("GH_TOKEN"):
+        ident = color(f"App {env['GH_APP_ID']}", "dim") if env.get("GH_APP_ID") else "—"
+        if args.probe and env.get("GH_TOKEN") and not env.get("GH_APP_ID"):
             login, expiry = gh_identity(container)
-            if login:
-                ident = color(f"{login} (exp {expiry[:10]})", "green")
-            else:
-                ident = color(expiry, "yellow")
+            ident = color(f"{login} (exp {expiry[:10]})", "green") if login else color(expiry, "yellow")
         st_c = "green" if state == "running" else "yellow"
-        rows.append((display, color(state, st_c), has_tok, ident, allow))
+        rows.append((display, color(state, st_c), auth, ident, allow))
     widths = [max(len(re.sub(r"\033\[[0-9;]*m", "", r[i])) for r in rows) for i in range(len(rows[0]))]
     for i, r in enumerate(rows):
         line = "  ".join(pad(c, widths[j]) for j, c in enumerate(r))
@@ -340,6 +347,71 @@ def cmd_unset(args):
         recreate(display, service, container)
 
 
+# ── GitHub App mode ─────────────────────────────────────────────────────────
+def cmd_app_init(args):
+    key_path = Path(args.key).expanduser().resolve()
+    if not key_path.exists():
+        sys.exit(f"private key not found: {key_path}")
+    pem = key_path.read_text()
+    if "PRIVATE KEY" not in pem:
+        sys.exit(f"{key_path} doesn't look like a PEM private key")
+    APP_CONFIG.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    cfg = {"app_id": str(args.app_id), "key_path": str(key_path)}
+    if args.installation_id:
+        cfg["installation_id"] = str(args.installation_id)
+    APP_CONFIG.write_text(json.dumps(cfg, indent=2))
+    APP_CONFIG.chmod(0o600)
+    print(color(f"  stored App config → {APP_CONFIG} (app_id={args.app_id}, key={key_path.name})", "green"))
+    print(color("  next: claw-git app-set <bot> --repos \"owner/repo …\"", "dim"))
+
+
+def _load_app_config():
+    if not APP_CONFIG.exists():
+        sys.exit("no App config — run `claw-git app-init --app-id <ID> --key <pem>` first")
+    cfg = json.loads(APP_CONFIG.read_text())
+    key_path = Path(cfg["key_path"])
+    if not key_path.exists():
+        sys.exit(f"App key missing at {key_path}; re-run app-init")
+    cfg["key_b64"] = base64.b64encode(key_path.read_bytes()).decode()
+    return cfg
+
+
+def cmd_app_set(args):
+    display, service, container = resolve_bot(args.bot)
+    cfg = _load_app_config()
+    updates = {
+        "GH_APP_ID": cfg["app_id"],
+        "GH_APP_PRIVATE_KEY_B64": cfg["key_b64"],
+    }
+    inst = args.installation_id or cfg.get("installation_id")
+    if inst:
+        updates["GH_APP_INSTALLATION_ID"] = str(inst)
+    if args.repos is not None:
+        updates["OASIS_GIT_REPOS"] = args.repos.strip()
+    if args.name:
+        updates["OASIS_GIT_USER_NAME"] = args.name
+    if args.email:
+        updates["OASIS_GIT_USER_EMAIL"] = args.email
+    # App mode supersedes any stale PAT.
+    path = envfile_for(service)
+    upsert_env(path, updates, remove=("GH_TOKEN",))
+    print(color(f"  wrote {path.relative_to(REPO_ROOT)} (App mode; repos='{args.repos or '<unset>'}')", "dim"))
+    if args.no_recreate:
+        print(color("  recreate to apply: make git-recreate or claw-git app-set again", "yellow"))
+        return
+    if recreate(display, service, container):
+        # Best-effort live mint check (fails on egress-locked bots — that's fine).
+        probe = args.repos.split()[0] if args.repos else ""
+        r = dexec(container, ["sh", "-c",
+                  f'printf "protocol=https\\nhost=github.com\\npath={probe}.git\\n\\n" | '
+                  'git-credential-oasis-gh-app get 2>/dev/null | grep -c "^password="'])
+        if r.stdout.strip() == "1":
+            print(f"  verified: {color('App token minted OK', 'green')} for {probe or 'installation'}")
+        else:
+            print(color("  note: no token minted yet (App not created/installed, or egress-locked bot). "
+                        "Config is in place; will work once the App is live + reachable.", "yellow"))
+
+
 def main():
     p = argparse.ArgumentParser(prog="claw-git", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -379,6 +451,21 @@ def main():
     s.add_argument("bot")
     s.add_argument("--no-recreate", action="store_true")
     s.set_defaults(func=cmd_unset)
+
+    s = sub.add_parser("app-init", help="store the shared GitHub App creds (once)")
+    s.add_argument("--app-id", required=True)
+    s.add_argument("--key", required=True, metavar="PEM", help="path to the App private-key .pem")
+    s.add_argument("--installation-id", help="optional default installation id")
+    s.set_defaults(func=cmd_app_init)
+
+    s = sub.add_parser("app-set", help="configure a bot for GitHub App auth (App mode)")
+    s.add_argument("bot")
+    s.add_argument("--repos", help="repo scope, space-separated owner/repo ('*' = all)")
+    s.add_argument("--installation-id", help="override the default installation id")
+    s.add_argument("--name", help="git commit user.name")
+    s.add_argument("--email", help="git commit user.email")
+    s.add_argument("--no-recreate", action="store_true")
+    s.set_defaults(func=cmd_app_set)
 
     args = p.parse_args()
     args.func(args)

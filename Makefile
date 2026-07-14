@@ -80,6 +80,17 @@ git-rotate: ## open the fine-grained-PAT page then store the new token (BOT=<nam
 	@test -n "$(BOT)" || { echo "BOT=<name> required"; exit 2; }
 	@./scripts/claw-git rotate $(BOT)
 
+git-app-init: ## store shared GitHub App creds once (APP_ID=<id> KEY=<pem> [INST=<installation-id>])
+	@test -n "$(APP_ID)" || { echo "APP_ID=<id> required"; exit 2; }
+	@test -n "$(KEY)"    || { echo "KEY=<path-to-pem> required"; exit 2; }
+	@./scripts/claw-git app-init --app-id $(APP_ID) --key "$(KEY)" $(if $(INST),--installation-id $(INST),)
+
+git-app-set: ## configure a bot for GitHub App auth (BOT=<name> REPOS='o/a o/b' [INST=<id>])
+	@test -n "$(BOT)" || { echo "BOT=<name> required"; exit 2; }
+	@./scripts/claw-git app-set $(BOT) \
+	    $(if $(REPOS),--repos "$(REPOS)",) $(if $(INST),--installation-id $(INST),) \
+	    $(if $(NAME),--name "$(NAME)",) $(if $(EMAIL),--email "$(EMAIL)",)
+
 assets-list: ## list per-bot avatar inventory (name, size, dims, hash)
 	@./scripts/claw-assets list
 
