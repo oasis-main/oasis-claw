@@ -1,0 +1,12 @@
+# Default static egress allowlist for the oasis-claw operating-system-sandbox
+# (CLAW-033). One entry per line:
+#   .example.com   matches example.com AND any subdomain
+#   example.com    matches exactly
+#   # ...          comment
+# Extended/overridden at runtime by the ALLOWLIST env var (comma/space/newline
+# separated). Learned first-visit-vetted domains (CLAW-034) will be appended to
+# a separate learned store, not this baked-in file.
+#
+# Core provider + control-plane endpoints the runtime legitimately needs:
+.anthropic.com
+api.telegram.org

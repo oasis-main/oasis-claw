@@ -1,0 +1,58 @@
+## operating-system-sandbox — ADVERSARIAL egress harness  (CLAW-037)
+##
+## Purpose-built to attack the egress proxy, not just smoke it. It reuses the
+## same two-network topology as the prototype (`sandboxed` is internal:true; the
+## proxy is the sole exit) but adds hostile scaffolding the clean prototype
+## compose deliberately keeps out:
+##
+##   - SNI_ENFORCE=strict — the tightest posture, so the fronting assertion has
+##     teeth.
+##   - extra_hosts that map ALLOWLISTED names onto internal / metadata IPs, so
+##     `adversarial.sh` can prove the DNS-rebinding / SSRF guard denies an
+##     allowlisted hostname the instant it resolves to a non-public address.
+##     These names exist ONLY in this test's /etc/hosts; the prototype and the
+##     live runtime never carry them.
+##
+## Run:  ./adversarial.sh   (from sandbox/test/)
+services:
+  egress-proxy:
+    build:
+      context: ../egress-proxy
+    image: oasis-egress-proxy:local
+    container_name: oasis-egress-proxy-adv
+    environment:
+      LISTEN: ":3128"
+      # metadata.test / internal.test / loopback.test are ALLOWLISTED BY NAME on
+      # purpose — the point is that the IP guard denies them anyway once they
+      # resolve to a special-use address (see extra_hosts). A name on the
+      # allowlist must still not be able to reach an internal IP.
+      ALLOWLIST: ".anthropic.com,api.telegram.org,metadata.test,internal.test,loopback.test"
+      SNI_ENFORCE: "strict"
+    extra_hosts:
+      - "metadata.test:169.254.169.254"   # cloud instance-metadata endpoint (link-local)
+      - "internal.test:10.0.0.5"          # RFC1918 internal host
+      - "loopback.test:127.0.0.1"         # host loopback
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - sandboxed
+      - egress
+    restart: unless-stopped
+
+  sandbox-client:
+    image: curlimages/curl:8.11.1
+    container_name: oasis-sandbox-client-adv
+    depends_on:
+      - egress-proxy
+    networks:
+      - sandboxed
+    entrypoint: ["curl", "--version"]
+
+networks:
+  sandboxed:
+    internal: true
+  egress:
+    driver: bridge

@@ -1,0 +1,7 @@
+# CLAW-050 per-bot static-seed store (host bind-mount, read-only into the proxy).
+# Each partitioned bot gets seeds/<bot>/allowlist.txt, RENDERED from its
+# role.yaml origins.trusted via:
+#   python3 scripts/compile-role.py --emit-egress-allowlist bots/<bot>/role.yaml \
+#     > sandbox/egress-proxy/seeds/<bot>/allowlist.txt
+# The rendered per-bot files are machine-local (role.yaml lives under gitignored
+# bots/) and gitignored — only this .gitkeep is committed so the mount dir exists.

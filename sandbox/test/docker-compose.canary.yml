@@ -1,0 +1,112 @@
+## operating-system-sandbox — CANARY  (CLAW-031 functional check, MUST PASS
+## before Nimbus or Van Helsing is applied to the sandbox-runtime overlay).
+##
+## What it proves: a fresh openclaw runtime container on the ACTUAL sandbox
+## topology (`internal:true` + egress-proxy sole exit) completes a real Anthropic
+## API call THROUGH the sidecar. In other words: openclaw's internal HTTP client
+## honors `HTTPS_PROXY` (per changelog #71833 / #43821 — Undici env-proxy
+## dispatcher). If this fails, Nimbus applied to the overlay would immediately
+## lose provider access, so we prove it here first on a throwaway.
+##
+## Isolation from live state:
+##   - Own container name (`oasis-claw-canary`), OWN volume (`oasis_canary_home`)
+##     — Nimbus's `oasis_openclaw_home` is never touched.
+##   - Empty Telegram token — no polling → no 409 conflict with the live Nimbus
+##     poller if the main .env carries Nimbus's token.
+##   - The canary's ONLY provider egress is anthropic — no OpenAI, no Gemini,
+##     no Ollama — so it can't accidentally hit an unallowlisted host.
+##
+## Run:  ./canary-smoke.sh  (from sandbox/test/)
+
+services:
+  # The egress boundary — same static allowlist / hardening as the live overlay.
+  egress-proxy:
+    build:
+      context: ../egress-proxy
+    image: oasis-egress-proxy:local
+    container_name: oasis-egress-proxy-canary
+    environment:
+      LISTEN: ":3128"
+      ALLOWLIST: ".anthropic.com,api.telegram.org"
+      SNI_ENFORCE: "strict"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - canary_runtime
+      - canary_egress
+    restart: unless-stopped
+
+  # The canary openclaw runtime — same image, same hardening as the fleet, on
+  # the SANDBOXED (internal:true) network. HTTPS_PROXY points at the sidecar.
+  openclaw-canary:
+    image: oasis-claw-runtime:local
+    container_name: oasis-claw-canary
+    init: true
+    restart: unless-stopped
+    env_file:
+      # Reuse the runtime's Anthropic key; below we deliberately blank Telegram
+      # + non-Anthropic providers so the canary can't touch anything else.
+      - path: ../../.env
+        required: true
+    environment:
+      OPENCLAW_GATEWAY_BIND: lan
+      OPENCLAW_GATEWAY_PORT: "18789"
+      OPENCLAW_DISABLE_BONJOUR: "1"
+      TZ: UTC
+      XDG_CONFIG_HOME: /home/node/.openclaw/config
+      XDG_STATE_HOME: /home/node/.openclaw/state
+      # ── CLAW-031 UNDER TEST ──
+      HTTP_PROXY: "http://egress-proxy:3128"
+      HTTPS_PROXY: "http://egress-proxy:3128"
+      NO_PROXY: "localhost,127.0.0.1"
+      # Force a Claude default — we want provider egress in Anthropic only.
+      OPENCLAW_DEFAULT_MODEL: "anthropic/claude-sonnet-4-6"
+      # Blank the non-Anthropic providers + Telegram so the canary can't 409
+      # the live Nimbus poller and can't try to reach an unallowlisted host.
+      OPENAI_API_KEY: ""
+      GEMINI_API_KEY: ""
+      OASIS_TELEGRAM_BOT_TOKEN: ""
+      OASIS_TELEGRAM_CHAT_ID: ""
+    ports:
+      - "127.0.0.1:18799:18789"       # unique loopback port — no clash with Nimbus (18789) or fleet (18790-95)
+    volumes:
+      - oasis_canary_home:/home/node/.openclaw
+    user: "node"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /home/node/.cache:size=32m,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - canary_runtime
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >
+          token=$$(cat /home/node/.openclaw/.gateway-token 2>/dev/null);
+          curl -fsS -H "Authorization: Bearer $$token"
+          http://127.0.0.1:18789/healthz >/dev/null
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 40s
+    depends_on:
+      - egress-proxy
+
+networks:
+  # No route to the internet. The proxy is the only exit.
+  canary_runtime:
+    internal: true
+  canary_egress:
+    driver: bridge
+
+volumes:
+  # Throwaway. Deleted on `docker compose down -v` at the end of the smoke.
+  oasis_canary_home:
+    name: oasis_canary_home

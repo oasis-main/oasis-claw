@@ -1,0 +1,3 @@
+# CLAW-034 learned-allowlist store (host bind-mount).
+# Runtime files (allowlist.txt, learned.jsonl) are written by scripts/claw-vet
+# and gitignored — only this .gitkeep is committed so the mount dir exists.

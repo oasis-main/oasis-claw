@@ -1,0 +1,57 @@
+## operating-system-sandbox — egress-control PROTOTYPE  (CLAW-033)
+##
+## Self-contained proof harness. It stands up the fail-closed egress proxy as
+## the SOLE route out of an `internal: true` network, plus a stand-in client
+## that models the sandboxed openclaw runtime. It does NOT touch the live
+## runtime compose — this is a version-independent demonstration of the network
+## boundary (see ./test/fail-closed.sh).
+##
+## Run:  ./test/fail-closed.sh
+## Or:   docker compose -f docker-compose.sandbox.yml up -d --build egress-proxy
+
+services:
+  # The egress boundary. Sits on BOTH networks and is the only thing that does,
+  # so it is the only physical path from `sandboxed` to the internet.
+  egress-proxy:
+    build:
+      context: ./egress-proxy
+    image: oasis-egress-proxy:local
+    container_name: oasis-egress-proxy
+    environment:
+      LISTEN: ":3128"
+      # Demo allowlist. Production config = baked-in allowlist.txt + this env.
+      # Suffix entries (leading dot) match subdomains.
+      ALLOWLIST: ".anthropic.com,api.telegram.org"
+      # off | lenient | strict. lenient exercises the SNI-peek path but only
+      # denies a present-and-unallowlisted SNI (strictly subtractive).
+      SNI_ENFORCE: "lenient"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - sandboxed
+      - egress
+    restart: unless-stopped
+
+  # Stand-in for the sandboxed openclaw runtime: attached ONLY to the internal
+  # network, so it has no direct route to the internet. The test drives curl
+  # inside this service (`compose run --rm --entrypoint curl sandbox-client …`).
+  sandbox-client:
+    image: curlimages/curl:8.11.1
+    container_name: oasis-sandbox-client
+    depends_on:
+      - egress-proxy
+    networks:
+      - sandboxed
+    # Overridden by the test; present so the service is valid on its own.
+    entrypoint: ["curl", "--version"]
+
+networks:
+  # No route to the internet. The proxy is the only exit.
+  sandboxed:
+    internal: true
+  # Normal outbound — only the proxy is attached here.
+  egress:
+    driver: bridge

@@ -1,0 +1,9 @@
+# Runtime learned-allowlist state — written by claw-vet, never committed.
+# Bare names (no slash) so the per-bot namespaces learned/<bot>/… match too.
+allowlist.txt
+learned.jsonl
+vet-audit.jsonl
+# Source-IP → bot map, regenerated from LIVE container IPs by claw-egress-sync.
+# Machine-local and stale the moment a bot is recreated — committing it would
+# hand another checkout a map that silently drops bots to base-only egress.
+client.map

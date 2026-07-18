@@ -1,0 +1,192 @@
+## operating-system-sandbox — LIVE-RUNTIME overlay (CLAW-033 integration)
+##
+## PARTIAL-FLEET-SAFE (2026-07-11 revision): this overlay is ADDITIVE — it adds
+## a NEW `oasis_sandboxed` internal:true network + the egress-proxy sidecar,
+## and bridges the local voice+semantics sidecars into that network so
+## sandboxed bots can still reach them. It does NOT touch `oasis_runtime`
+## (Nimbus's bridge), so applying this alongside a running Nimbus is safe:
+## Nimbus keeps direct egress via `oasis_runtime`, sandboxed bots (added via
+## per-bot reach overlays like `bots/docker-compose.vanhelsing-reach.yml`) route
+## exclusively through the sidecar via `oasis_sandboxed`.
+##
+## When we eventually cut ALL of the fleet + Nimbus over, we'll add an
+## additional overlay that flips `oasis_runtime → internal:true` and points
+## every bot at HTTPS_PROXY. Until then, use this + the per-bot reach overlay.
+##
+## Apply:
+##   docker compose -f docker-compose.runtime.yml \
+##                  -f sandbox/docker-compose.sandbox-runtime.yml \
+##                  -f bots/docker-compose.bots.yml \
+##                  -f bots/docker-compose.vanhelsing-reach.yml \
+##                  up -d egress-proxy oasis-voice oasis-semantics vanhelsing
+##
+## First application will briefly restart oasis-voice + oasis-semantics to
+## attach them to `oasis_sandboxed`; Nimbus will see its sidecars flap for a
+## few seconds but does not crash — its subsequent calls succeed on reconnect.
+
+services:
+  egress-proxy:
+    # context is resolved relative to the PROJECT directory (the first -f file's
+    # dir = repo root), not this override file — so it must include sandbox/.
+    build:
+      context: ./sandbox/egress-proxy
+    image: oasis-egress-proxy:local
+    container_name: oasis-egress-proxy
+    environment:
+      LISTEN: ":3128"
+      # Baked allowlist.txt already carries .anthropic.com + api.telegram.org.
+      # Extend per deployment; keep it minimal (each entry is an exfil channel).
+      ALLOWLIST: ".anthropic.com,api.telegram.org"
+      SNI_ENFORCE: "strict"
+      # ── CLAW-034: learned-allowlist store (first-visit vetting) ────────────
+      # The proxy ADDITIVELY loads vetted domains from this file and hot-reloads
+      # it every LEARNED_RELOAD_SECONDS, so a `pass` verdict takes effect with no
+      # recreate. TRUST BOUNDARY: mounted READ-ONLY here; the ONLY writer is the
+      # host-side `scripts/claw-vet` CLI (the vetting brain). A sandboxed bot NEVER
+      # mounts this path — so a compromised agent loop cannot widen its own egress
+      # by editing the learned store. Until claw-vet writes it the file is absent
+      # (a no-op): the proxy runs on the static seed alone, fully fail-closed.
+      LEARNED_ALLOWLIST_FILE: "/var/lib/egress/learned/allowlist.txt"
+      LEARNED_RELOAD_SECONDS: "5"
+      # ── CLAW-050: per-bot egress partitioning ──────────────────────────────
+      # OFF by default (empty CLIENT_MAP) → every client shares the base allowlist,
+      # byte-for-byte the pre-CLAW-050 behavior. To ACTIVATE per-bot blast radii:
+      #   1. assign each sandboxed bot a STATIC ipv4_address on oasis_sandboxed
+      #      (in its bots/docker-compose.<bot>-reach.yml overlay), and
+      #   2. set OASIS_EGRESS_CLIENT_MAP="10.x=vanhelsing,10.y=house" (docker/.env
+      #      or the overlay) mapping those IPs → bot names.
+      # Identity is the client SOURCE IP — an unprivileged container cannot spoof
+      # it, whereas it controls its own HTTPS_PROXY target, so IP is the only
+      # spoof-resistant seam. Each bot then reaches base ∪ its own seed ∪ its own
+      # learned namespace, and NOTHING of a peer's. Per-bot seed + learned files:
+      #   SEED_DIR/<bot>/allowlist.txt     (rendered from role.yaml origins.trusted)
+      #   LEARNED_DIR/<bot>/allowlist.txt  (written ONLY by claw-vet --bot <bot>)
+      CLIENT_MAP: "${OASIS_EGRESS_CLIENT_MAP:-}"
+      # CLIENT_MAP_FILE (hot-reloadable) is the primary source-IP → bot map: the
+      # host helper scripts/claw-egress-sync writes it from live container IPs, and
+      # the proxy hot-reloads it (no recreate). Run the sync after ANY sandboxed bot
+      # is recreated — a bot's IP can change, and a stale map silently drops it to
+      # base-only egress. Lives in the RO-mounted learned dir; proxy reads it RO.
+      CLIENT_MAP_FILE: "/var/lib/egress/learned/client.map"
+      SEED_DIR: "/var/lib/egress/seeds"
+      LEARNED_DIR: "/var/lib/egress/learned"
+      # ── CLAW-034: audit sink for the vetting service ───────────────────────
+      # stdout stays the operator's view (docker logs is unchanged); this is a
+      # SECOND sink so the claw-vet container can read the deny stream WITHOUT a
+      # docker socket. Mounting /var/run/docker.sock into the vetter would give it
+      # root-equivalent control of the host just to tail a log — this file is the
+      # whole reason that mount is unnecessary. Bounded + single-generation
+      # rotation; unset ⇒ stdout only, exactly as before.
+      AUDIT_FILE: "/var/lib/egress/audit/audit.jsonl"
+      AUDIT_MAX_BYTES: "33554432"   # 32 MiB, then rotate to .1
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - oasis_sandboxed   # internal side — reachable by sandboxed bots
+      - oasis_egress      # outbound side — the only container attached here
+    volumes:
+      # HOST BIND-MOUNT (not a named volume) so the host-side claw-vet CLI writes
+      # the learned store directly — on Docker Desktop a named volume lives inside
+      # the VM and would need a helper container per write. RO into the proxy;
+      # claw-vet (host) is the sole writer; sandboxed bots never mount it. Path is
+      # relative to the project dir (repo root); override with OASIS_EGRESS_LEARNED_DIR
+      # (must match claw-vet's env). Committed as an empty dir via .gitkeep.
+      - ${OASIS_EGRESS_LEARNED_DIR:-./sandbox/egress-proxy/learned}:/var/lib/egress/learned:ro
+      # CLAW-050 per-bot STATIC seeds (RO). Same host-bind rationale as the learned
+      # store. Empty until a bot is partitioned; a rendered SEED_DIR/<bot>/allowlist.txt
+      # comes from `compile-role.py --emit-egress-allowlist bots/<bot>/role.yaml`.
+      - ${OASIS_EGRESS_SEED_DIR:-./sandbox/egress-proxy/seeds}:/var/lib/egress/seeds:ro
+      # Audit sink. A NAMED volume, not a host bind: the proxy runs as uid 65532
+      # and could not write into a host dir owned by Mike, and the image seeds the
+      # volume with a correctly-owned mountpoint (see egress-proxy/Dockerfile).
+      - egress_audit:/var/lib/egress/audit
+    restart: unless-stopped
+
+  # ── CLAW-034: first-visit vetting service ──────────────────────────────────
+  # Turns the proxy's vettable denials into safe allow decisions with no human in
+  # the loop: role-policy gate → safety classifier → honeypot meta-eval → write.
+  # Runs as a container rather than a launchd agent because macOS TCC blocks
+  # launchd from reading ~/Documents (see sandbox/vetter/Dockerfile).
+  #
+  # TRUST BOUNDARY — this service is the ONLY writer of the learned store, so its
+  # own blast radius is the thing that matters:
+  #   • attached to oasis_egress ONLY. It is NOT on oasis_sandboxed, so no bot can
+  #     reach the service that decides that bot's egress.
+  #   • no docker socket (that is what AUDIT_FILE buys).
+  #   • read-only rootfs, all caps dropped, no-new-privileges, non-root.
+  #   • the repo goes in READ-ONLY: it enforces role.yaml, it cannot edit it.
+  claw-vet:
+    build:
+      # Resolved relative to the PROJECT dir (repo root), like egress-proxy above.
+      context: ./sandbox/vetter
+    image: oasis-claw-vet:local
+    container_name: oasis-claw-vet
+    depends_on:
+      - egress-proxy
+    environment:
+      # Read the deny queue from the proxy's audit file, not `docker logs`.
+      OASIS_EGRESS_AUDIT_FILE: "/var/lib/egress/audit/audit.jsonl"
+      OASIS_EGRESS_LEARNED_DIR: "/var/lib/egress/learned"
+      # Interpolated from the repo .env (NOT env_file: .env — that would hand the
+      # vetter every provider key and the Telegram token; it needs exactly one
+      # credential). `:?` fails the run loudly rather than starting a vetter that
+      # cannot classify and would just audit classifier-errors forever.
+      OASIS_GENERATION_URL: "${OASIS_GENERATION_URL:?set OASIS_GENERATION_URL in .env}"
+      OASIS_GENERATION_TOKEN: "${OASIS_GENERATION_TOKEN:?set OASIS_GENERATION_TOKEN in .env}"
+      OASIS_VET_MODEL: "${OASIS_VET_MODEL:-claude-opus-4-8}"
+    volumes:
+      # The tool and the policy it enforces — both RO. A vetter that could write
+      # role.yaml could widen its own gate.
+      - ./scripts/claw-vet:/app/scripts/claw-vet:ro
+      - ./bots:/app/bots:ro
+      # The one thing it writes.
+      - ${OASIS_EGRESS_LEARNED_DIR:-./sandbox/egress-proxy/learned}:/var/lib/egress/learned
+      - egress_audit:/var/lib/egress/audit:ro
+    extra_hosts:
+      # The oasis-generation gateway listens on the host, not in this project.
+      - "host.docker.internal:host-gateway"
+    networks:
+      - oasis_egress       # outbound only — deliberately NOT oasis_sandboxed
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  # Bridge the trusted local sidecars into the sandboxed network too, so a
+  # sandboxed bot can still reach oasis-voice / oasis-semantics by hostname
+  # (they are local Piper/Moonshine/embedding wrappers, not LLM-driven, so
+  # putting them on both networks does not widen the injection surface).
+  oasis-voice:
+    networks:
+      - oasis_runtime
+      - oasis_sandboxed
+
+  oasis-semantics:
+    networks:
+      - oasis_runtime
+      - oasis_sandboxed
+
+networks:
+  # The sandboxed network — internal:true, no route to the internet. Sandboxed
+  # bots and the egress-proxy are the only things attached (plus voice+semantics
+  # for local sidecar access).
+  oasis_sandboxed:
+    driver: bridge
+    internal: true
+  # Outbound bridge — only the egress-proxy and the vetting service are attached.
+  # Neither is reachable from oasis_sandboxed, so a bot can reach the proxy's
+  # LISTEN port on the internal side and nothing else.
+  oasis_egress:
+    driver: bridge
+
+volumes:
+  # Proxy → vetter decision stream. Named (not a host bind) so the proxy's uid
+  # 65532 can write it; the vetter mounts it read-only.
+  egress_audit:

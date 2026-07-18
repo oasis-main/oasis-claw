@@ -1,0 +1,2 @@
+# Per-bot rendered seeds — machine-local (derived from gitignored bots/<bot>/role.yaml).
+*/allowlist.txt
