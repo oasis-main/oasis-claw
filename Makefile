@@ -108,3 +108,35 @@ assets-show: ## open a bot's current avatar (BOT=<name>)
 wait-ready:
 	@until $(COMPOSE) logs --since=30s openclaw 2>&1 | grep -q "\[gateway\] ready"; do sleep 1; done
 	@echo "[gateway] ready"
+
+# ── nimbus-watchdog (launchd) ────────────────────────────────────────────────
+# The script is DEPLOYED outside the repo on purpose. macOS TCC blocks launchd
+# agents from reading ~/Documents, so an agent pointed into this repo fails with
+# "Operation not permitted" (exit 126) on every fire — and does so SILENTLY,
+# which for a watchdog is indistinguishable from healthy. That is how this agent
+# sat dead. The script needs only `docker` + ~/Library/Logs, so a deployed copy
+# outside TCC-protected space is the whole fix: no Full Disk Access grant, and no
+# container holding a root-equivalent docker socket just to run `docker restart`.
+WATCHDOG_DIR := $(HOME)/Library/Application Support/oasis-x
+WATCHDOG_PLIST := $(HOME)/Library/LaunchAgents/com.oasis-x.nimbus-watchdog.plist
+
+.PHONY: watchdog-install watchdog-status watchdog-uninstall
+
+watchdog-install: ## (re)deploy + load the nimbus telegram-channel watchdog — re-run after editing the script
+	@mkdir -p "$(WATCHDOG_DIR)"
+	@cp scripts/nimbus-watchdog.sh "$(WATCHDOG_DIR)/nimbus-watchdog.sh"
+	@chmod +x "$(WATCHDOG_DIR)/nimbus-watchdog.sh"
+	@cp scripts/com.oasis-x.nimbus-watchdog.plist "$(WATCHDOG_PLIST)"
+	@plutil -lint "$(WATCHDOG_PLIST)" >/dev/null
+	@launchctl bootout gui/$$(id -u)/com.oasis-x.nimbus-watchdog 2>/dev/null || true
+	@launchctl bootstrap gui/$$(id -u) "$(WATCHDOG_PLIST)"
+	@echo "watchdog installed — verify with: make watchdog-status"
+
+watchdog-status: ## show the watchdog's last exit code (0 = healthy; 126 = TCC-blocked, see watchdog-install)
+	@launchctl print gui/$$(id -u)/com.oasis-x.nimbus-watchdog 2>/dev/null \
+	  | grep -E "state =|last exit code" || echo "not loaded"
+	@tail -3 "$(HOME)/Library/Logs/nimbus-watchdog.stderr.log" 2>/dev/null || true
+
+watchdog-uninstall: ## unload the watchdog
+	@launchctl bootout gui/$$(id -u)/com.oasis-x.nimbus-watchdog 2>/dev/null || true
+	@echo "watchdog unloaded"
