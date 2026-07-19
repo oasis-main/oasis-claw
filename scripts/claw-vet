@@ -138,6 +138,25 @@ PROVIDER_HOSTS = {
     "api.perplexity.ai",
 }
 
+# Developer infrastructure that belongs to no single role. The peer-owned-host
+# check fences a host ONE bot declared so a peer cannot acquire it by probing —
+# but package registries and code hosts are legitimately common to several bots,
+# and whichever bot happened to list one first must not thereby own it. (Only
+# Van Helsing declares registry.npmjs.org; that is an accident of drafting order,
+# not a claim on npm.) Hosts declared by TWO OR MORE bots are treated as shared
+# automatically; this list covers the ones only one bot got around to declaring.
+SHARED_INFRA = {
+    "registry.npmjs.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "crates.io",
+    "static.crates.io",
+    "github.com",
+    "raw.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "proxy.golang.org",
+}
+
 HOST_RE = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.[A-Za-z0-9-]{1,63})+$")
 
 
@@ -584,10 +603,33 @@ def load_role_policy(bot):
         "posture": str(origins.get("posture", "") or "").strip().lower() or "vetted",
         "exclude": _hosts("exclude"),
         "candidates": _hosts("candidates"),
+        # `trusted` is auto-allowed into the bot's static seed, so it is equally a
+        # declaration of ownership for the peer-owned-host check.
+        "trusted": _hosts("trusted"),
         "path": str(path),
     }
     _ROLE_CACHE[bot] = policy
     return policy
+
+
+def all_role_policies():
+    """{bot: policy} for every bot with a readable role.yaml. Unreadable manifests
+    are SKIPPED rather than fatal — one broken peer manifest must not stop the
+    bot being vetted from getting a decision (its own manifest is checked
+    separately, and fails closed there)."""
+    out = {}
+    if not ROLES_DIR.is_dir():
+        return out
+    for d in sorted(ROLES_DIR.iterdir()):
+        if not (d / "role.yaml").exists():
+            continue
+        try:
+            p = load_role_policy(d.name)
+        except RolePolicyError:
+            continue
+        if p:
+            out[d.name] = p
+    return out
 
 
 def host_matches(host, entries):
@@ -648,6 +690,37 @@ def policy_gate(host, bot):
     if host_matches(host, policy["exclude"]):
         return {"decision": "block", "reason": "role-exclude",
                 "detail": f"{host} is in {bot}'s origins.exclude"}
+
+    # 6. Peer-owned host. A host another bot DECLARED in its role manifest, and
+    #    this bot did not, belongs to that bot's job — not this one's.
+    #
+    #    Found the hard way 2026-07-19: probing `kolmogorov -> kalshi.com` (a
+    #    House origin) produced a vettable denial; the classifier judged kalshi.com
+    #    safe — correctly, it IS safe — and the vetter wrote it into KOLMOGOROV's
+    #    namespace. Nothing above caught it: not a provider host, not locked, not
+    #    excluded. So per-bot partitioning was weaker than advertised: it bounded
+    #    what a bot had ALREADY been granted, but any bot that merely TRIED a
+    #    peer's host would be granted it, because "safe" was the only question
+    #    being asked. This closes that: the role manifests are the arbiter of whose
+    #    host is whose.
+    #
+    #    Deliberately keyed on DECLARED candidates/trusted, never on what a peer
+    #    happens to have learned — shared infrastructure (raw.githubusercontent.com,
+    #    registry.npmjs.org) is legitimately reachable by several bots and must
+    #    stay discoverable. Only a host someone explicitly claimed is fenced, and a
+    #    host in THIS bot's own candidates is always fine.
+    own = set(policy["candidates"]) | set(policy.get("trusted") or [])
+    if not host_matches(host, own) and not host_matches(host, SHARED_INFRA):
+        claimants = [peer for peer, pp in all_role_policies().items()
+                     if peer != bot
+                     and host_matches(host, set(pp["candidates"]) | set(pp.get("trusted") or []))]
+        # Exactly ONE claimant ⇒ that bot owns it. TWO OR MORE ⇒ it is shared
+        # infrastructure by revealed preference, and fencing it would be wrong.
+        if len(claimants) == 1:
+            return {"decision": "block", "reason": "peer-owned-host",
+                    "detail": f"{host} is declared in {claimants[0]}'s role, not {bot}'s — "
+                              f"if {bot} genuinely needs it, add it to {bot}'s "
+                              f"origins.candidates"}
 
     return None
 

@@ -71,6 +71,25 @@ check("crates.io / butterbolt", reason("crates.io", "butterbolt"), None)
 # back into a static allowlist.
 check("undeclared host / house", reason("evil.example.test", "house"), None)
 
+print("== 3b. a peer's declared host cannot be acquired by probing ==")
+# Found live 2026-07-19: probing `kolmogorov -> kalshi.com` (a House origin) made
+# a vettable denial, the classifier judged kalshi.com safe — correctly, it IS
+# safe — and it was written into KOLMOGOROV's namespace. Per-bot partitioning
+# therefore bounded only what a bot had ALREADY been granted; any bot that merely
+# TRIED a peer's host was given it, because "safe" was the only question asked.
+check("kalshi.com / kolmogorov (House's)", reason("kalshi.com", "kolmogorov"), "peer-owned-host")
+check(".polymarket.com / kolmogorov (House's)", reason(".polymarket.com", "kolmogorov"), "peer-owned-host")
+check("amazon.com / house (ButterBolt's)", reason("amazon.com", "house"), "peer-owned-host")
+# ...but the owner itself is unaffected.
+check("kalshi.com / house (its own)", reason("kalshi.com", "house"), None)
+# Shared developer infrastructure must NOT be fenced to whichever bot listed it
+# first, or a drafting accident becomes an ownership claim.
+check("raw.githubusercontent.com / house (3 declarers)",
+      reason("raw.githubusercontent.com", "house"), None)
+check("registry.npmjs.org / butterbolt (SHARED_INFRA)",
+      reason("registry.npmjs.org", "butterbolt"), None)
+check("pypi.org / house (SHARED_INFRA)", reason("pypi.org", "house"), None)
+
 print("== 4. unattributed candidates cannot widen a partitioned fleet ==")
 # bot="" writes the GLOBAL store that every bot reads. Stale pre-partition log
 # lines must not become fleet-wide grants.

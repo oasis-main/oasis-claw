@@ -127,7 +127,8 @@ if isinstance(plugins_cfg, dict):
         if isinstance(sc, dict) and isinstance(sc.get("config"), dict):
             allowed = {
                 "enabled", "timezone", "dozeAt", "deepSleepAt", "wakeAt",
-                "sessionMatch", "wakingSummary", "semanticsEndpoint", "semanticsModel",
+                "sessionMatch", "wakingSummary", "contextNap",
+                "semanticsEndpoint", "semanticsModel",
             }
             for k in list(sc["config"]):
                 if k not in allowed:
@@ -135,6 +136,27 @@ if isinstance(plugins_cfg, dict):
 
 config_path.write_text(json.dumps(config, indent=2) + "\n")
 PY
+
+# ---- compile role.yaml if present (CLAW-047) -----------------------------
+# A bot whose compose overlay mounts bots/<bot>/role.yaml at /app/role.yaml
+# gets its four enforcement layers DERIVED from that single file instead of
+# hand-maintained env vars. The compiler reads the ACTIVE exec tier for the
+# bot's current `phase`, extracts tools.profile + alsoAllow, and exports
+# shell variables that the merge_config + exec-approvals blocks below consume
+# (same variable names: OASIS_EXEC_ALLOWLIST, etc.). Bots WITHOUT a role.yaml
+# fall through to the existing env-driven behavior (backward-compatible).
+ROLE_FILE="${OASIS_ROLE_FILE:-/app/role.yaml}"
+if [[ -f "${ROLE_FILE}" ]]; then
+  _role_exports=$(python3 /usr/local/bin/compile-role.py "${ROLE_FILE}" 2>&1)
+  if [[ $? -eq 0 && -n "${_role_exports}" ]]; then
+    eval "${_role_exports}"
+    echo "[entrypoint] role compiled: ${OASIS_ROLE_NAME:-?} phase=${OASIS_ROLE_PHASE:-?}" \
+         "exec=${_ROLE_EXEC_ACTIVE_COUNT:-0} active + ${_ROLE_EXEC_DORMANT_COUNT:-0} dormant" \
+         "(${_ROLE_EXEC_DORMANT_TIERS:-none})"
+  else
+    echo "[entrypoint] WARN: role compilation failed for ${ROLE_FILE}; falling back to env" >&2
+  fi
+fi
 
 # ---- install our 11 extensions via the openclaw plugin registry -------
 # `--link` points the registry at /app/extensions/<id>/ (read-only image) so
@@ -238,17 +260,40 @@ if not config["gateway"]["controlUi"].get("allowedOrigins"):
 # bots only needs adding TELEGRAM_BOT_TOKEN to .env without touching this.
 # We use long-polling, dmPolicy=allowlist, allowFrom = operator user id.
 # No public endpoint required.
-inbound_token = (
-    os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    or os.environ.get("OASIS_TELEGRAM_BOT_TOKEN", "").strip()
-    or None
+#
+# The token is written as a SECRET REF, never as a literal. openclaw's native
+# form — {"source":"env","provider":"default","id":"<ENV_VAR>"} — is resolved at
+# runtime, so openclaw.json holds a POINTER and no credential at rest. This was
+# the fifth copy: the plugin-config dedupe (approval-gate, secrets-vault,
+# prompt-injection-reporting, clawhub-skill-audit) never touched the native
+# CHANNEL config, so a plaintext bot token stayed in every bot's openclaw.json.
+# Van Helsing reported reading it and was right.
+#
+# SCOPE, precisely: this removes the persisted AT-REST copy (config volume,
+# backups, `docker cp`, volume snapshots) and makes rotation a restart instead of
+# a config rewrite. It does NOT hide the token from an agent that can exec —
+# `agents.sandbox` is null on this fleet, so openclaw's env sanitizer
+# (BLOCKED_ENV_VAR_PATTERNS) does not apply and `printenv` still resolves it.
+# Containing THAT is the uid/netns exec sandbox, tracked separately.
+inbound_env_name = (
+    "TELEGRAM_BOT_TOKEN"
+    if os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    else ("OASIS_TELEGRAM_BOT_TOKEN"
+          if os.environ.get("OASIS_TELEGRAM_BOT_TOKEN", "").strip()
+          else None)
 )
 operator_user_id = os.environ.get("OASIS_TELEGRAM_CHAT_ID", "").strip() or None
-if inbound_token:
+if inbound_env_name:
     channels = config.setdefault("channels", {})
     tg = channels.setdefault("telegram", {})
     tg["enabled"] = True
-    tg["botToken"] = inbound_token  # config beats env per docs
+    # Assigned (not setdefault'd) so an existing plaintext token from a prior
+    # boot is REPLACED by the ref rather than left in place.
+    tg["botToken"] = {
+        "source": "env",
+        "provider": "default",
+        "id": inbound_env_name,
+    }
     tg["dmPolicy"] = "allowlist"
     if operator_user_id and operator_user_id.lstrip("-").isdigit():
         existing_allow = tg.get("allowFrom") or []
@@ -293,23 +338,19 @@ def merge_config(plugin_id, defaults, hooks=None):
         for k, v in hooks.items():
             h.setdefault(k, v)
 
-# Telegram creds flow from compose env (.env on host) into plugin config here.
-# We DON'T log values; entries.* are written to disk inside the volume only.
-tg_token = os.environ.get("OASIS_TELEGRAM_BOT_TOKEN", "").strip() or None
-tg_chat = os.environ.get("OASIS_TELEGRAM_CHAT_ID", "").strip() or None
-
+# Telegram creds: each of the 4 alerting plugins (prompt-injection-reporting,
+# secrets-vault, approval-gate, clawhub-skill-audit below) reads
+# OASIS_TELEGRAM_BOT_TOKEN / OASIS_TELEGRAM_CHAT_ID from process.env directly
+# at register() — same convention as ANTHROPIC_API_KEY below. Previously this
+# copied the literal token into 4 separate entries.*.config blocks in
+# openclaw.json (one persisted plaintext copy per plugin, readable via the
+# bot's own `cat`); now there is exactly one copy of the secret at rest — the
+# container's env — and nothing plugin-config-shaped to keep in sync on
+# rotation. cfg.telegramBotToken/telegramChatId remain valid as an explicit
+# manual override in openclaw.json, they're just never written here.
 prompt_inj_cfg = {"attackLogDir": str(home / ".openclaw/logs/attacks")}
 secrets_cfg = {"secretsDir": str(home / ".openclaw/state/secrets")}
 approval_cfg = {}
-if tg_token:
-    prompt_inj_cfg["telegramBotToken"] = tg_token
-    secrets_cfg["telegramBotToken"] = tg_token
-    approval_cfg["telegramBotToken"] = tg_token
-if tg_chat:
-    # Naming differs between plugins by design (alert vs interactive chat).
-    prompt_inj_cfg["telegramAlertChatId"] = tg_chat
-    secrets_cfg["telegramAlertChatId"] = tg_chat
-    approval_cfg["telegramChatId"] = tg_chat
 
 merge_config("prompt-injection-reporting", prompt_inj_cfg)
 merge_config("secrets-vault", secrets_cfg)
@@ -354,6 +395,23 @@ config.setdefault("agents", {})
 config["agents"].setdefault("defaults", {})
 config["agents"]["defaults"].setdefault("compaction", {})
 config["agents"]["defaults"]["compaction"]["provider"] = "swarm-compact"
+
+# compaction reserve — the headroom kept below the model window. The runtime's
+# auto-compaction threshold is `contextWindow - reserveTokensFloor - softThreshold`
+# (softThreshold defaults to 4000), and it keys off reserveTokensFloor, NOT the
+# plain `reserveTokens` — which is itself floored UP to reserveTokensFloor
+# (default 20000). So BOTH keys must be set or the 20000 floor wins and a bare
+# reserveTokens=5000 is silently ignored. With 5000 the compaction line sits at
+# window-9000. sleep-cycle's context-nap (preemptTokens=9000) fires just BEFORE
+# that line, so a ballooned session gets a free archive+reset instead of paying
+# native compaction — native compaction stays only as the ceiling safety-net.
+try:
+    _compaction_reserve = int(os.environ.get("OASIS_COMPACTION_RESERVE_TOKENS", "").strip() or "5000")
+except ValueError:
+    _compaction_reserve = 5000
+_compaction_reserve = max(1000, _compaction_reserve)
+config["agents"]["defaults"]["compaction"]["reserveTokens"] = _compaction_reserve
+config["agents"]["defaults"]["compaction"]["reserveTokensFloor"] = _compaction_reserve
 
 # ---- heartbeat cadence + active-hours (runtime efficiency) --------------
 # openclaw's DEFAULT agent self-wakes every 30m (DEFAULT_HEARTBEAT_EVERY),
@@ -411,8 +469,9 @@ if _hb_start and _hb_end:
     )
 
 # clawhub-skill-audit: Opus 4.7 security review on every newly installed skill,
-# trail at ~/.openclaw/logs/skill-audits. ANTHROPIC_API_KEY is read by the
-# plugin from env directly so we don't have to copy it into the JSON config.
+# trail at ~/.openclaw/logs/skill-audits. ANTHROPIC_API_KEY and the Telegram
+# creds are read by the plugin from env directly so we don't have to copy them
+# into the JSON config (see the telegram-creds comment above).
 # Quarantine + auditModel are intentionally not defaulted from the merge
 # layer — change them by editing entries["clawhub-skill-audit"].config in
 # openclaw.json directly when you want a non-default policy.
@@ -423,10 +482,6 @@ skill_audit_cfg = {
         str(home / ".openclaw/workspace/skills"),
     ],
 }
-if tg_token:
-    skill_audit_cfg["telegramBotToken"] = tg_token
-if tg_chat:
-    skill_audit_cfg["telegramAlertChatId"] = tg_chat
 quarantine_dir = os.environ.get("OASIS_SKILL_AUDIT_QUARANTINE_DIR", "").strip() or None
 if quarantine_dir:
     skill_audit_cfg["quarantineDir"] = quarantine_dir
@@ -488,19 +543,48 @@ entries["sleep-cycle"]["config"]["enabled"] = (
     (os.environ.get("OASIS_SLEEP_ENABLED", "").strip() or "1") == "1"
 )
 
-# tools.alsoAllow: re-admit the `sleep_deep` TOOL past the tools.profile filter.
-# The automatic deep-sleep reset needs no tool (it's openclaw's native session
-# reset — see below), but we keep sleep_deep for MANUAL on-demand resets. The
-# active tool profile (`coding` on this fleet) strips plugin tools before the
-# agent's allowlist resolves, so without this the model can't call sleep_deep
-# even when you ask it to. alsoAllow merges into the profile's allow list
-# (openclaw tool-policy `mergeAlsoAllowPolicy`), exempting exactly this one
-# plugin tool without loosening the profile for anything else. Under a
-# permissive profile (`full`) it's a harmless no-op. Mirror the plugin's
-# enabled flag; preserve any operator-added entries.
+# context-nap: the CONTEXT-THRESHOLD deep-sleep. Same archive+reset+waking-
+# summary cycle as the nightly deep-sleep, but triggered when a session's live
+# prompt crosses `thresholdRatio` of the ACTIVE model's window — model-aware, so
+# a small fallback model naps sooner than the big primary for the same work.
+# `preemptTokens` MUST equal the compaction reserve + softThreshold (4000) so
+# the nap fires just before native compaction would; we derive it from the same
+# reserve set above to keep them locked together. setdefault semantics: operator
+# overrides in a volume-persisted config are preserved; only unset keys are
+# seeded. `enabled` is force-set from OASIS_CONTEXT_NAP_ENABLED (default on).
+_nap_cfg = entries["sleep-cycle"]["config"].setdefault("contextNap", {})
+_nap_cfg.setdefault("preemptTokens", _compaction_reserve + 4000)
+try:
+    _nap_ratio = float(os.environ.get("OASIS_CONTEXT_NAP_RATIO", "").strip() or "0.85")
+except ValueError:
+    _nap_ratio = 0.85
+_nap_cfg.setdefault("thresholdRatio", max(0.1, min(0.99, _nap_ratio)))
+_nap_cfg["enabled"] = (
+    (os.environ.get("OASIS_CONTEXT_NAP_ENABLED", "").strip() or "1") == "1"
+)
+
+# ---- Layer 1: tools.profile from role.yaml (CLAW-047) --------------------
+# When the role compiler runs, it exports OASIS_TOOLS_PROFILE (e.g. "coding").
+# This overrides the profile on every boot so the running bot's tool surface
+# matches its role manifest. Without a role.yaml the profile is whatever
+# openclaw defaults to or whatever the operator set in openclaw.json.
 tools_cfg = config.setdefault("tools", {})
+role_profile = os.environ.get("OASIS_TOOLS_PROFILE", "").strip()
+if role_profile:
+    tools_cfg["profile"] = role_profile
+
+# ---- Layer 1: tools.alsoAllow (role.yaml seed + sleep-cycle toggle) ------
+# Re-admit specific tools past the tools.profile filter. Role.yaml's
+# `tools.alsoAllow` seeds the list (CLAW-047); the sleep-cycle enabled/disabled
+# toggle still applies on top (sleep_deep is only useful when the plugin is
+# active). Under a permissive profile (`full`) this is a harmless no-op.
 also = tools_cfg.get("alsoAllow")
 also = list(also) if isinstance(also, list) else []
+role_also_allow = os.environ.get("OASIS_TOOLS_ALSO_ALLOW", "").strip()
+if role_also_allow:
+    for item in (x.strip() for x in role_also_allow.split(",") if x.strip()):
+        if item not in also:
+            also.append(item)
 if entries["sleep-cycle"]["config"]["enabled"]:
     if "sleep_deep" not in also:
         also.append("sleep_deep")
@@ -798,6 +882,203 @@ elif not existing_primary:
     fallback_model = "anthropic/claude-sonnet-4-6"
     config["agents"]["defaults"]["model"]["primary"] = fallback_model
     print(f"[entrypoint] no OPENCLAW_DEFAULT_MODEL set; defaulting to {fallback_model}")
+
+# ---- oasis-generation provider (durable GEN-003 wiring) ----------------
+# Registers the unified inference gateway as an openai-completions provider IF
+# this bot's .env carries a service token — so ONLY bots pointed at the gateway
+# get it (Nimbus today; VH etc. can't reach it under the current egress rules).
+# Replaces the hand-injected 2026-07-13 live block (which had only the two Gemma
+# models) with the canonical catalog: local Gemma + the Bedrock-proxied frontier
+# models (GEN-003). The apiKey comes from env (never hardcoded in this committed
+# script) and MUST match the gateway's OASIS_GENERATION_SERVICE_TOKENS.
+oasis_gen_token = os.environ.get("OASIS_GENERATION_TOKEN", "").strip()
+oasis_gen_url = (
+    os.environ.get("OASIS_GENERATION_URL", "").strip() or "http://host.docker.internal:8800/v1"
+)
+if oasis_gen_token:
+    def _gen_model(mid, name, ctx):
+        # input=text only: the gateway's Bedrock passthrough is text-only in v0
+        # (images are dropped), so we don't advertise vision. cost=0 because
+        # metering happens at the gateway, not per-bot.
+        return {
+            "id": mid,
+            "name": name,
+            "reasoning": True,
+            "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": ctx,
+            "maxTokens": 8192,
+        }
+
+    # Display names carry only the backend tag ("(Bedrock)" / "(Local)"); the
+    # provider grouping ("oasis-generation") already supplies the rest, and
+    # repeating it here just ran the model name off the left edge of the
+    # Telegram model-picker button (unreadable). See §/models UX note in the
+    # generative plan.
+    gen_models = [
+        _gen_model("gemma-4-12b-coder", "Gemma-4 12B Coder (Local)", 32768),
+        _gen_model("gemma-4-12b-agentic", "Gemma-4 12B Agentic (Local)", 32768),
+        _gen_model("claude-sonnet-4-6", "Claude Sonnet 4.6 (Bedrock)", 200000),
+        _gen_model("claude-opus-4-8", "Claude Opus 4.8 (Bedrock)", 200000),
+        _gen_model("claude-haiku-4-5", "Claude Haiku 4.5 (Bedrock)", 200000),
+        _gen_model("gpt-oss-120b", "GPT-OSS 120B (Bedrock)", 131072),
+        _gen_model("glm-5", "GLM-5 (Bedrock)", 131072),
+        _gen_model("deepseek-v3.2", "DeepSeek V3.2 (Bedrock)", 131072),
+        _gen_model("llama-4-maverick", "Llama 4 Maverick (Bedrock)", 131072),
+    ]
+    config.setdefault("models", {}).setdefault("providers", {})["oasis-generation"] = {
+        "baseUrl": oasis_gen_url,
+        "apiKey": oasis_gen_token,
+        "api": "openai-completions",
+        "models": gen_models,
+    }
+    print(f"[entrypoint] oasis-generation provider: {len(gen_models)} models @ {oasis_gen_url}")
+
+    # Surface the WHOLE roster in /models. openclaw's default model picker lists
+    # only the allowlist (agents.defaults.models) ∪ fallbacks ∪ default — and,
+    # because a non-empty allowlist is also an ENFORCED gate, a model missing
+    # from it can't even be `/model`-selected (not just hidden). So without this
+    # the Bedrock roster registers but only the 2-3 fallback/default refs are
+    # both visible and selectable. Seed each oasis-generation model into the
+    # allowlist (seed-if-absent: the model-switcher plugin's curation of OTHER
+    # providers is untouched; a deliberate removal returns on the next recreate,
+    # acceptable given the intent is a stable, fully-visible roster).
+    _allow = config.setdefault("agents", {}).setdefault("defaults", {}).setdefault("models", {})
+    _seeded = [f"oasis-generation/{m['id']}" for m in gen_models
+               if f"oasis-generation/{m['id']}" not in _allow]
+    for _k in _seeded:
+        _allow[_k] = {}
+    if _seeded:
+        print(f"[entrypoint] oasis-generation: seeded {len(_seeded)} model(s) into the /models allowlist")
+
+# ---- durable model fallback chain (OPENCLAW_MODEL_FALLBACKS) ------------
+# Comma-separated provider/model refs. Set per-bot in .env so the chain survives
+# a volume wipe (the model-switcher plugin only manages primary + catalog, not
+# fallbacks). Nimbus uses this to fail over a low-credit direct-Anthropic key to
+# Bedrock Claude (billed to the personal oasis-dev account) before dropping tier.
+fallbacks_env = os.environ.get("OPENCLAW_MODEL_FALLBACKS", "").strip()
+if fallbacks_env:
+    fbs = [f.strip() for f in fallbacks_env.split(",") if f.strip()]
+    config["agents"]["defaults"]["model"]["fallbacks"] = fbs
+    print(f"[entrypoint] model fallbacks: {fbs}")
+
+# ---- Layer 2: exec allow-list policy (CLAW-032, safe-auto-mode §2c) -----
+# openclaw's exec policy lives in its OWN file, exec-approvals.json (NOT
+# openclaw.json): `defaults.{security,ask,askFallback}` = the gate mode,
+# `agents.<id>.allowlist[]` = per-agent command allowlist (each entry matches an
+# EXECUTABLE basename, optional argPattern — there is no full-command glob).
+# openclaw normalize-PRESERVES this file on boot (the socket + reactively-learned
+# `allow-always` approvals survive), so we MERGE, never clobber — that keeps the
+# reactive Telegram-approval feeder's learnings durable across recreate (the
+# continuity-always rule). GATED on OASIS_EXEC_SECURITY being set, so ONLY bots
+# that opt in (Van Helsing today) get the allowlist gate; unset => openclaw's
+# built-in default (security=full, i.e. unrestricted) is left untouched for the
+# rest of the fleet. OASIS_EXEC_ALLOWLIST comes from one of two sources:
+#   (a) CLAW-047 role compiler — if /app/role.yaml is mounted, the compiler
+#       exports OASIS_EXEC_ALLOWLIST from role.yaml's ACTIVE exec.allow tier.
+#   (b) compose env fallback — if no role.yaml, the hand-maintained env var
+#       in the bot's compose overlay (legacy, pre-CLAW-047).
+exec_security = os.environ.get("OASIS_EXEC_SECURITY", "").strip()
+if exec_security:
+    ea_path = config_path.parent / "exec-approvals.json"
+    try:
+        ea = json.loads(ea_path.read_text())
+        if not isinstance(ea, dict):
+            ea = {}
+    except Exception:
+        ea = {}
+    ea.setdefault("version", 1)
+    # mode in defaults (inherited by all this bot's agents); env-authoritative.
+    ea_def = ea.setdefault("defaults", {})
+    # Valid openclaw enums (6.11): security ∈ {deny, allowlist, full};
+    # ask ∈ {off, on-miss, always}; askFallback ∈ {deny, ...}. "on-miss" = ask a
+    # reviewer only when a command MISSES the allowlist (allowlisted runs silent).
+    # An invalid value is DROPPED by openclaw's sanitizer (e.g. "on" → ask unset →
+    # no escalation), so these defaults must be exact.
+    ea_def["security"] = exec_security
+    ea_def["ask"] = os.environ.get("OASIS_EXEC_ASK", "").strip() or "on-miss"
+    ea_def["askFallback"] = os.environ.get("OASIS_EXEC_ASK_FALLBACK", "").strip() or "deny"
+    # autoReview: when true, an allowlist MISS is first judged by openclaw's
+    # model-backed exec reviewer (see src/infra/exec-auto-review.ts) — allow-once
+    # for a clearly-safe single execution, otherwise fall through to the ask path
+    # (which, with mode=session forwarding below, prompts Mike in Telegram). This
+    # is what makes a real shell usable safely: the reviewer reasons about the
+    # WHOLE command (pipeline segments, cwd, env keys, inline-eval) in context
+    # instead of a basename allowlist match, and it treats the command as
+    # untrusted data (won't follow embedded instructions). The static allowlist
+    # stays as the zero-latency fast-path; only misses pay a review. Needs
+    # ask != "off" to have an escalation target. Env-gated + default OFF so a bot
+    # that doesn't opt in keeps the strict static-allowlist-only floor. Reviewer
+    # MODEL is set separately via OASIS_EXEC_REVIEWER_MODEL (tools.exec.reviewer)
+    # below; omit it to reuse the bot's own agent model.
+    _auto = os.environ.get("OASIS_EXEC_AUTOREVIEW", "").strip().lower()
+    ea_def["autoReview"] = _auto in ("1", "true", "yes", "on")
+    # allowlist in agents.main — UNION seed patterns with existing entries,
+    # dedup by (pattern, argPattern). Preserve learned entries verbatim (they
+    # carry source/lastUsedAt). Patterns are lowercased by openclaw on load.
+    agents_ea = ea.setdefault("agents", {})
+    main_ea = agents_ea.setdefault("main", {})
+    existing = main_ea.get("allowlist")
+    existing = existing if isinstance(existing, list) else []
+    seen = set()
+    merged = []
+    for e in existing:
+        if isinstance(e, dict) and str(e.get("pattern", "")).strip():
+            k = (str(e["pattern"]).strip().lower(), str(e.get("argPattern", "")).strip().lower())
+            if k not in seen:
+                seen.add(k); merged.append(e)
+    seed_raw = os.environ.get("OASIS_EXEC_ALLOWLIST", "")
+    for tok in seed_raw.replace(";", "\n").replace(",", "\n").splitlines():
+        p = tok.strip()
+        if not p or p.startswith("#"):
+            continue
+        k = (p.lower(), "")
+        if k not in seen:
+            seen.add(k); merged.append({"pattern": p})
+    main_ea["allowlist"] = merged
+    ea_path.write_text(json.dumps(ea, indent=2) + "\n")
+    try:
+        os.chmod(ea_path, 0o600)
+    except OSError:
+        pass
+    print(f"[entrypoint] exec policy: security={ea_def['security']} ask={ea_def['ask']} "
+          f"askFallback={ea_def['askFallback']} autoReview={ea_def['autoReview']} "
+          f"allowlist={len(merged)} patterns (seeded {len(merged) - len(existing)} new)")
+
+# ---- Layer 2b: exec-approval FORWARDING to a channel (CLAW-035) ---------
+# openclaw's native `approvals.exec` (in openclaw.json) routes a miss's approval
+# prompt to an operational CHANNEL. Without it, the ask=on-miss path has the
+# agent's own gateway-client try to self-grant the `operator.approvals` scope,
+# which needs device pairing a headless bot lacks — the GatewayTransportError
+# ("pairing required") the 2026-07-15 live test surfaced. mode="session" delivers
+# the prompt back to the ORIGIN chat; for a Telegram-driven turn that's the
+# operator's DM, so no chat-id needs hardcoding. modes: session|targets|both.
+# Gated on OASIS_EXEC_APPROVAL_MODE (unset => forwarding stays off, openclaw
+# default). agentFilter scopes it to this bot's main agent.
+exec_approval_mode = os.environ.get("OASIS_EXEC_APPROVAL_MODE", "").strip()
+if exec_approval_mode:
+    approvals_cfg = config.setdefault("approvals", {})
+    exec_fwd = approvals_cfg.setdefault("exec", {})
+    exec_fwd["enabled"] = True
+    exec_fwd["mode"] = exec_approval_mode
+    exec_fwd.setdefault("agentFilter", ["main"])
+    print(f"[entrypoint] exec-approval forwarding: enabled mode={exec_approval_mode} agentFilter=['main']")
+
+# ---- Layer 2c: exec reviewer model (tools.exec.reviewer.model) -----------
+# Optional cheap/fast model for the OASIS_EXEC_AUTOREVIEW reviewer. Omit to
+# reuse the bot's own agent model (guaranteed reachable + valid, but pricier per
+# miss). Set to a small model to cut review latency/cost. CONSTRAINT: must be a
+# model this bot can actually reach — sandboxed bots egress-lock to the core
+# allowlist whose only model host is .anthropic.com, so use anthropic/* (e.g.
+# anthropic/claude-haiku-4-5) or leave unset. A google/* or openai/* reviewer
+# would hang then time out (30s) → fall back to human ask on every miss.
+exec_reviewer_model = os.environ.get("OASIS_EXEC_REVIEWER_MODEL", "").strip()
+if exec_reviewer_model:
+    tools_cfg = config.setdefault("tools", {})
+    exec_tcfg = tools_cfg.setdefault("exec", {})
+    reviewer_tcfg = exec_tcfg.setdefault("reviewer", {})
+    reviewer_tcfg["model"] = exec_reviewer_model
+    print(f"[entrypoint] exec reviewer model: {exec_reviewer_model}")
 
 config_path.parent.mkdir(parents=True, exist_ok=True)
 config_path.write_text(json.dumps(config, indent=2) + "\n")

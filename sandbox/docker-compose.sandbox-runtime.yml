@@ -180,6 +180,17 @@ networks:
   oasis_sandboxed:
     driver: bridge
     internal: true
+    # Subnet PINNED so the per-bot static addresses in the reach overlays are
+    # meaningful — an auto-assigned subnet can move between Docker restarts, which
+    # would invalidate every ipv4_address at once. 172.30.0.0/16 is free today and sits at the
+    # TOP of Docker's 172.17-31 default pool, which fills from the bottom — 172.22
+    # collided on the first attempt because a sibling network claimed it the instant
+    # ours released it. Bots occupy 172.30.10.11-15; everything else
+    # (proxy, voice, semantics) keeps a dynamic address from the low end.
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+          gateway: 172.30.0.1
   # Outbound bridge — only the egress-proxy and the vetting service are attached.
   # Neither is reachable from oasis_sandboxed, so a bot can reach the proxy's
   # LISTEN port on the internal side and nothing else.
