@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""
+claw-approve — grant a bot's AGENT device the narrow exec-approval scope (CLAW-049).
+
+THE PROBLEM THIS SOLVES
+
+Under `ask=on-miss`, an allowlist miss makes the runtime register an exec
+approval, which needs `operator.approvals`. A fresh bot does not have it, so the
+first miss dies with "pairing required: device is asking for more scopes than
+currently approved". Granting that scope by hand has two traps, and this tool
+exists because both were hit live:
+
+  TRAP 1 — the admin bundle. Triggering the request by running `openclaw devices
+  approve <dummy>` seems reasonable, but approving devices is ITSELF an admin
+  action, so the request THAT connection generates asks for `operator.admin`.
+  Approve it and the bot gets admin instead of the narrow scope. (This happened
+  to Kolmogorov and Yes Man; both had to be unpaired and re-approved.)
+
+  TRAP 2 — the circular CLI. `openclaw devices approve <id>` connects to the
+  gateway first, and that connect needs `operator.approvals` — the very scope
+  being granted. So the CLI mints a NEW request for itself, invalidates the one
+  you were approving ("unknown requestId"), and cannot approve either.
+
+  The escape is `--token`: the gateway token authenticates directly and needs no
+  device scope at all. It also means the CLI device never needs a standing
+  elevated credential — which matters, because the CLI runs as the SAME uid as
+  the agent inside the container, so a persistent `operator.approvals` on the CLI
+  device would be readable by a prompt-injected agent and is precisely the
+  CLAW-049 self-approve path. Reject those; use the token.
+
+WHAT IT REFUSES
+
+  • any request whose requested scopes include `operator.admin` (or anything
+    outside ALLOWED_SCOPES) — the guard against trap 1
+  • requests from non-agent devices by default (`clientId: cli`), so approving
+    never leaves an elevated credential sitting where the agent can read it
+
+Only the AGENT's own device, asking only for approvals/pairing, is approvable —
+and that request can only be minted by the agent's own exec miss, never by this
+tool. The human decision stays "should this bot escalate exec at all", not
+"which of these opaque request ids is safe".
+
+Usage:
+  claw-approve <bot>                 # approve the agent request pending right now
+  claw-approve <bot> --watch [--timeout 300]
+                                     # wait for one to appear, then approve it
+  claw-approve <bot> --list          # show pending + paired, decide nothing
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+import time
+
+# The narrow scopes an agent device legitimately needs to escalate an exec
+# approval. operator.admin is deliberately absent and must stay absent.
+ALLOWED_SCOPES = {"operator.approvals", "operator.pairing", "operator.read"}
+
+
+def container(bot):
+    return f"oasis-claw-{bot}"
+
+
+def gateway_token(bot):
+    """Read gateway.auth.token from the bot's own config. Never printed."""
+    out = subprocess.run(
+        ["docker", "exec", container(bot), "python3", "-c",
+         "import json;print(json.load(open('/home/node/.openclaw/openclaw.json'))"
+         "['gateway']['auth']['token'])"],
+        capture_output=True, text=True, timeout=30,
+    )
+    tok = out.stdout.strip()
+    if not tok:
+        raise SystemExit(f"[claw-approve] no gateway token in {container(bot)}: {out.stderr.strip()[:200]}")
+    return tok
+
+
+def devices(bot, token):
+    """`devices list --json` via token auth. Tolerates the doctor-warning preamble
+    openclaw prints before the JSON."""
+    out = subprocess.run(
+        ["docker", "exec", "-e", f"GWT={token}", container(bot), "sh", "-c",
+         'openclaw devices list --token "$GWT" --json 2>/dev/null'],
+        capture_output=True, text=True, timeout=60,
+    )
+    raw = out.stdout
+    i = raw.find("{")
+    if i < 0:
+        raise SystemExit(f"[claw-approve] no JSON from devices list: {raw[:200]}")
+    return json.loads(raw[i:])
+
+
+def requested_scopes(req):
+    for k in ("requestedScopes", "scopes", "requested"):
+        v = req.get(k)
+        if isinstance(v, list):
+            return set(v)
+        if isinstance(v, dict) and isinstance(v.get("scopes"), list):
+            return set(v["scopes"])
+    return set()
+
+
+def agent_requests(pending, allow_cli=False):
+    out = []
+    for r in pending:
+        client = (r.get("clientId") or "").lower()
+        if not allow_cli and client == "cli":
+            continue
+        out.append(r)
+    return out
+
+
+def approve(bot, token, req):
+    rid = req.get("requestId")
+    scopes = requested_scopes(req)
+    extra = scopes - ALLOWED_SCOPES
+    if extra:
+        raise SystemExit(
+            f"[claw-approve] REFUSING {rid}: requests {sorted(extra)} beyond the narrow set "
+            f"{sorted(ALLOWED_SCOPES)}. This is the admin-bundle trap — do NOT approve it; "
+            f"reject it and let the agent's own exec miss mint a clean request."
+        )
+    print(f"[claw-approve] approving {rid} (clientId={req.get('clientId')}) scopes={sorted(scopes)}")
+    out = subprocess.run(
+        ["docker", "exec", "-e", f"GWT={token}", container(bot), "sh", "-c",
+         f'openclaw devices approve {rid} --token "$GWT" 2>&1'],
+        capture_output=True, text=True, timeout=60,
+    )
+    line = [l for l in out.stdout.splitlines()
+            if l.strip() and not l.startswith(("│", "├", "◇", "-"))
+            and "legacy" not in l and "SQLite" not in l]
+    print("   " + (line[-1].strip() if line else out.stdout.strip()[:200]))
+    return out.returncode == 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("bot")
+    ap.add_argument("--watch", action="store_true",
+                    help="wait for an agent request to appear, then approve it")
+    ap.add_argument("--timeout", type=int, default=300, help="--watch timeout (s)")
+    ap.add_argument("--interval", type=int, default=5)
+    ap.add_argument("--list", action="store_true", help="show state, change nothing")
+    ap.add_argument("--allow-cli", action="store_true",
+                    help="also approve cli-device requests (NOT recommended: the cli "
+                         "runs as the agent's uid, so a standing elevated device "
+                         "credential there is the CLAW-049 self-approve path)")
+    args = ap.parse_args()
+
+    token = gateway_token(args.bot)
+
+    if args.list:
+        d = devices(args.bot, token)
+        print(f"pending ({len(d.get('pending', []))}):")
+        for r in d.get("pending", []):
+            print(f"  {r.get('requestId')}  clientId={r.get('clientId')}  "
+                  f"requested={sorted(requested_scopes(r))}")
+        print(f"paired ({len(d.get('paired', []))}):")
+        for e in d.get("paired", []):
+            print(f"  {e.get('deviceId','')[:16]}…  clientId={e.get('clientId')}  "
+                  f"scopes={e.get('scopes')}")
+        return 0
+
+    deadline = time.time() + (args.timeout if args.watch else 0)
+    while True:
+        d = devices(args.bot, token)
+        reqs = agent_requests(d.get("pending", []), allow_cli=args.allow_cli)
+        if reqs:
+            # Newest last — approve the freshest, since each connect supersedes
+            # the previous one and stale ids fail with "unknown requestId".
+            return 0 if approve(args.bot, token, reqs[-1]) else 1
+        if not args.watch or time.time() >= deadline:
+            print(f"[claw-approve] no agent request pending for {args.bot}. "
+                  f"One is minted only by the agent's OWN exec allowlist miss — "
+                  f"send the bot a task needing a non-allowlisted command, "
+                  f"then re-run (or use --watch).")
+            return 2
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

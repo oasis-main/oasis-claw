@@ -120,7 +120,7 @@ wait-ready:
 WATCHDOG_DIR := $(HOME)/Library/Application Support/oasis-x
 WATCHDOG_PLIST := $(HOME)/Library/LaunchAgents/com.oasis-x.nimbus-watchdog.plist
 
-.PHONY: watchdog-install watchdog-status watchdog-uninstall
+.PHONY: watchdog-install watchdog-status watchdog-uninstall egress-check egress-sync
 
 watchdog-install: ## (re)deploy + load the nimbus telegram-channel watchdog — re-run after editing the script
 	@mkdir -p "$(WATCHDOG_DIR)"
@@ -140,3 +140,10 @@ watchdog-status: ## show the watchdog's last exit code (0 = healthy; 126 = TCC-b
 watchdog-uninstall: ## unload the watchdog
 	@launchctl bootout gui/$$(id -u)/com.oasis-x.nimbus-watchdog 2>/dev/null || true
 	@echo "watchdog unloaded"
+
+# ── egress partitioning health ───────────────────────────────────────────────
+egress-check: ## verify client.map still matches live bot IPs (CLAW-050 isolation)
+	@python3 ./scripts/claw-egress-sync --check
+
+egress-sync: ## regenerate client.map from live bot IPs after a restart/recreate
+	@python3 ./scripts/claw-egress-sync
