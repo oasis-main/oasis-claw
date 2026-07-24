@@ -1,0 +1,19 @@
+{
+  "name": "@oasis-claw/genconfig",
+  "version": "0.1.0",
+  "description": "openclaw plugin: /genconfig — per-model inference config (profile/effort/max_tokens) driven by the oasis-generation gateway's /v1/models capability descriptors",
+  "type": "module",
+  "devDependencies": {
+    "openclaw": "2026.6.11",
+    "vitest": "^3.0.0"
+  },
+  "scripts": {
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest --passWithNoTests"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

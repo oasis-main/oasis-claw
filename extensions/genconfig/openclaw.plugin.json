@@ -1,0 +1,15 @@
+{
+  "id": "genconfig",
+  "name": "Generation Config",
+  "description": "Per-model inference configuration for the oasis-generation gateway. Registers a /genconfig slash command (and read-only agent tools) that fetch the gateway's /v1/models capability descriptors and render only the controls each model actually supports — a fast/balanced/deep profile as the primary control, with effort / max_tokens as advanced knobs, and no temperature control for models that reject it. Selecting a profile writes the gateway override (reasoning_effort + max_tokens) into agents.defaults for the currently-active oasis-generation model via api.runtime.config.replaceConfigFile (afterWrite.mode=auto → hot reload). The gateway remains the source of truth: with no override it applies each model's default profile.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "providerId": {
+        "type": "string",
+        "description": "openclaw provider key that maps to the oasis-generation gateway (its models.providers.<id>). Defaults to \"oasis-generation\"."
+      }
+    }
+  }
+}
