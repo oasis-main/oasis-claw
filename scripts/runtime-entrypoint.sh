@@ -178,6 +178,10 @@ declare -A PLUGINS=(
   [secrets-vault]="--dangerously-force-unsafe-install"
   [approval-gate]=""
   [session-history]=""
+  # oasis-reviewer: independent before_tool_call reviewer (CLAW-074,
+  # .swarm/UNIFIED_REVIEWER.md). Skeleton phase = SHADOW (audit-only, never
+  # blocks). Gated per-bot via OASIS_REVIEWER_ENABLE so it lands on yesman first.
+  [oasis-reviewer]=""
   [dot-swarm]=""
   # clawhub-skill-audit's audit-prompt.ts intentionally contains the
   # exact "dynamic code execution" string patterns the auditor looks
@@ -384,6 +388,20 @@ merge_config(
     # Non-bundled plugins must explicitly opt in to llm_input/llm_output hooks.
     # session-history's whole purpose is recording the transcript, so this is
     # required for it to do its job.
+    hooks={"allowConversationAccess": True},
+)
+# oasis-reviewer (CLAW-074, .swarm/UNIFIED_REVIEWER.md). The before_tool_call
+# hook is only WIRED for a non-bundled plugin when it declares explicit hook
+# policy (gateway-startup-plugin-ids.ts hasExplicitHookPolicyConfig); without
+# this the plugin loads + register() runs but the gateway never invokes the hook
+# (verified 2026-07-26: register fired, audit dir created, zero hook calls, while
+# session-history captured the same turns). allowConversationAccess also lets the
+# reviewer see the stated goal for its "act only in service of Mike's intent"
+# principle — the constitution primes it to treat all such content as untrusted
+# data. Skeleton config = SHADOW (audit-only, never blocks).
+merge_config(
+    "oasis-reviewer",
+    {"mode": "shadow", "auditDir": str(home / ".openclaw/logs/reviewer")},
     hooks={"allowConversationAccess": True},
 )
 merge_config("dot-swarm", {

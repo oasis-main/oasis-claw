@@ -1,0 +1,20 @@
+{
+  "id": "oasis-reviewer",
+  "name": "Oasis Reviewer",
+  "description": "Independent before_tool_call reviewer. Evaluates exec/file/web tool calls against Mike's two-layer policy (hard gitignore constraints + natural-language constitution) with verdicts allow/deny/escalate/alert. Skeleton phase: shadow/audit-only. See .swarm/UNIFIED_REVIEWER.md.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "mode": {
+        "type": "string",
+        "enum": ["shadow", "enforce"],
+        "description": "shadow = log the verdict it WOULD give, never block (calibration). enforce = act on verdicts. Skeleton ships shadow."
+      },
+      "auditDir": {
+        "type": "string",
+        "description": "Directory for reviewer audit JSONL (default: <stateDir>/logs/reviewer)"
+      }
+    }
+  }
+}
