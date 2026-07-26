@@ -302,10 +302,33 @@ if inbound_env_name:
         tg["allowFrom"] = existing_allow
     # Group adds disabled by default; require explicit opt-in via .env later.
     tg.setdefault("groups", {})
+    # Faster recovery from a wedged getUpdates long-poll (CLAW-072). openclaw's
+    # polling monitor force-restarts the channel after pollingStallThresholdMs of a
+    # stuck poll (default 120s). The long-poll is timeout:30, so 75s (2.5x) trims
+    # openclaw's own self-heal while staying safely above a healthy long-poll
+    # (openclaw clamps to [30s, 10m]). NOTE the biggest stalls are macOS-sleep
+    # wedges — recovered on wake; the fleet watchdog (make watchdog-install, 90s) is
+    # the primary fast-recovery path. This is a modest secondary trim.
+    tg["pollingStallThresholdMs"] = 75000
 
 # ---- per-plugin config (registration is handled by `plugins install`) ----
 plugins = config.setdefault("plugins", {})
 entries = plugins.setdefault("entries", {})
+
+# CLAW-073 / openclaw 2026.7.1 upgrade: `codex` was UNBUNDLED from core into a
+# separate npm package (@openclaw/codex). On upgrade, core-plugin convergence
+# (src/cli/update-cli/post-core-plugin-convergence.ts) finds the stale 4.26-era
+# install record, sees the payload is gone, and tries to `npm install` it. Our
+# egress proxy is fail-closed and denies registry.npmjs.org, so that returns
+# E403 -> "startup migrations did not complete cleanly" -> THE GATEWAY REFUSES
+# TO REPORT READY AND NEVER LISTENS. 6.11 tolerated this; 7.1 does not.
+# Convergence drops records for plugins listed in `plugins.deny`, so denying
+# codex is the config-only fix — no npm access, no weakening of the egress
+# boundary. Remove this only if we ever actually want the codex plugin (which
+# would require allowlisting the npm registry for the bots).
+deny = plugins.setdefault("deny", [])
+if "codex" not in deny:
+    deny.append("codex")
 
 TELEGRAM_KEYS = {"telegramBotToken", "telegramChatId", "telegramAlertChatId"}
 
@@ -572,6 +595,26 @@ tools_cfg = config.setdefault("tools", {})
 role_profile = os.environ.get("OASIS_TOOLS_PROFILE", "").strip()
 if role_profile:
     tools_cfg["profile"] = role_profile
+
+# ---- web_fetch through the egress proxy (CLAW-073 / reach-parity) --------
+# The bots run in an `internal:true` sandbox with NO DNS resolver — all egress
+# goes through the fail-closed egress-proxy (HTTPS_PROXY=http://egress-proxy:3128).
+# openclaw's web_fetch defaults to a STRICT policy that pre-resolves the hostname
+# locally (getaddrinfo) for its SSRF check BEFORE connecting — which returns
+# `EAI_AGAIN` in our resolver-less sandbox, so web_fetch was dead (only exec
+# curl/wget, which delegate name resolution to the proxy CONNECT, worked).
+# `tools.web.fetch.useTrustedEnvProxy=true` (added upstream, present in 7.1-2)
+# switches web_fetch to trusted-env-proxy mode: it stops resolving DNS locally
+# and routes through HTTPS_PROXY, letting the proxy do the DNS + allowlist
+# gating. This does NOT broaden reach — the egress-proxy's allowlist is still the
+# single control point (allowed host -> 200; denied host -> proxy refuses the
+# CONNECT with reason=host-not-allowlisted, vettable=true). It only makes the
+# native web_fetch tool usable and gives a clean policy-deny instead of a broken
+# DNS error. Verified live on yesman 2026-07-26: anthropic.com->200,
+# example.com->proxy-deny. Fleet-wide; VH included (still egress-narrowed).
+web_cfg = tools_cfg.setdefault("web", {})
+fetch_cfg = web_cfg.setdefault("fetch", {})
+fetch_cfg["useTrustedEnvProxy"] = True
 
 # ---- Layer 1: tools.alsoAllow (role.yaml seed + sleep-cycle toggle) ------
 # Re-admit specific tools past the tools.profile filter. Role.yaml's
@@ -879,9 +922,60 @@ elif not existing_primary:
     # No env override and nothing already configured (fresh fleet bot): default
     # to Claude instead of falling through to openclaw's openai/gpt-5.5 built-in,
     # which needs an OpenAI key no bot has. Overridable via OPENCLAW_DEFAULT_MODEL.
-    fallback_model = "anthropic/claude-sonnet-4-6"
+    fallback_model = "anthropic/claude-sonnet-5"
     config["agents"]["defaults"]["model"]["primary"] = fallback_model
     print(f"[entrypoint] no OPENCLAW_DEFAULT_MODEL set; defaulting to {fallback_model}")
+
+# ---- agent identity: name / emoji (CLAW-057) ---------------------------
+# Sets the agent's DISPLAY IDENTITY. Until 2026-07-20 this was unset fleet-wide,
+# so `resolveMessagePrefix` fell through to its built-in "[openclaw]" fallback
+# and every bot signed its outbound messages with the product name instead of
+# its own. That is the config gap behind the Yes Man identity incident.
+#
+# WHERE THIS LANDS (verified against the 6.11 dist, not the 4.26 vendor tree):
+#   resolveAgentIdentity()  = resolveAgentConfig(cfg, agentId)?.identity
+#   resolveAgentEntry()     = cfg.agents.list.find(e => e.id === agentId)
+# so the identity MUST live in `agents.list[]` keyed by agent id — NOT in
+# `agents.defaults`, which resolveAgentConfig never consults for `identity`.
+# With no matching list entry, resolveAgentConfig returns undefined and the
+# name silently falls back. Every bot in this fleet runs the default agent id.
+#
+# WHAT THIS DOES *NOT* CHANGE — two other labels also read "OpenClaw", and
+# neither is reachable from config; don't expect this block to fix them:
+#   1. The `#session:<id> OpenClaw:` byline in the untrusted conversation-context
+#      block is HARDCODED at bot-*.js `toSessionTranscriptPromptMessage`:
+#        const sender = entry.role === "assistant" ? "OpenClaw" : "User";
+#      Only a patched dist or an upstream fix changes it.
+#   2. The Telegram DISPLAY NAME (the `#NN <sender>:` byline, sourced from the
+#      Telegram message cache) is the bot account's own name and is set in
+#      @BotFather. openclaw never calls setMyName — confirmed absent from dist.
+agent_name = os.environ.get("OASIS_AGENT_NAME", "").strip()
+agent_emoji = os.environ.get("OASIS_AGENT_EMOJI", "").strip()
+if agent_name:
+    _agents_cfg = config.setdefault("agents", {})
+    _agent_list = _agents_cfg.setdefault("list", [])
+    if not isinstance(_agent_list, list):
+        _agent_list = []
+        _agents_cfg["list"] = _agent_list
+    # Default agent id for this runtime; every fleet bot is a single-agent
+    # container, so we address the one entry rather than enumerating.
+    _agent_id = os.environ.get("OASIS_AGENT_ID", "").strip() or "main"
+    _entry = next(
+        (e for e in _agent_list if isinstance(e, dict) and str(e.get("id", "")).strip() == _agent_id),
+        None,
+    )
+    if _entry is None:
+        _entry = {"id": _agent_id}
+        _agent_list.append(_entry)
+    _identity = _entry.setdefault("identity", {})
+    _identity["name"] = agent_name
+    if agent_emoji:
+        _identity["emoji"] = agent_emoji
+    print(f"[entrypoint] agent identity: {agent_name}"
+          f"{' ' + agent_emoji if agent_emoji else ''} (agents.list[id={_agent_id}].identity)")
+else:
+    print("[entrypoint] agent identity: OASIS_AGENT_NAME unset — outbound prefix "
+          "will fall back to openclaw's built-in '[openclaw]'")
 
 # ---- oasis-generation provider (durable GEN-003 wiring) ----------------
 # Registers the unified inference gateway as an openai-completions provider IF
@@ -915,16 +1009,16 @@ if oasis_gen_token:
     # repeating it here just ran the model name off the left edge of the
     # Telegram model-picker button (unreadable). See §/models UX note in the
     # generative plan.
+    # Roster trimmed to match the gateway catalog (2026-07-24, oasis-generation
+    # dev): removed sonnet-4-6 / haiku-4-5 / gpt-oss-120b / deepseek-v3.2 /
+    # llama-4-maverick; added claude-sonnet-5. Keep in sync with the gateway's
+    # catalog.py enabled Bedrock entries — a model NOT enabled there 404s here.
     gen_models = [
         _gen_model("gemma-4-12b-coder", "Gemma-4 12B Coder (Local)", 32768),
         _gen_model("gemma-4-12b-agentic", "Gemma-4 12B Agentic (Local)", 32768),
-        _gen_model("claude-sonnet-4-6", "Claude Sonnet 4.6 (Bedrock)", 200000),
         _gen_model("claude-opus-4-8", "Claude Opus 4.8 (Bedrock)", 200000),
-        _gen_model("claude-haiku-4-5", "Claude Haiku 4.5 (Bedrock)", 200000),
-        _gen_model("gpt-oss-120b", "GPT-OSS 120B (Bedrock)", 131072),
+        _gen_model("claude-sonnet-5", "Claude Sonnet 5 (Bedrock)", 200000),
         _gen_model("glm-5", "GLM-5 (Bedrock)", 131072),
-        _gen_model("deepseek-v3.2", "DeepSeek V3.2 (Bedrock)", 131072),
-        _gen_model("llama-4-maverick", "Llama 4 Maverick (Bedrock)", 131072),
     ]
     config.setdefault("models", {}).setdefault("providers", {})["oasis-generation"] = {
         "baseUrl": oasis_gen_url,
@@ -1011,8 +1105,14 @@ if exec_security:
     # that doesn't opt in keeps the strict static-allowlist-only floor. Reviewer
     # MODEL is set separately via OASIS_EXEC_REVIEWER_MODEL (tools.exec.reviewer)
     # below; omit it to reuse the bot's own agent model.
-    _auto = os.environ.get("OASIS_EXEC_AUTOREVIEW", "").strip().lower()
-    ea_def["autoReview"] = _auto in ("1", "true", "yes", "on")
+    # NOTE (6.11, verified live 2026-07-20): autoReview is NOT configured here.
+    # `autoReview` is not a writable field in exec-approvals.json — it is DERIVED
+    # from the exec MODE, and the mode knob lives in openclaw.json under
+    # `tools.exec.mode` (schema: "Normalized exec policy mode. Prefer this over
+    # raw security/ask knobs."). Writing autoReview into these defaults is
+    # silently dropped by openclaw's sanitizer, which is why autoReview never
+    # fired on this fleet despite OASIS_EXEC_AUTOREVIEW=1 on every bot.
+    # See Layer 2c below, which now sets tools.exec.mode.
     # allowlist in agents.main — UNION seed patterns with existing entries,
     # dedup by (pattern, argPattern). Preserve learned entries verbatim (they
     # carry source/lastUsedAt). Patterns are lowercased by openclaw on load.
@@ -1042,7 +1142,7 @@ if exec_security:
     except OSError:
         pass
     print(f"[entrypoint] exec policy: security={ea_def['security']} ask={ea_def['ask']} "
-          f"askFallback={ea_def['askFallback']} autoReview={ea_def['autoReview']} "
+          f"askFallback={ea_def['askFallback']} "
           f"allowlist={len(merged)} patterns (seeded {len(merged) - len(existing)} new)")
 
 # ---- Layer 2b: exec-approval FORWARDING to a channel (CLAW-035) ---------
@@ -1079,6 +1179,41 @@ if exec_reviewer_model:
     reviewer_tcfg = exec_tcfg.setdefault("reviewer", {})
     reviewer_tcfg["model"] = exec_reviewer_model
     print(f"[entrypoint] exec reviewer model: {exec_reviewer_model}")
+
+# ---- Layer 2d: exec MODE — the real autoReview switch (fixed 2026-07-20) -----
+# ROOT CAUSE this fixes: OASIS_EXEC_AUTOREVIEW=1 was set fleet-wide, but nothing
+# consumed it. autoReview is not a writable field — it is DERIVED from the exec
+# mode, and the mode knob lives HERE, in openclaw.json `tools.exec.mode`, whose
+# 6.11 schema says: "Normalized exec policy mode. Prefer this over raw
+# security/ask knobs." The 6.11 mode table (resolveExecPolicyForMode):
+#     allowlist → security=allowlist, ask=off,     autoReview=false
+#     ask       → security=allowlist, ask=on-miss, autoReview=false
+#     auto      → security=allowlist, ask=on-miss, autoReview=true   ← only one
+#     full      → security=full
+# With mode unset openclaw BACK-DERIVES it from (security, ask); our
+# allowlist+on-miss pair lands on "ask" → autoReview=false. That is why every
+# allowlist miss fell through to the human ask path, and why the three test bots
+# on 2026-07-20 all died with a mislabeled "approval-timeout".
+# Gated on the SAME env var, and only applied when the bot's exec policy is
+# actually the allowlist+on-miss shape — so a bot deliberately pinned at ask=off
+# (Van Helsing, until the uid-exec sandbox lands) is never silently escalated.
+_auto_review = os.environ.get("OASIS_EXEC_AUTOREVIEW", "").strip().lower() in (
+    "1", "true", "yes", "on")
+# Mirror Layer 2's resolution exactly. Both only mean anything when the bot opted
+# into the allowlist gate (OASIS_EXEC_SECURITY set); otherwise openclaw's own
+# defaults (security=full) apply and mode=auto would be wrong.
+_exec_security = os.environ.get("OASIS_EXEC_SECURITY", "").strip()
+_exec_ask = (os.environ.get("OASIS_EXEC_ASK", "").strip() or "on-miss") if _exec_security else ""
+if _auto_review and _exec_security == "allowlist" and _exec_ask == "on-miss":
+    tools_cfg = config.setdefault("tools", {})
+    exec_tcfg = tools_cfg.setdefault("exec", {})
+    exec_tcfg["mode"] = "auto"
+    print("[entrypoint] exec mode: auto (autoReview ON — misses are model-reviewed "
+          "before falling back to human approval)")
+elif _auto_review:
+    print(f"[entrypoint] exec mode: NOT set to auto — OASIS_EXEC_AUTOREVIEW is on but "
+          f"security={_exec_security or '(unset)'}/ask={_exec_ask or '(unset)'} is not the "
+          f"allowlist+on-miss shape; autoReview stays OFF")
 
 config_path.parent.mkdir(parents=True, exist_ok=True)
 config_path.write_text(json.dumps(config, indent=2) + "\n")

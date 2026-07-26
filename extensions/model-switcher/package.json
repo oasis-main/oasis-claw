@@ -4,7 +4,7 @@
   "description": "openclaw plugin: self-referencing LLM swap (switch_model agent tool + /setmodel slash command)",
   "type": "module",
   "devDependencies": {
-    "openclaw": "^2026.4.26",
+    "openclaw": "2026.6.11",
     "vitest": "^3.0.0"
   },
   "scripts": {

@@ -2,8 +2,16 @@ node_modules/
 *.log
 .DS_Store
 dist/
-.env
-.env.local
+.env*
+!.env.example
+
+# Personal bot definitions — env files, persona, per-bot compose overlay,
+# per-bot Makefile, anything beyond the generic oasis-claw substrate.
+# Layout convention:
+#   bots/<botname>/.env          # OASIS_TELEGRAM_BOT_TOKEN + chat_id, model creds
+#   bots/docker-compose.bots.yml # overlay: declares per-bot openclaw services
+#   bots/Makefile                # `make BOT=<name> logs|token|recreate|...`
+bots/
 
 # OAuth client secrets (Google / GCP, etc.) — never commit
 client_secret*.json
@@ -18,3 +26,8 @@ service-account*.json
 # ~2GB on disk, no reason to track it — the SHA we depend on lives in
 # extensions/browser/UPSTREAM, not in this clone.
 vendor/openclaw-source/
+
+# build artifacts / editor cruft (CLAW-074 commit hygiene)
+__pycache__/
+*.pyc
+.vscode/

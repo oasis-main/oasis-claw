@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""
+claw-approve-v2 — 6.11-compatible successor to claw-approve.
+
+WHY V2
+
+Under openclaw 6.11 the v1 escape (--token bypasses device-based scope checks)
+STOPPED WORKING. Empirically 2026-07-22 on yesman:
+
+  Yes Man exec at 20:22:48 minted scope-upgrade d2476897 (client=gateway-client,
+  scopesTo=operator.approvals). Watcher woke, ran `openclaw devices approve
+  d2476897 --token …`. The CLI\'s own connect at 20:22:54 minted its own
+  scope-upgrade (client=cli, scopesTo=operator.approvals,operator.pairing) —
+  because the CLI still loads its persistent device identity and the CLI\'s
+  approve-scope-resolver at devices-cli.runtime-gyLzlHn0.js:310 asks for
+  PAIRING_SCOPE ∪ requested-scopes-being-granted. The CLI device only has
+  operator.pairing, so the connect fails, invalidates d2476897, and the approve
+  returns "unknown requestId". Trap-2 revived by 6.11\'s stricter behavior.
+
+Root cause: `openclaw devices approve` unconditionally calls
+loadOrCreateDeviceIdentity() (node-cli-CNJPg7_s.js:2598 and its CLI cousins) —
+there is no CLI flag or env to skip. Only three code paths in the 6.11 dist do
+`deviceIdentity: null`: channels-cli, channels-DU4qKSFa, and
+operator-approvals-client. None of them are exposed as a CLI.
+
+Additional server-side constraint (device-pairing-DBBF4i61.js:322-337): the
+caller must present in `callerScopes` every scope being granted. So to approve
+a request that grants operator.approvals, the caller\'s connect must carry
+operator.approvals (or operator.admin). A same-uid CLI device holding either
+scope is the CLAW-049 self-approve vector we deliberately closed.
+
+HOW V2 ESCAPES BOTH
+
+Uses openclaw\'s publicly-exported `callGatewayFromCli` from
+`openclaw/plugin-sdk/gateway-runtime` with `deviceIdentity: null` + gateway
+token + explicit scopes. A null-device connect bypasses device-based scope
+checks entirely (shouldSkipLocalBackendSelfPairing at message-handler:526 →
+skipLocalBackendSelfPairing = true for loopback + BACKEND + token), so the
+caller can request ["operator.admin"] and the gateway token authenticates it
+directly — no device to check scopes against.
+
+No standing elevated credential lives anywhere: the scope elevation exists only
+for the lifetime of the RPC call, tied to the gateway token (which the container
+already has).
+
+SAFETY INVARIANTS PRESERVED FROM V1
+
+  • ALLOWED_SCOPES gate on the pending request (v1: prevents admin bundle-trap)
+  • allow-cli defaults to False (v1: prevents CLI-device self-approve)
+  • no persistent grant to any co-located device
+
+USAGE (identical to v1)
+
+  claw-approve-v2 <bot>                    # approve first pending agent request
+  claw-approve-v2 <bot> --watch [--timeout 300]
+  claw-approve-v2 <bot> --list
+
+CROSS-REFS: CLAW-058 (unblock), CLAW-066 (proper approval-runtime; v2 is the
+stopgap), CLAW-067 (upstream monitoring — this is the second silent 6.11 break
+we\'ve hit; the diff script should catch this class of change).
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+import time
+
+ALLOWED_SCOPES = {
+    "operator.approvals", "operator.pairing", "operator.read",
+    # operator.write — added 2026-07-24 (CLAW-058 follow-on). This is openclaw's
+    # OWN required scope for the inline-autoReview-approved node.invoke call
+    # (bash-tools-CMeLXzt9.js: APPROVED_NODE_INVOKE_SCOPES = [WRITE_SCOPE,
+    # APPROVALS_SCOPE]) — not an admin-bundle trap. Confirmed live 2026-07-24:
+    # device 8fe0ccae held operator.approvals+operator.pairing only, and the
+    # 6.11 node-invoke-device-identity patch (which makes that call present a
+    # device) surfaced a real 1008 "pairing required" scope-upgrade for
+    # operator.write that was previously masked (pre-patch that connect carried
+    # no device identity at all, so this per-device check never ran).
+    #
+    # UNLIKE operator.admin (used only for THIS script's own ephemeral,
+    # per-call connect — never persisted), granting operator.write here is a
+    # STANDING scope on the target bot's persistent agent device. Per
+    # method-scopes-D5SEXRvS.js it's the default fallback scope for most
+    # dynamic/plugin gateway write methods, not narrowly bound to node.invoke.
+    # Accepted as the same risk bucket as the operator.approvals grant (agent
+    # self-approval, mitigated by CLAW-054 runner isolation + Telegram/session
+    # visibility + agent honesty) — Mike's explicit go-ahead 2026-07-24.
+    "operator.write",
+}
+
+
+def container(bot):
+    return f"oasis-claw-{bot}"
+
+
+def gateway_token(bot):
+    """Read gateway.auth.token from the bot's own config. Never printed."""
+    out = subprocess.run(
+        ["docker", "exec", container(bot), "python3", "-c",
+         "import json;print(json.load(open('/home/node/.openclaw/openclaw.json'))"
+         "['gateway']['auth']['token'])"],
+        capture_output=True, text=True, timeout=30,
+    )
+    tok = out.stdout.strip()
+    if not tok:
+        raise SystemExit(
+            f"[claw-approve-v2] no gateway token in {container(bot)}: "
+            f"{out.stderr.strip()[:200]}"
+        )
+    return tok
+
+
+# ── Headless RPC via openclaw's public plugin-sdk ────────────────────────────
+# Runs inside the bot container as a Node subprocess. Uses callGatewayFromCli
+# with deviceIdentity: null so the connect bypasses device pairing entirely —
+# the gateway token is the only credential the server sees, and it authorizes
+# whatever scopes we ask for.
+_NODE_HEADLESS_RPC = r"""
+// Absolute path — Node can't resolve bare 'openclaw' from /app because the
+// package is a global npm install. NODE_PATH is already set to include
+// /usr/local/lib/node_modules but its module-resolution semantics don't help
+// with ESM subpath imports. Absolute file URL is the reliable escape.
+import { callGatewayFromCli } from 'file:///usr/local/lib/node_modules/openclaw/dist/plugin-sdk/gateway-runtime.js';
+
+// Args pass via env vars, NOT positional argv, to avoid Node's -e/-- argv
+// quirks (with `node -e SCRIPT -- a b c`, argv.slice(2) starts with "--" and
+// shifts by one — verified live 2026-07-22 the "undefined is not valid JSON"
+// off-by-one).
+const method     = process.env.RPC_METHOD;
+const paramsJson = process.env.RPC_PARAMS;
+const scopesJson = process.env.RPC_SCOPES;
+const token      = process.env.GWT;
+if (!token || !method || !paramsJson || !scopesJson) {
+  console.error('missing env: need GWT, RPC_METHOD, RPC_PARAMS, RPC_SCOPES');
+  process.exit(2);
+}
+try {
+  const result = await callGatewayFromCli(
+    method,
+    { url: 'ws://127.0.0.1:18789', token, json: true, timeout: '15000' },
+    JSON.parse(paramsJson),
+    {
+      // deviceIdentity: null is the whole point — no persistent device
+      // identity gets presented, so no device-based scope check runs.
+      deviceIdentity: null,
+      // clientName + mode MUST be gateway-client/backend, NOT the callGatewayFromCli
+      // defaults (cli/cli). shouldSkipLocalBackendSelfPairing (message-handler:526)
+      // gates scope-preservation on GATEWAY_CLIENT + BACKEND + loopback + token.
+      // With cli/cli defaults the connect would drop our requested scopes and the
+      // RPC handler would reject with "missing scope: <x>". Verified live 2026-07-22.
+      clientName: 'gateway-client',
+      mode: 'backend',
+      // The approver-scope-must-cover-granted-scope check on the server side
+      // (device-pairing-DBBF4i61.js:322) then passes trivially.
+      scopes: JSON.parse(scopesJson),
+      progress: false,
+    }
+  );
+  process.stdout.write(JSON.stringify(result));
+} catch (err) {
+  console.error(err && err.message ? err.message : String(err));
+  process.exit(1);
+}
+"""
+
+
+def call_gateway_headless(bot, token, method, params, scopes):
+    """
+    Invoke a gateway RPC through a null-device-identity, token-authenticated
+    connect. Returns the parsed JSON result on success, raises on failure.
+    """
+    out = subprocess.run(
+        ["docker", "exec", "-i",
+         "-e", f"GWT={token}",
+         "-e", f"RPC_METHOD={method}",
+         "-e", f"RPC_PARAMS={json.dumps(params)}",
+         "-e", f"RPC_SCOPES={json.dumps(list(scopes))}",
+         container(bot),
+         "node", "--input-type=module", "-e", _NODE_HEADLESS_RPC],
+        capture_output=True, text=True, timeout=45,
+    )
+    if out.returncode != 0:
+        err = (out.stderr or out.stdout).strip()
+        raise RuntimeError(f"headless RPC failed ({method}): {err[:500]}")
+    try:
+        return json.loads(out.stdout.strip())
+    except json.JSONDecodeError:
+        raise RuntimeError(
+            f"headless RPC returned non-JSON ({method}): {out.stdout[:300]}"
+        )
+
+
+def devices_list(bot, token):
+    """List pending + paired devices via a null-identity RPC. Does NOT mint
+    a scope-upgrade request for the CLI device (v1's --list side effect)."""
+    return call_gateway_headless(
+        bot, token, "device.pair.list", {}, ["operator.pairing"]
+    )
+
+
+def requested_scopes(req):
+    for k in ("requestedScopes", "scopes", "requested"):
+        v = req.get(k)
+        if isinstance(v, list):
+            return set(v)
+        if isinstance(v, dict) and isinstance(v.get("scopes"), list):
+            return set(v["scopes"])
+    return set()
+
+
+def agent_requests(pending, allow_cli=False):
+    out = []
+    for r in pending:
+        client = (r.get("clientId") or "").lower()
+        if not allow_cli and client == "cli":
+            continue
+        out.append(r)
+    return out
+
+
+def approve(bot, token, req):
+    """
+    Approve one pending request via the null-identity RPC. Enforces the
+    ALLOWED_SCOPES gate before calling — an admin-bundled request never gets
+    approved, matching v1's guard.
+    """
+    rid = req.get("requestId")
+    scopes = requested_scopes(req)
+    extra = scopes - ALLOWED_SCOPES
+    if extra:
+        raise SystemExit(
+            f"[claw-approve-v2] REFUSING {rid}: requests {sorted(extra)} beyond "
+            f"the narrow set {sorted(ALLOWED_SCOPES)}. This is the admin-bundle "
+            f"trap — do NOT approve it; reject it and let the agent's own exec "
+            f"miss mint a clean request."
+        )
+    print(
+        f"[claw-approve-v2] approving {rid} (clientId={req.get('clientId')}) "
+        f"scopes={sorted(scopes)} via headless null-identity RPC"
+    )
+    # scopes ["operator.admin"] on the CALLER side: covers everything being
+    # granted without needing a persistent device that holds admin. The token
+    # is the authority; the connect is ephemeral.
+    result = call_gateway_headless(
+        bot, token, "device.pair.approve",
+        {"requestId": rid}, ["operator.admin"]
+    )
+    print(f"[claw-approve-v2] approved: "
+          f"deviceId={result.get('deviceId', '?')[:16]}… "
+          f"decision={result.get('decision', '?')}")
+    return True
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("bot")
+    ap.add_argument("--watch", action="store_true",
+                    help="wait for an agent request to appear, then approve it")
+    ap.add_argument("--timeout", type=int, default=300, help="--watch timeout (s)")
+    ap.add_argument("--interval", type=int, default=5)
+    ap.add_argument("--list", action="store_true",
+                    help="show state, change nothing (no CLI-device mint side effect in v2)")
+    ap.add_argument("--allow-cli", action="store_true",
+                    help="also approve cli-device requests (NOT recommended — see v1 doc)")
+    args = ap.parse_args()
+
+    token = gateway_token(args.bot)
+
+    if args.list:
+        d = devices_list(args.bot, token)
+        pending = d.get("pending", [])
+        paired = d.get("paired", [])
+        print(f"pending ({len(pending)}):")
+        for r in pending:
+            print(f"  {r.get('requestId')}  clientId={r.get('clientId')}  "
+                  f"requested={sorted(requested_scopes(r))}")
+        print(f"paired ({len(paired)}):")
+        for e in paired:
+            print(f"  {e.get('deviceId','')[:16]}…  "
+                  f"clientId={e.get('clientId')}  scopes={e.get('scopes')}")
+        return 0
+
+    deadline = time.time() + (args.timeout if args.watch else 0)
+    while True:
+        d = devices_list(args.bot, token)
+        reqs = agent_requests(d.get("pending", []), allow_cli=args.allow_cli)
+        if reqs:
+            # Newest last — approve the freshest; each connect supersedes the
+            # previous one so stale ids would fail with "unknown requestId".
+            return 0 if approve(args.bot, token, reqs[-1]) else 1
+        if not args.watch or time.time() >= deadline:
+            print(
+                f"[claw-approve-v2] no agent request pending for {args.bot}. "
+                f"One is minted only by the agent's OWN exec allowlist miss — "
+                f"send the bot a task needing a non-allowlisted command, then "
+                f"re-run (or use --watch)."
+            )
+            return 2
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

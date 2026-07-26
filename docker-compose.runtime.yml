@@ -22,6 +22,12 @@
 ##        http://127.0.0.1:18789/healthz
 ##
 
+## Personal multi-bot deployments (Nimbus + Kolmogorov + House + Yes Man,
+## etc.) live in the gitignored bots/ overlay. Layer it in like this:
+##   docker compose -f docker-compose.runtime.yml \
+##                  -f bots/docker-compose.bots.yml up -d
+## or use the convenience targets in bots/Makefile.
+
 services:
   openclaw:
     build:
@@ -107,6 +113,47 @@ services:
     # bring them together by default.
     depends_on:
       - oasis-voice
+      - oasis-semantics
+
+  # ─── oasis-semantics sidecar ─────────────────────────────────────────
+  # Multimodal embedding service. Text (sentence-transformers: bge-small,
+  # bge-m3, MiniLM, nomic) + image+text shared-space (CLIP, SigLIP).
+  # Consumed by the extensions/oasis-semantics openclaw plugin which
+  # registers as a MemoryEmbeddingProviderAdapter for memory-core.
+  #
+  # Build (one-time, after changes to vendor/oasis-semantics):
+  #   (cd vendor/oasis-semantics && docker build -f docker/Dockerfile.cpu -t oasis-semantics:cpu .)
+  #
+  # Weights are downloaded into a named volume on first request (lazy
+  # load). bge-small-en-v1.5 is ~130MB; CLIP ViT-B/32 ~600MB. Rebuilding
+  # the image doesn't wipe them.
+  oasis-semantics:
+    image: oasis-semantics:cpu
+    container_name: oasis-semantics
+    init: true
+    restart: unless-stopped
+    environment:
+      OASIS_SEMANTICS_DEFAULT_TEXT_MODEL: default
+      OASIS_SEMANTICS_DEFAULT_MM_MODEL: clip-lite
+      OASIS_SEMANTICS_SKIP_WARMUP: "1"
+      HF_HOME: /srv/weights/huggingface
+    volumes:
+      - oasis_semantics_weights:/srv/weights
+    networks:
+      - oasis_runtime
+    user: "1000:1000"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8732/healthz')\""
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   # ─── oasis-voice sidecar (CLAW-021) ──────────────────────────────────
   # Speech-in / speech-out service. Runs the same image the cloud-MVP
@@ -142,9 +189,9 @@ services:
       # fast container start (otherwise we'd need a longer healthcheck
       # grace period).
       VOICE_SKIP_WARMUP: "1"
-      # Default Piper voice — UK Alan (medium) per Mike's preference.
+      # Default Piper voice — UK Aru (medium), RP accent.
       # Overrides the upstream-hardcoded en_US-lessac-high default in piper.py.
-      VOICE_PIPER_DEFAULT_VOICE: en_GB-alan-medium
+      VOICE_PIPER_DEFAULT_VOICE: en_GB-aru-medium
       # Weights live on the volume below. Both XDG_CACHE_HOME (used by
       # huggingface/onnxruntime caches) and XDG_DATA_HOME (used by piper.py
       # and the download_weights script to resolve voice files) point to it.
@@ -190,3 +237,5 @@ volumes:
     name: oasis_openclaw_home
   oasis_voice_weights:
     name: oasis_voice_weights
+  oasis_semantics_weights:
+    name: oasis_semantics_weights

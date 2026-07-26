@@ -1,6 +1,6 @@
 # oasis-claw
 
-Vanilla [openclaw](https://github.com/openclaw/openclaw) is a capable AI gateway, but it ships without answers to four production concerns: **what happens when the model is manipulated**, **where credentials go when the user pastes them**, **how you audit what the agent actually did**, and **what stops a malicious skill from the registry running before you ever look at it**. oasis-claw is a thin plugin layer that fills exactly those gaps — no fork, no divergence from upstream, nine focused extensions on top of the standard plugin SDK. Six are the security/observability surface; three (`oasis-voice`, `model-switcher`, `browser`) ship voice + LLM-routing + headless-browser capability. Private long-term memory is the bundled upstream `memory-core` plugin, enabled and configured (not forked) with nightly dreaming consolidation on by default. Anything we vendor in from upstream (currently just `browser`) is pinned, audited, and refresh-gated — see [AUDIT_LOG.md](./AUDIT_LOG.md).
+Vanilla [openclaw](https://github.com/openclaw/openclaw) is a capable AI gateway, but it ships without answers to four production concerns: **what happens when the model is manipulated**, **where credentials go when the user pastes them**, **how you audit what the agent actually did**, and **what stops a malicious skill from the registry running before you ever look at it**. oasis-claw is a thin plugin layer that fills exactly those gaps — no fork, no divergence from upstream, eleven focused extensions on top of the standard plugin SDK. Six are the security/observability surface; five ship capability: voice (`oasis-voice`), LLM routing (`model-switcher`), headless browser (`browser`), local embeddings (`oasis-semantics`), and the biomimetic sleep/wake lifecycle (`sleep-cycle` — doze mutex, nightly session compact+reset, waking summary). Private long-term memory is the bundled upstream `memory-core` plugin, enabled and configured (not forked) with nightly dreaming consolidation on by default. Anything we vendor in from upstream (currently just `browser`) is pinned, audited, and refresh-gated — see [AUDIT_LOG.md](./AUDIT_LOG.md).
 
 ## What this adds over vanilla openclaw
 
@@ -37,7 +37,7 @@ Every LLM input, output, and tool call is written to an append-only JSONL file b
 
 ## Running with Docker
 
-The runtime image bakes all nine extensions in at build time. Credentials come from `.env`. The build also pulls in pinned Chromium + Playwright via the `browser` plugin (~400MB on top of bookworm-slim). See [AUDIT_LOG.md](./AUDIT_LOG.md) for the per-plugin audit verdicts that gate every release.
+The runtime image bakes all eleven extensions in at build time. Credentials come from `.env`. The build also pulls in pinned Chromium + Playwright via the `browser` plugin (~400MB on top of bookworm-slim). See [AUDIT_LOG.md](./AUDIT_LOG.md) for the per-plugin audit verdicts that gate every release.
 
 ```sh
 cp .env.example .env

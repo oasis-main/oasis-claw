@@ -4,7 +4,7 @@
   "description": "openclaw plugin: oasis-voice TTS (SpeechProvider) and STT (RealtimeTranscriptionProvider) backed by a local or hosted oasis-voice sidecar",
   "type": "module",
   "devDependencies": {
-    "openclaw": "^2026.4.26",
+    "openclaw": "2026.6.11",
     "vitest": "^3.2.4"
   },
   "scripts": {

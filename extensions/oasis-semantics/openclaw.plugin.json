@@ -1,0 +1,36 @@
+{
+  "id": "oasis-semantics",
+  "name": "Oasis Semantics",
+  "description": "Local-first embedding provider for memory-core, backed by an oasis-semantics sidecar. Speaks text (sentence-transformers: bge-small / bge-m3 / nomic / MiniLM) and multimodal (CLIP / SigLIP image+text in a shared vector space).",
+  "enabledByDefault": true,
+  "contracts": {
+    "memoryEmbeddingProviders": ["oasis-semantics"]
+  },
+  "_contracts_NOTE_2026_07_11": "The previous _contracts_NOTE (removed 2026-07-11) claimed that declaring `contracts.memoryEmbeddingProviders` makes the loader lazy-load /app/extensions/-mounted plugins and skips register(). Verified WRONG for openclaw 6.11: `src/plugins/registry.ts:1668-1694` REQUIRES the plugin to either have `kind: 'memory'` or declare `contracts.memoryEmbeddingProviders` — otherwise the `api.registerMemoryEmbeddingProvider(adapter)` call pushes a diagnostic and returns without writing to the global registry, so memory-core sees the provider as unknown. Only other reference to `contracts.memoryEmbeddingProviders` is `installed-plugin-index-record-builder.ts:47`, where it flips `sidecar: false` — i.e. declaring contracts makes the plugin an EAGER runtime plugin, the opposite of the lazy-load claim. This block re-declares the contract for 6.11 semantics.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "endpoint": {
+        "type": "string",
+        "description": "Base URL of the oasis-semantics HTTP server. Default: http://oasis-semantics:8732 (in-container) or http://127.0.0.1:8732 (host)."
+      },
+      "default_text_model": {
+        "type": "string",
+        "description": "Tier name for text embeddings when memory-core does not pin one. Default: 'default' (BAAI/bge-small-en-v1.5, 384-d, MIT)."
+      },
+      "default_mm_model": {
+        "type": "string",
+        "description": "Tier name for multimodal embeddings when memory-core does not pin one. Default: 'clip-lite' (openai/clip-vit-base-patch32, 512-d, MIT)."
+      },
+      "bearer_token": {
+        "type": "string",
+        "description": "Optional Bearer token for a hosted oasis-semantics endpoint. Not needed for the local sidecar."
+      },
+      "request_timeout_ms": {
+        "type": "number",
+        "description": "Per-request HTTP timeout in milliseconds. Default: 60000 (60s)."
+      }
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "//": "Transpile-only config for baking this extension into openclaw's dist/extensions as compiled JS (CLAW-043). The --link path uses tsx and needs no build; the bundled-origin path requires index.js. noEmitOnError:false + skipLibCheck keep it a pure transpile (no @types/node needed at image-build time).",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "target": "ES2022",
+    "declaration": false,
+    "sourceMap": false,
+    "removeComments": false,
+    "outDir": "dist-bundle",
+    "rootDir": ".",
+    "skipLibCheck": true,
+    "noEmitOnError": false,
+    "types": []
+  },
+  "include": ["index.ts", "src/shroud-policy.ts", "src/shroud-transform.ts"]
+}

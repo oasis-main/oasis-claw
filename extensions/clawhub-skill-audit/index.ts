@@ -88,9 +88,13 @@ const plugin = {
       maxBytesPerFile: cfg.maxBytesPerFile ?? DEFAULT_MAX_BYTES,
       maxFilesPerSkill: cfg.maxFilesPerSkill ?? DEFAULT_MAX_FILES,
     };
+    // Same bot identity as every other alerting plugin on this bot — one
+    // literal per env var (docker-compose env_file), not one persisted copy
+    // per plugin config block in openclaw.json. cfg.* stays as an explicit
+    // manual override, never written by the entrypoint.
     const telegram = {
-      botToken: cfg.telegramBotToken,
-      chatId: cfg.telegramAlertChatId,
+      botToken: cfg.telegramBotToken ?? process.env.OASIS_TELEGRAM_BOT_TOKEN,
+      chatId: cfg.telegramAlertChatId ?? process.env.OASIS_TELEGRAM_CHAT_ID,
     };
 
     const store = createAuditStore({ logDir: auditLogDir });

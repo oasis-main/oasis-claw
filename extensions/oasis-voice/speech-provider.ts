@@ -9,7 +9,7 @@ import type {
 } from "openclaw/plugin-sdk/speech";
 
 const DEFAULT_ENDPOINT = "http://127.0.0.1:8731";
-const DEFAULT_VOICE = "piper:en_US-lessac-high";
+const DEFAULT_VOICE = "piper:en_GB-aru-medium";
 
 // Piper's lite-tier output is 22050 Hz int16 WAV.
 // Twilio Media Streams expect 8000 Hz µ-law (mulaw).  We ask oasis-voice

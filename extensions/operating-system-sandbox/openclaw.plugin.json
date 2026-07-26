@@ -1,0 +1,31 @@
+{
+  "id": "operating-system-sandbox",
+  "name": "OS Sandbox — gitignore read-shroud",
+  "description": "Withholds contents of gitignored/secret-shaped files from Read/Bash tool results before the model reasons on them; file metadata (exists/size/mode/mtime) still passes so a bot can audit posture without reading values. App-layer companion to the egress sandbox (internal:true + egress-proxy). Requires origin:bundled to arm the tool-result middleware seam.",
+  "contracts": {
+    "agentToolResultMiddleware": ["pi", "codex"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "reachRoots": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Absolute reach roots that are git repos to scan for gitignored paths (e.g. [\"/reach/runes\"]). The always-shroud globs and secret-dir rules apply everywhere regardless."
+      },
+      "enforce": {
+        "type": "boolean",
+        "description": "true (default): replace shrouded contents. false: audit-only dry-run — record would-shroud events but let contents through (for validating the manifest before arming)."
+      },
+      "auditPath": {
+        "type": "string",
+        "description": "JSONL audit path for shroud events (default: ~/.openclaw/logs/shroud-audit.jsonl)"
+      },
+      "rescanIntervalMs": {
+        "type": "number",
+        "description": "TTL in ms for the gitignore manifest cache (default: 60000)"
+      }
+    }
+  }
+}

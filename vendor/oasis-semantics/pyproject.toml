@@ -1,0 +1,43 @@
+[project]
+name = "oasis-semantics"
+version = "0.0.1"
+description = "Multimodal embedding sidecar for openclaw / oasis-claw. Speaks the Ollama /api/embed wire format for text so the existing openclaw `ollama` plugin can drive it via baseUrl override; adds /v1/embed/multimodal for image + text embeddings."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.32",
+  "pydantic>=2.9",
+  "numpy>=1.26",
+  "python-multipart>=0.0.9",
+  "huggingface-hub>=0.26",
+]
+
+# Tier-scoped extras keep the cpu image small. Install only what you need.
+[project.optional-dependencies]
+# ── Text tiers ──
+# bge-small / bge-m3 / minilm all run on sentence-transformers (torch CPU).
+text-lite     = ["sentence-transformers>=3.3", "torch>=2.5"]   # bge-small, minilm
+text-multi    = ["sentence-transformers>=3.3", "FlagEmbedding>=1.3", "torch>=2.5"]  # bge-m3
+text-large    = ["sentence-transformers>=3.3", "torch>=2.5"]   # nomic-embed-text
+
+# ── Multimodal tiers ──
+# CLIP/SigLIP via transformers + Pillow for image decode.
+mm-clip       = ["transformers>=4.46", "torch>=2.5", "Pillow>=11.0"]
+mm-siglip     = ["transformers>=4.46", "torch>=2.5", "Pillow>=11.0"]
+
+# ── Reranker tiers (future) ──
+rerank-bge    = ["FlagEmbedding>=1.3", "torch>=2.5"]
+
+# Convenience bundles
+cpu = ["oasis-semantics[text-lite,text-multi,mm-clip]"]
+gpu = ["oasis-semantics[text-large,mm-siglip,rerank-bge]"]
+
+[project.scripts]
+oasis-semantics-download = "oasis_semantics.scripts.download_weights:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

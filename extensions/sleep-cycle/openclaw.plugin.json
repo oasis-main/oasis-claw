@@ -53,6 +53,41 @@
           }
         }
       },
+      "contextNap": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Context-threshold deep-sleep. Fires the SAME archive+reset+waking-summary cycle as the nightly deep-sleep when a session's live prompt crosses a fraction of the ACTIVE model's context window — pre-empting native compaction. Continuity is preserved (archived transcript + waking handoff + memories); only the working window is refreshed. Driven off per-turn hooks (llm_output/message_sending/agent_end).",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Master switch for the context-nap trigger. Default true. Force-set from OASIS_CONTEXT_NAP_ENABLED by the entrypoint."
+          },
+          "thresholdRatio": {
+            "type": "number",
+            "description": "Fraction (0-1) of the model's context budget that triggers a nap. Default 0.85. Model-aware: a 32K fallback naps ~6x sooner than a 200K primary."
+          },
+          "preemptTokens": {
+            "type": "number",
+            "description": "Tokens reserved below the window before native compaction fires; the nap fires before this line so we reset instead of compacting. Keep = compaction.reserveTokensFloor + softThreshold (entrypoint default 5000 + 4000 = 9000)."
+          },
+          "guardTokens": {
+            "type": "number",
+            "description": "Fire the nap this many tokens BEFORE the native compaction line (extra margin so the nap always wins the race). Default 1500."
+          },
+          "minAbsoluteTokens": {
+            "type": "number",
+            "description": "Never nap while the prompt is smaller than this (avoids noise on tiny-window models). Default 2000."
+          },
+          "minMsBetweenNaps": {
+            "type": "number",
+            "description": "Per-session debounce so a pinned-high context can't nap every turn. Default 60000 (60s)."
+          },
+          "message": {
+            "type": "string",
+            "description": "Operator-visible notice appended to the tripping turn's reply. Default \"Attention exhausted. Clean-up & refresh required. Taking a quick power nap...\""
+          }
+        }
+      },
       "semanticsEndpoint": {
         "type": "string",
         "description": "oasis-semantics sidecar endpoint used to embed + rank memory chunks. Default http://oasis-semantics:8732."

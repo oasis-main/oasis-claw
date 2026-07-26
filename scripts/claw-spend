@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""
+claw-spend — per-bot token-spend report across the oasis-claw fleet.
+
+Lives on the deployment machine (your Mac). Compose-driven discovery, same as
+claw-creds: every running container on the `oasis-claw-runtime:local` image is
+a bot. For each bot it reads openclaw's own per-session usage ledger
+(`.usage-cost-cache.json`, refreshed via `openclaw gateway usage-cost`) and
+reports tokens + cost by bot × model, plus the fleet total.
+
+Why not just `openclaw gateway usage-cost`? Two gaps that matter here:
+
+  1. It reports only daily *aggregates* — no per-model attribution, so you
+     can't see that sonnet is 95% of the bill while haiku is noise.
+  2. openclaw prices models by fetching the OpenRouter + LiteLLM catalogs at
+     startup. Bots behind the egress-proxy allowlist (Van Helsing) can't reach
+     those hosts, so every one of their models is UNPRICED and their spend
+     reports as $0 — invisible. We do NOT want to widen a sandboxed bot's
+     egress just to price tokens.
+
+So claw-spend computes cost itself from raw token counts:
+
+  * It DERIVES the effective unit price per (model, token-type) from entries
+    that openclaw *did* price (e.g. Nimbus, on the open network), then applies
+    those calibrated rates to entries openclaw left unpriced (Van Helsing).
+    Same model, same real price — no guessing.
+  * For models never priced anywhere, it falls back to STATIC_PRICES below.
+
+It also counts the most recent days accurately. openclaw's own `usage-cost`
+summary DEFERS active-session days (it reports $0 for the last few days until
+sessions finalize), so its recent-window totals read far lower than reality.
+claw-spend forces a rescan and sums the same per-file `usageEntries` openclaw
+counts — matching it exactly on finalized days and filling in the recent ones.
+
+Cost components tracked separately (this fleet's bill is ~97% cacheWrite):
+    input · output · cacheRead · cacheWrite   (USD per 1M tokens)
+
+Usage:
+    claw-spend                     # 30-day summary, all running bots
+    claw-spend --days 7            # window
+    claw-spend --by-day            # add a per-day breakdown
+    claw-spend --bot nimbus        # one bot (repeatable)
+    claw-spend --json              # machine-readable
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+from collections import defaultdict
+from datetime import datetime, timezone
+
+RUNTIME_IMAGE = "oasis-claw-runtime:local"
+CACHE_REL = "agents/main/sessions/.usage-cost-cache.json"
+OPENCLAW_HOME = "/home/node/.openclaw"
+
+# `openclaw` root-compose container is called Nimbus by everyone.
+SERVICE_DISPLAY_NAMES = {"oasis-claw-runtime": "nimbus"}
+
+# Static fallback prices, USD per 1M tokens, used ONLY when no live rate can be
+# derived from a priced entry for that model. Keep rough — the derived rates
+# (calibrated from openclaw's own catalog) are preferred and override these.
+# Shape: model-substring -> {input, output, cacheRead, cacheWrite}
+STATIC_PRICES = {
+    "opus":   {"input": 15.0, "output": 75.0, "cacheRead": 1.50, "cacheWrite": 18.75},
+    "sonnet": {"input": 3.0,  "output": 15.0, "cacheRead": 0.30, "cacheWrite": 3.75},
+    "haiku":  {"input": 1.0,  "output": 5.0,  "cacheRead": 0.10, "cacheWrite": 1.25},
+    "gemini": {"input": 1.25, "output": 10.0, "cacheRead": 0.31, "cacheWrite": 1.625},
+    "gpt":    {"input": 1.25, "output": 10.0, "cacheRead": 0.125, "cacheWrite": 1.5625},
+}
+COMPONENTS = ("input", "output", "cacheRead", "cacheWrite")
+
+
+def color(s, c):
+    if not sys.stdout.isatty():
+        return s
+    codes = {"red": 31, "green": 32, "yellow": 33, "cyan": 36, "bold": 1, "dim": 90}
+    return f"\033[{codes[c]}m{s}\033[0m"
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def discover_bots():
+    """Every running container on the runtime image -> (container, display)."""
+    res = run(["docker", "ps", "--format", "{{.Names}}\t{{.Image}}"])
+    bots = []
+    for line in res.stdout.splitlines():
+        if "\t" not in line:
+            continue
+        name, image = line.split("\t", 1)
+        if image.strip() != RUNTIME_IMAGE:
+            continue
+        display = SERVICE_DISPLAY_NAMES.get(name, name.replace("oasis-claw-", ""))
+        bots.append((name, display))
+    return sorted(bots, key=lambda b: b[1])
+
+
+def refresh_and_read(container, days):
+    """Force openclaw to (re)build the cost cache, then read the raw ledger."""
+    # `usage-cost` rescans session logs and rewrites .usage-cost-cache.json.
+    run(["docker", "exec", container, "sh", "-c",
+         f'tok=$(cat {OPENCLAW_HOME}/.gateway-token 2>/dev/null); '
+         f'openclaw gateway usage-cost --days {days} --json --token "$tok" >/dev/null 2>&1'])
+    res = run(["docker", "exec", container, "cat", f"{OPENCLAW_HOME}/{CACHE_REL}"])
+    if res.returncode != 0 or not res.stdout.strip():
+        return None
+    try:
+        return json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def iter_entries(cache):
+    for meta in (cache.get("files") or {}).values():
+        for e in (meta.get("usageEntries") or []):
+            yield e
+
+
+def derive_rates(all_entries):
+    """Effective USD/token per (model, component), from openclaw-priced entries."""
+    num = defaultdict(float)   # (model, comp) -> summed cost
+    den = defaultdict(float)   # (model, comp) -> summed tokens
+    for e in all_entries:
+        model = e.get("model", "?")
+        for comp in COMPONENTS:
+            tok = e.get(comp, 0) or 0
+            cost = e.get(comp + "Cost", 0) or 0
+            if tok > 0 and cost > 0:
+                num[(model, comp)] += cost
+                den[(model, comp)] += tok
+    return {k: num[k] / den[k] for k in den if den[k] > 0}  # USD per token
+
+
+def price_for(model, comp, derived):
+    """USD per token for (model, comp): derived rate first, else static/1e6."""
+    if (model, comp) in derived:
+        return derived[(model, comp)], False  # calibrated
+    for key, table in STATIC_PRICES.items():
+        if key in model.lower():
+            return table[comp] / 1_000_000.0, True  # estimated
+    return 0.0, True
+
+
+def cutoff_ms(days):
+    return (datetime.now(timezone.utc).timestamp() - days * 86400) * 1000
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Per-bot token-spend report for oasis-claw.")
+    ap.add_argument("--days", type=int, default=30, help="window in days (default 30)")
+    ap.add_argument("--bot", action="append", default=[], help="limit to bot display name (repeatable)")
+    ap.add_argument("--by-day", action="store_true", help="add per-day breakdown")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    args = ap.parse_args()
+
+    bots = discover_bots()
+    if args.bot:
+        want = {b.lower() for b in args.bot}
+        bots = [b for b in bots if b[1].lower() in want]
+    if not bots:
+        print("No running oasis-claw bots found.", file=sys.stderr)
+        return 1
+
+    caches = {}
+    for container, display in bots:
+        cache = refresh_and_read(container, args.days)
+        if cache is not None:
+            caches[display] = cache
+
+    # Pass 1: derive calibrated rates from ALL entries fleet-wide (Nimbus prices
+    # sonnet/haiku/opus; those rates then price Van Helsing's same models).
+    derived = derive_rates(e for c in caches.values() for e in iter_entries(c))
+
+    cut = cutoff_ms(args.days)
+    # Pass 2: recompute every entry with the unified price table.
+    report = {}          # bot -> {model -> {comp_tokens, comp_cost, total_cost, estimated}}
+    daily = defaultdict(lambda: defaultdict(float))  # bot -> date -> cost
+    for display, cache in caches.items():
+        models = defaultdict(lambda: {**{c: 0 for c in COMPONENTS},
+                                      **{c + "Cost": 0.0 for c in COMPONENTS},
+                                      "cost": 0.0, "tokens": 0, "estimated": False})
+        for e in iter_entries(cache):
+            ts = e.get("timestamp", 0) or 0
+            if ts < cut:
+                continue
+            model = e.get("model", "?")
+            if not any(e.get(c, 0) for c in COMPONENTS):
+                continue  # skip zero-token bookkeeping rows (delivery-mirror etc.)
+            row = models[model]
+            for comp in COMPONENTS:
+                tok = e.get(comp, 0) or 0
+                unit, est = price_for(model, comp, derived)
+                c = tok * unit
+                row[comp] += tok
+                row[comp + "Cost"] += c
+                row["cost"] += c
+                row["tokens"] += tok
+                row["estimated"] = row["estimated"] or (est and tok > 0)
+            d = datetime.fromtimestamp(ts / 1000, timezone.utc).strftime("%Y-%m-%d")
+            daily[display][d] += sum(
+                (e.get(comp, 0) or 0) * price_for(model, comp, derived)[0] for comp in COMPONENTS
+            )
+        report[display] = {m: v for m, v in models.items() if v["tokens"] > 0}
+
+    if args.json:
+        out = {"days": args.days, "generatedAt": datetime.now(timezone.utc).isoformat(),
+               "bots": report, "daily": {b: dict(d) for b, d in daily.items()}}
+        print(json.dumps(out, indent=2))
+        return 0
+
+    # ---- human report -------------------------------------------------------
+    print(color(f"\noasis-claw spend — last {args.days} days", "bold"))
+    print(color("(cost derived from openclaw's own price catalog where available; "
+                "* = estimated from fallback table)\n", "dim"))
+    fleet_total = 0.0
+    any_estimated = False
+    for _container, display in bots:
+        models = report.get(display, {})
+        if not models:
+            continue
+        bot_total = sum(m["cost"] for m in models.values())
+        fleet_total += bot_total
+        print(color(f"── {display} ", "cyan") + color(f"${bot_total:,.2f}", "bold"))
+        print(f"   {'model':<26} {'tokens':>14} {'cacheWrite':>12} {'output':>10} {'other':>10} {'cost':>11}")
+        for model, v in sorted(models.items(), key=lambda kv: -kv[1]["cost"]):
+            est = " *" if v["estimated"] else "  "
+            other = v["cost"] - v["cacheWriteCost"] - v["outputCost"]
+            any_estimated = any_estimated or v["estimated"]
+            print(f"   {model[:26]:<26} {v['tokens']:>14,} "
+                  f"{'$'+format(v['cacheWriteCost'],',.2f'):>12} "
+                  f"{'$'+format(v['outputCost'],',.2f'):>10} "
+                  f"{'$'+format(other,',.2f'):>10} "
+                  f"{color('$'+format(v['cost'],',.2f'), 'yellow'):>11}{est}")
+        if args.by_day and daily.get(display):
+            print(color("   by day:", "dim"))
+            for d in sorted(daily[display]):
+                print(color(f"     {d}  ${daily[display][d]:,.2f}", "dim"))
+        print()
+
+    print(color(f"fleet total: ${fleet_total:,.2f}", "bold") +
+          color(f"   ({args.days}d, {len(report)} bot(s))", "dim"))
+    if any_estimated:
+        print(color("* some models priced from the fallback table (no live catalog rate "
+                     "and none derivable from a priced bot).", "dim"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

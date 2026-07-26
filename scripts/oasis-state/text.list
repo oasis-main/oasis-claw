@@ -1,0 +1,32 @@
+# text-git bucket — committed to the state repo as plaintext.
+# One glob per line. Globs are relative to /home/node/.openclaw inside the
+# oasis-claw-runtime container. Lines starting with # are comments.
+#
+# Anything matching here is mergeable text — Mike can hand-resolve conflicts
+# if two hosts both edit. Nothing here should contain credentials.
+
+# Nimbus's curated identity & journal
+workspace/*.md
+workspace/memory/*.md
+workspace/avatars/**
+workspace/hantavirus-outreach/**
+workspace/handoffs/**
+workspace/bugs/**
+workspace/state/**
+
+# Cron schedule + state index
+cron/jobs.json
+
+# Top-level config (current + last-good only; .bak.1-4 are noisy backups)
+openclaw.json
+openclaw.json.last-good
+
+# Small JSON state files
+plugins/installs.json
+devices/paired.json
+devices/pending.json
+subagents/runs.json
+telegram/update-offset-default.json
+agents/main/agent/models.json
+acpx/codex-home/config.toml
+acpx/codex-acp-wrapper.mjs

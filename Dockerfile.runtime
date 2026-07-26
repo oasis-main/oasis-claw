@@ -1,8 +1,27 @@
 # oasis-claw runtime image — full openclaw gateway + our 10 extensions
 #
-# Uses npm-published openclaw@2026.4.26 (same version as vendor/openclaw submodule
-# pin) and bakes our extensions in at /app/extensions/<id>. tsx loads the .ts
-# entry points directly so we don't ship a compile step.
+# Uses npm-published openclaw@2026.7.1-2 and bakes our extensions in at
+# /app/extensions/<id>. tsx loads the .ts entry points directly so we don't ship
+# a compile step.
+#
+# Version history / why:
+#   2026.4.26 -> 2026.6.11  CLAW-024: clears 99 GHSA advisories.
+#   2026.6.11 -> 2026.7.1-2 CLAW-073: picks up the Telegram getUpdates fixes.
+#     The fleet was logging ~9-10 polling stall/stop events per bot per day,
+#     which wedged the channel and made the exec-approval "ask" path unusable
+#     (dead approval cards -> hung tasks -> the CLAW-072 scope-down). Upstream
+#     5a10a29807 "retry transient getUpdates API errors in ingress worker"
+#     (2026-07-01) adds isRetryableTelegramApiError (429 + retry_after, 500,
+#     502) and a retry policy in the ingress worker; before it a single
+#     transient Bot API error killed the poll loop. Also picks up 2a55c7c59a
+#     (rescoped ingress watchdog). Both are in v2026.7.1; NEITHER is in 6.11,
+#     and neither is in the 2026.6.33 "extended-stable" line, which is frozen
+#     off an older base — do not "upgrade" to 6.33.
+#
+# Version numbering is YYYY.M.<release-ordinal>, NOT a date: 2026.6.11 is the
+# 11th June release, and 2026.5.6 is OLDER than it, not newer. The `-1`/`-2`
+# suffixes are upstream's post-release hotfix convention; npm dist-tag `latest`
+# points at 2026.7.1-2 (there is no matching git tag for the hotfix builds).
 #
 # Build:  docker build -f Dockerfile.runtime -t oasis-claw-runtime .
 # Run:    docker compose -f docker-compose.runtime.yml up -d
@@ -13,13 +32,13 @@
 
 FROM node:22-bookworm-slim
 
-ARG OPENCLAW_VERSION=2026.4.26
+ARG OPENCLAW_VERSION=2026.7.1-2
 
 # System batteries: git for plugin install, openssl for token gen, tini for
 # proper signal handling, python3 for openclaw.json templating in entrypoint.
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      ca-certificates curl git openssl python3 procps lsof jq && \
+      ca-certificates curl git openssl python3 python3-yaml procps lsof jq && \
     rm -rf /var/lib/apt/lists/*
 
 # gog CLI for Gmail/Calendar/Drive (https://github.com/steipete/gogcli).
@@ -96,10 +115,95 @@ COPY extensions/ /app/extensions/
 # Strip any host-side node_modules that may have come along; we use /app/node_modules.
 RUN find /app/extensions -type d -name node_modules -prune -exec rm -rf {} + || true
 
+# The vendored `browser` plugin (extensions/browser/) declares runtime deps
+# beyond zod — typebox, express, ws, commander, @modelcontextprotocol/sdk. Node
+# resolves an extension's imports by walking up to /app/node_modules, and none
+# of these are transitive deps of the global openclaw, so without this the
+# plugin dies at load with "Cannot find module 'typebox'" (its first import).
+# jq reads ONLY `.dependencies` from browser's own package.json — single source
+# of truth, stays in lockstep with the vendor pin, and sidesteps the workspace:*
+# devDependency that would trip a bare `npm install`. playwright-core is excluded
+# (already installed globally above, version-pinned against the Chromium build).
+RUN npm install --omit=dev --prefix /app \
+      $(jq -r '.dependencies | to_entries[] | select(.key!="playwright-core") | "\(.key)@\(.value)"' \
+         /app/extensions/browser/package.json)
+
+# ---- CLAW-043: bake the gitignore read-shroud as a BUNDLED extension --------
+# openclaw gates `registerAgentToolResultMiddleware` (the seam that withholds
+# file CONTENTS *before the model reasons on them*, and the only seam that also
+# exposes the tool's path arg) to plugins with origin:"bundled". Our other
+# extensions are `--link`'d (origin:"config"), where that seam silently no-ops.
+# So this one — and only this one — must live inside openclaw's own
+# dist/extensions. The bundled slot loads `index.js` (not `.ts` via tsx like
+# /app/extensions), so we transpile TS -> ESM JS, preserving the ./src/*.js
+# import specifiers, and drop it in beside its manifest. typescript is installed
+# and removed in the SAME layer so the final image doesn't carry it. The
+# "cannot find node types" errors are expected without @types/node and do NOT
+# block emit (noEmitOnError:false), hence `|| true`; the `test -s` checks then
+# fail the build LOUD if any output is actually missing (a real syntax error
+# would block that file's emit). Coupling to watch on openclaw bumps: the
+# dist/extensions discovery path (see GITIGNORE_SHROUD_DESIGN.md build note).
+RUN OSB=/usr/local/lib/node_modules/openclaw/dist/extensions/operating-system-sandbox && \
+    npm install -g typescript@5.7 >/dev/null 2>&1 && \
+    cd /app/extensions/operating-system-sandbox && \
+    (tsc -p tsconfig.bundle.json || true) && \
+    mkdir -p "$OSB/src" && \
+    cp dist-bundle/index.js "$OSB/index.js" && \
+    cp dist-bundle/src/shroud-policy.js dist-bundle/src/shroud-transform.js "$OSB/src/" && \
+    cp openclaw.plugin.json "$OSB/openclaw.plugin.json" && \
+    printf '{"type":"module","name":"operating-system-sandbox","main":"index.js"}\n' > "$OSB/package.json" && \
+    test -s "$OSB/index.js" && test -s "$OSB/src/shroud-policy.js" && test -s "$OSB/src/shroud-transform.js" && \
+    grep -q registerAgentToolResultMiddleware "$OSB/index.js" && \
+    rm -rf dist-bundle && \
+    npm uninstall -g typescript >/dev/null 2>&1 && \
+    echo "[build] CLAW-043 os-sandbox bundled -> $OSB"
+
+# GitHub CLI (gh) so bots can manage their repos. Same release-tarball pattern
+# as gogcli: arch-aware, pinned, with a `--version` assertion so a bad pin fails
+# the build LOUD rather than at deploy. Placed late (after the heavy npm +
+# Playwright layers) so bumping it doesn't invalidate them. Bots authenticate
+# with a per-bot fine-grained PAT injected as GH_TOKEN (gh reads it from env);
+# actual git ops go through the guardrail shim installed just below.
+ARG TARGETARCH
+ARG GH_CLI_VERSION=2.96.0
+RUN case "${TARGETARCH:-amd64}" in \
+      amd64) GH_ARCH=amd64 ;; \
+      arm64) GH_ARCH=arm64 ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_${GH_ARCH}.tar.gz" \
+      | tar -xz -C /tmp && \
+    install -m 0755 "/tmp/gh_${GH_CLI_VERSION}_linux_${GH_ARCH}/bin/gh" /usr/local/bin/gh && \
+    rm -rf "/tmp/gh_${GH_CLI_VERSION}_linux_${GH_ARCH}" && \
+    gh --version
+
+# ---- git guardrail: shadow `git` with the rollback-safe wrapper -------------
+# Bakes the policy scripts read-only into the image (tamper-resistant — a bot
+# cannot edit its own guardrail). /usr/local/bin/git sits ahead of /usr/bin/git
+# on PATH and is the wrapper; it fails OPEN, passing everything except
+# force-push / ref-delete / out-of-scope pushes straight through to the real
+# /usr/bin/git. A global pre-push hook (wired via core.hooksPath in the
+# entrypoint) backstops direct /usr/bin/git calls. The credential helper serves
+# the per-bot GH_TOKEN for github.com https with no network call at boot (so an
+# egress-locked bot still starts). See scripts/git-policy/ + AUDIT_LOG.md.
+COPY scripts/git-policy/ /usr/local/lib/oasis-git-policy/
+RUN chmod +x /usr/local/lib/oasis-git-policy/git-guard.sh \
+             /usr/local/lib/oasis-git-policy/git-credential-oasis-gh.sh \
+             /usr/local/lib/oasis-git-policy/git-credential-oasis-gh-app \
+             /usr/local/lib/oasis-git-policy/hooks/pre-push && \
+    ln -sf /usr/local/lib/oasis-git-policy/git-guard.sh                  /usr/local/bin/git && \
+    ln -sf /usr/local/lib/oasis-git-policy/git-credential-oasis-gh.sh    /usr/local/bin/git-credential-oasis-gh && \
+    ln -sf /usr/local/lib/oasis-git-policy/git-credential-oasis-gh-app   /usr/local/bin/git-credential-oasis-gh-app && \
+    test "$(command -v git)" = /usr/local/bin/git && \
+    /usr/local/bin/git --version >/dev/null && \
+    python3 -c "import ast; ast.parse(open('/usr/local/lib/oasis-git-policy/git-credential-oasis-gh-app').read())" && \
+    echo "[build] git guardrail + credential helpers installed (PAT: oasis-gh, App: oasis-gh-app)"
+
 # Entry script: generates openclaw.json with plugin.entries pointing at the
 # baked-in extensions, then execs `openclaw gateway`.
 COPY scripts/runtime-entrypoint.sh /usr/local/bin/runtime-entrypoint.sh
-RUN chmod +x /usr/local/bin/runtime-entrypoint.sh
+COPY scripts/compile-role.py /usr/local/bin/compile-role.py
+RUN chmod +x /usr/local/bin/runtime-entrypoint.sh /usr/local/bin/compile-role.py
 
 # Run as the unprivileged "node" user that's already present in the base image.
 RUN mkdir -p /home/node/.openclaw /home/node/.openclaw/workspace /home/node/.openclaw/logs && \

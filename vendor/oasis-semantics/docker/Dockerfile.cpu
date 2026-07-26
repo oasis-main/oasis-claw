@@ -1,0 +1,43 @@
+# Dockerfile.cpu — embedding sidecar, CPU-only. Ships text-lite/default/multi
+# tiers + multimodal clip-lite. Target: ≲1.5GB (torch CPU wheels are heavy),
+# boots in <15s with OASIS_SEMANTICS_SKIP_WARMUP=1.
+
+FROM python:3.12-slim
+
+RUN groupadd -g 1000 oasis && useradd -u 1000 -g 1000 -s /bin/false oasis
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    OASIS_SEMANTICS_DEFAULT_TEXT_MODEL=default \
+    OASIS_SEMANTICS_DEFAULT_MM_MODEL=clip-lite \
+    OASIS_SEMANTICS_SKIP_WARMUP=1 \
+    TORCHINDUCTOR_CACHE_DIR=/tmp/torch_cache
+
+# System deps for Pillow image decode + httpx CA certs
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libjpeg62-turbo \
+      ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /srv
+COPY pyproject.toml ./
+COPY src ./src
+
+# CPU bundle only — gpu tiers (text-large, mm-siglip, rerank-bge) deliberately
+# excluded. Install torch CPU wheels explicitly to avoid the default CUDA
+# index pulling ~3GB of nvidia libs.
+RUN pip install --index-url https://download.pytorch.org/whl/cpu torch \
+ && pip install -e ".[text-lite,text-multi,mm-clip]"
+
+# Pre-create the weights tree so a fresh named volume is immediately writable
+# by UID 1000. Same propagation footgun as oasis-voice — pre-creating leaf
+# dirs with 777 reliably carries through Docker Desktop's volume seeding.
+RUN mkdir -p /srv/weights/huggingface /srv/weights/oasis-semantics \
+    && chmod 1777 /srv/weights \
+    && chmod 777 /srv/weights/huggingface /srv/weights/oasis-semantics
+
+# HuggingFace cache dir — overridden by XDG_CACHE_HOME from compose.
+ENV HF_HOME=/srv/weights/huggingface
+
+EXPOSE 8732
+CMD ["uvicorn", "oasis_semantics.main:app", "--host", "0.0.0.0", "--port", "8732"]

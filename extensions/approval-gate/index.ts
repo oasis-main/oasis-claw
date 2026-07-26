@@ -37,15 +37,21 @@ const plugin = {
 
   register(api: OpenClawPluginApi) {
     const cfg = configSchema.parse(api.pluginConfig ?? {});
+    // Same bot identity as every other alerting plugin on this bot — one
+    // literal per env var (docker-compose env_file), not one persisted copy
+    // per plugin config block in openclaw.json. cfg.* stays as an explicit
+    // manual override, never written by the entrypoint.
+    const telegramBotToken = cfg.telegramBotToken ?? process.env.OASIS_TELEGRAM_BOT_TOKEN;
+    const telegramChatId = cfg.telegramChatId ?? process.env.OASIS_TELEGRAM_CHAT_ID;
 
     // forward_captcha tool — the model invokes this when it encounters a
     // CAPTCHA in a browser session. Image is sent to Telegram; operator's
     // text reply becomes the tool's return value.
-    if (cfg.telegramBotToken && cfg.telegramChatId) {
+    if (telegramBotToken && telegramChatId) {
       api.registerTool(
         createForwardCaptchaTool({
-          telegramBotToken: cfg.telegramBotToken,
-          telegramChatId: cfg.telegramChatId,
+          telegramBotToken,
+          telegramChatId,
         }),
       );
     } else {
@@ -55,7 +61,7 @@ const plugin = {
     }
 
     api.logger.info("approval-gate plugin loaded", {
-      forwardCaptchaWired: Boolean(cfg.telegramBotToken && cfg.telegramChatId),
+      forwardCaptchaWired: Boolean(telegramBotToken && telegramChatId),
       apiApprovalLibraryAvailable: true,
       browserApprovalsAvailable: "via ~/.openclaw/openclaw.json approvals.exec config",
     });

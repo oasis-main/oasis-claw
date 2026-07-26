@@ -27,15 +27,17 @@ The compose file sets `VOICE_SKIP_WARMUP=1` so boot is fast and the healthcheck 
 
 ## Voice + weights (post-fix, 2026-05-13)
 
-Default voice is **`en_GB-alan-medium`** (UK Alan, medium quality), set via `VOICE_PIPER_DEFAULT_VOICE` in compose. Don't rely on `piper.py`'s upstream default — that's `en_US-lessac-high` and doesn't match what we ship.
+Default voice is **`en_GB-aru-medium`** (UK Aru, RP accent, medium quality), set via `VOICE_PIPER_DEFAULT_VOICE` in compose. Don't rely on `piper.py`'s upstream default — that's `en_US-lessac-high` and doesn't match what we ship.
+
+Multi-speaker models (e.g. `en_GB-vctk-medium`, 109 speakers) are supported via `#speaker` suffix: `piper:en_GB-vctk-medium#p236`. The speaker name is resolved from the model's `.onnx.json` sidecar `speaker_id_map`. Numeric IDs also work (`#0`).
 
 Both `XDG_CACHE_HOME` AND `XDG_DATA_HOME` must point to `/srv/weights` in compose. They serve different consumers — `XDG_DATA_HOME` is what `piper.py` and `download_weights.py` use to resolve voice files; `XDG_CACHE_HOME` is the HF/onnxruntime cache home (Moonshine downloads via `hf_hub_download` land at `$XDG_CACHE_HOME/huggingface`).
 
 Volume layout after first-boot population:
 ```
 /srv/weights/
-  oasis-voice/piper/en_GB-alan-medium.onnx       # ~63 MB
-  oasis-voice/piper/en_GB-alan-medium.onnx.json
+  oasis-voice/piper/en_GB-aru-medium.onnx        # ~63 MB
+  oasis-voice/piper/en_GB-aru-medium.onnx.json
   huggingface/                                    # Moonshine model + tokenizer (~140 MB)
 ```
 
@@ -47,6 +49,12 @@ If you hit `PermissionError: '/srv/weights/huggingface'` on a fresh volume, the 
 2. **Can openclaw reach it?** From inside the openclaw container: `curl -s http://oasis-voice:8731/healthz`. The sidecar is *not* reachable from the host Mac — that's intentional.
 3. **TTS first, STT second.** TTS exercises piper + the audio module without the model-load gauntlet. `curl -sX POST http://oasis-voice:8731/v1/tts/speak -H 'content-type: application/json' -d '{"text":"hi"}' -o /tmp/t.wav`. If that 500s, the entire sidecar is sick; if it succeeds and STT still 500s, suspect Moonshine specifically.
 4. **STT roundtrip.** Feed the TTS WAV back: `curl -sX POST -F audio=@/tmp/t.wav http://oasis-voice:8731/v1/stt/transcribe`.
+
+## TTS input rules (injected into the gateway's memory prompt)
+
+The plugin pushes a behavioural rule into every agent's memory prompt via `api.registerMemoryPromptSupplement` (see `TTS_INPUT_RULES` at the top of `index.ts`). The rule tells the model: **strip emojis from any reply destined for `/v1/tts/speak`** (Telegram voice notes, Twilio telephony) because Piper reads emoji aloud as their literal Unicode name ("face with tears of joy") — jarring in audio. Punctuation, em-dashes and ellipses map to prosody and stay. Narrow exception: keep the emoji if the *audible pronunciation itself* is the joke.
+
+If you need to edit the rule, do it in `index.ts` (the runtime source of truth). Don't duplicate the text here — it'll drift.
 
 ## Don't
 

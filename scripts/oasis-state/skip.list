@@ -1,0 +1,30 @@
+# skip bucket — documentation only. Anything NOT in text.list, secrets.list,
+# or blob.list is implicitly skipped. This file is the explicit record of
+# WHY we skip the big stuff so future-you doesn't accidentally add it back.
+
+# Regenerated on container boot
+plugin-runtime-deps/**       # ~830 MB of npm-installed plugin runtime deps
+node_modules_local/**        # ~18 MB build cache
+npm-cache/**                 # ~12 MB npm cache
+logs/**                      # runtime logs, regenerated continuously
+canvas/**                    # canvas-host generated artifacts
+
+# Per-host trust state — must NOT carry over to a new host
+exec-approvals.json          # which commands you've previously approved
+.gateway-token               # bearer token, entrypoint re-mints on first boot
+
+# Ephemeral
+state/**                     # gog state dir, transient
+update-check.json            # version checker cache
+delivery-queue/**            # in-flight; will replay on restart
+plugin-skills/**             # populated lazily from plugin manifests
+extensions/**                # plugin metadata cache
+browser/**                   # browser plugin state (currently failing to load)
+tmp/**
+
+# Backup churn — keep current + last-good only (see text.list)
+openclaw.json.bak
+openclaw.json.bak.1
+openclaw.json.bak.2
+openclaw.json.bak.3
+openclaw.json.bak.4

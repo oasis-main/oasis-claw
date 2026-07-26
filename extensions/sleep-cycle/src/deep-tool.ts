@@ -71,6 +71,13 @@ export type SleepDeepDeps = {
   store: StateStore;
   nowMs: () => number;
   log?: (msg: string) => void;
+  /**
+   * When set, reset exactly these session keys instead of the `sessionMatch`
+   * filter. The context-nap trigger passes the single session that crossed the
+   * threshold, so a nap never resets a different session than the one that
+   * ballooned. Empty/undefined = fall back to `cfg.sessionMatch`.
+   */
+  overrideTargetKeys?: string[];
 };
 
 /** Core deep-sleep logic, separated from the tool wrapper for testing. */
@@ -85,7 +92,12 @@ export async function runDeepSleep(deps: SleepDeepDeps): Promise<{
 
   let targets: SessionListEntry[] = [];
   try {
-    targets = matchTargetSessions(listedSessions(await call("sessions.list", {})), cfg.sessionMatch);
+    const listed = listedSessions(await call("sessions.list", {}));
+    const override = deps.overrideTargetKeys?.filter((k) => k) ?? [];
+    targets =
+      override.length > 0
+        ? listed.filter((e) => e.key && override.includes(e.key))
+        : matchTargetSessions(listed, cfg.sessionMatch);
   } catch (err) {
     log(`sessions.list failed: ${String(err)}`);
     return { resetCount: 0, memoryHitCount: 0, archives: [] };

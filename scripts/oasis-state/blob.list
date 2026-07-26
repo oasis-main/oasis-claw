@@ -1,0 +1,29 @@
+# opaque-blob bucket — packed into one tarball, age-encrypted to blob.tar.age,
+# pushed to every rclone remote in OASIS_STATE_BACKENDS. NOT committed to git
+# (too large, churns daily). The git state repo only carries a manifest
+# (blob.manifest.json: timestamp, sha256, byte count, backends pushed to).
+
+# Conversation transcripts — the bulk of state (~290 MB, 686+ files).
+# Explicit per-extension globs avoid sweeping in openclaw's own *.bak-* and
+# *.deleted.* garbage files in the same directory.
+agents/main/sessions/*.jsonl
+agents/main/sessions/*.trajectory.jsonl
+agents/main/sessions/*.trajectory-path.json
+agents/main/sessions/sessions.json
+agents/main/sessions/sessions.json.telegram-sent-messages.json
+
+# Mike's inbound media (voice notes, photos sent to Nimbus)
+media/inbound/**
+
+# Embedding store (small now, will grow with oasis-semantics)
+memory/main.sqlite
+memory/main.sqlite-shm
+memory/main.sqlite-wal
+
+# Task run + flow registry sqlite stores
+tasks/runs.sqlite
+tasks/runs.sqlite-shm
+tasks/runs.sqlite-wal
+flows/registry.sqlite
+flows/registry.sqlite-shm
+flows/registry.sqlite-wal

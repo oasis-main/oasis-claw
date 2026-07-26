@@ -1,0 +1,19 @@
+{
+  "name": "@oasis-claw/oasis-semantics",
+  "version": "0.1.0",
+  "description": "openclaw plugin: memory-core embedding provider backed by the oasis-semantics sidecar (local sentence-transformers + multimodal CLIP / SigLIP).",
+  "type": "module",
+  "devDependencies": {
+    "openclaw": "2026.6.11",
+    "vitest": "^3.2.4"
+  },
+  "scripts": {
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest --passWithNoTests"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

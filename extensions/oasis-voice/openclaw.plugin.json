@@ -25,7 +25,7 @@
       },
       "tts_voice": {
         "type": "string",
-        "description": "Default TTS voice passed to oasis-voice (e.g. piper:en_GB-alan-medium). Default: piper:en_GB-alan-medium"
+        "description": "TTS voice passed to oasis-voice (e.g. piper:en_GB-aru-medium, piper:en_GB-vctk-medium#p236). Default: piper:en_GB-aru-medium"
       },
       "bearer_token": {
         "type": "string",

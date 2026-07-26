@@ -25,7 +25,8 @@ import path from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { z } from "zod";
 import { type BeforeResetEvent, handleBeforeReset } from "./src/before-reset.js";
-import { createSleepDeepTool, type SleepDeepConfig } from "./src/deep-tool.js";
+import { type ContextNapConfig, createContextNapHooks } from "./src/context-nap.js";
+import { createSleepDeepTool, runDeepSleep, type SleepDeepConfig } from "./src/deep-tool.js";
 import { createGatewayCaller } from "./src/gateway-cli.js";
 import { loadState, StateStore } from "./src/state-store.js";
 import { buildWakingLines, type WakingConfig } from "./src/waking.js";
@@ -47,6 +48,17 @@ const configSchema = z.object({
       injectUntilHour: z.number().optional(),
     })
     .optional(),
+  contextNap: z
+    .object({
+      enabled: z.boolean().optional(),
+      thresholdRatio: z.number().optional(),
+      preemptTokens: z.number().optional(),
+      guardTokens: z.number().optional(),
+      minAbsoluteTokens: z.number().optional(),
+      minMsBetweenNaps: z.number().optional(),
+      message: z.string().optional(),
+    })
+    .optional(),
   semanticsEndpoint: z.string().optional(),
   semanticsModel: z.string().optional(),
 });
@@ -61,9 +73,13 @@ type ResolvedConfig = {
     transcriptPointers: number;
     injectUntilHour: number;
   };
+  contextNap: ContextNapConfig;
   semanticsEndpoint: string;
   semanticsModel: string;
 };
+
+const NAP_MESSAGE_DEFAULT =
+  "Attention exhausted. Clean-up & refresh required. Taking a quick power nap...";
 
 function resolveConfig(raw: unknown): ResolvedConfig {
   const cfg = configSchema.parse(raw ?? {});
@@ -81,6 +97,24 @@ function resolveConfig(raw: unknown): ResolvedConfig {
       // limit), and the handoff should follow the reset, not wait for the next
       // morning. Lower this only if you want a morning-only cutoff.
       injectUntilHour: cfg.wakingSummary?.injectUntilHour ?? 24,
+    },
+    contextNap: {
+      enabled: cfg.contextNap?.enabled ?? true,
+      // 0.85 of the ACTIVE model's window — model-aware, so a 32K fallback naps
+      // ~6x sooner than a 200K primary for the same work.
+      thresholdRatio: cfg.contextNap?.thresholdRatio ?? 0.85,
+      // = compaction.reserveTokensFloor (5000) + softThreshold (4000). The nap
+      // fires before this line so we reset instead of paying native compaction.
+      // Keep in sync with the entrypoint's compaction reserve.
+      preemptTokens: cfg.contextNap?.preemptTokens ?? 9000,
+      guardTokens: cfg.contextNap?.guardTokens ?? 1500,
+      minAbsoluteTokens: cfg.contextNap?.minAbsoluteTokens ?? 2000,
+      minMsBetweenNaps: cfg.contextNap?.minMsBetweenNaps ?? 60_000,
+      message: cfg.contextNap?.message ?? NAP_MESSAGE_DEFAULT,
+      // Nap-eligible sessions = the same long-lived conversational sessions the
+      // nightly deep-sleep targets; ephemeral cron/heartbeat sessions are left
+      // to native compaction (they're short and auto-pruned).
+      sessionMatch: cfg.sessionMatch ?? ["telegram:direct"],
     },
     semanticsEndpoint: cfg.semanticsEndpoint ?? "http://oasis-semantics:8732",
     semanticsModel: cfg.semanticsModel ?? "default",
@@ -118,6 +152,10 @@ const plugin = {
       semanticsModel: cfg.semanticsModel,
     };
 
+    // One gateway caller (loopback RPC via the CLI + gateway token), shared by
+    // the manual sleep_deep tool AND the context-nap reset.
+    const call = createGatewayCaller();
+
     // AUTOMATIC path: openclaw's own scheduled session reset (native
     // `session.reset` policy, seeded by the runtime entrypoint) archives the
     // long-lived transcript and starts fresh — no cron, no tool, no admin
@@ -146,11 +184,41 @@ const plugin = {
         cfg: deepCfg,
         homeDir,
         workspaceDir,
-        call: createGatewayCaller(),
+        call,
         store,
         nowMs: () => Date.now(),
       }),
     );
+
+    // CONTEXT-THRESHOLD path: nap when a session's live prompt crosses a
+    // fraction of the ACTIVE model's window (pre-empting native compaction),
+    // announce it on that turn's reply, then run the SAME archive+reset+
+    // waking-summary cycle as the nightly deep-sleep. Continuity is preserved
+    // (archived transcript + waking handoff + memories); only the working
+    // window is refreshed. Driven off per-turn hooks — openclaw runs no plugin
+    // background timer.
+    if (cfg.contextNap.enabled) {
+      const napHooks = createContextNapHooks({
+        cfg: cfg.contextNap,
+        nowMs: () => Date.now(),
+        log: (m) => api.logger?.info?.(`sleep-cycle: ${m}`),
+        runNap: async (sessionKey) => {
+          await runDeepSleep({
+            cfg: deepCfg,
+            homeDir,
+            workspaceDir,
+            call,
+            store,
+            nowMs: () => Date.now(),
+            overrideTargetKeys: [sessionKey],
+            log: (m) => api.logger?.info?.(`sleep-cycle: ${m}`),
+          });
+        },
+      });
+      api.on("llm_output", napHooks.onLlmOutput);
+      api.on("message_sending", napHooks.onMessageSending);
+      api.on("agent_end", napHooks.onAgentEnd);
+    }
 
     // Waking summary — read fresh from the state file each time so it reflects
     // the sleep_deep tool's most recent write.

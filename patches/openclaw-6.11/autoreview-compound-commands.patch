@@ -1,0 +1,11 @@
+--- a/dist/bash-tools-CMeLXzt9.js	2026-07-24 12:29:38
++++ b/dist/bash-tools-CMeLXzt9.js	2026-07-24 12:29:01
+@@ -1765,7 +1765,7 @@
+ 			runtimePayload: inlineEvalHit !== null,
+ 			preparedCoverage: params.prepared.allowAlwaysCoverage
+ 		}),
+-		autoReviewArgv: autoReviewBindingEval.segments.length === 1 && (autoReviewBindingEval.segments[0]?.raw === void 0 || autoReviewBindingEval.segments[0].raw.trim() === autoReviewBindingCommand.trim()) ? autoReviewBindingEval.segments[0].argv : void 0
++		autoReviewArgv: autoReviewBindingEval.segments.length === 1 && (autoReviewBindingEval.segments[0]?.raw === void 0 || autoReviewBindingEval.segments[0].raw.trim() === autoReviewBindingCommand.trim()) ? autoReviewBindingEval.segments[0].argv : (autoReviewBindingEval.analysisOk && autoReviewBindingEval.segments.length > 1 ? autoReviewBindingEval.segments.flatMap((s) => s.argv ?? []) : void 0)
+ 	};
+ }
+ //#endregion

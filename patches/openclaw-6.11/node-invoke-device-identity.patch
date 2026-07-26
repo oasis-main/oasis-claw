@@ -1,0 +1,11 @@
+--- a/dist/gateway-Cql8-Ml_.js
++++ b/dist/gateway-Cql8-Ml_.js
+@@ -142,7 +142,7 @@
+ 	return getOperatorApprovalRuntimeToken();
+ }
+ function resolveApprovalRequesterDeviceIdentityForGatewayTool(params) {
+-	if (!APPROVAL_RUNTIME_METHODS.has(params.method)) return;
++	if (!APPROVAL_RUNTIME_METHODS.has(params.method) && params.method !== "node.invoke") return;
+ 	if (trimToUndefined(params.opts.gatewayUrl) !== void 0) return;
+ 	try {
+ 		const identity = loadOrCreateDeviceIdentity();

@@ -29,9 +29,13 @@ const plugin = {
     const stateDir = api.runtime?.stateDir ?? (process.env.HOME + "/.openclaw");
     const secretsDir = cfg.secretsDir ?? `${stateDir}/state/secrets`;
 
+    // Same bot identity as every other alerting plugin on this bot — one
+    // literal per env var (docker-compose env_file), not one persisted copy
+    // per plugin config block in openclaw.json. cfg.* stays as an explicit
+    // manual override, never written by the entrypoint.
     const telegramCfg = {
-      botToken: cfg.telegramBotToken,
-      chatId: cfg.telegramAlertChatId,
+      botToken: cfg.telegramBotToken ?? process.env.OASIS_TELEGRAM_BOT_TOKEN,
+      chatId: cfg.telegramAlertChatId ?? process.env.OASIS_TELEGRAM_CHAT_ID,
     };
 
     // Encrypted at-rest store. The agent never sees the plaintext after deposit;

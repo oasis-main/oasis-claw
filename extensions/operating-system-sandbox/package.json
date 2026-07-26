@@ -1,0 +1,19 @@
+{
+  "name": "@oasis-claw/operating-system-sandbox",
+  "version": "0.1.0",
+  "description": "openclaw plugin: gitignore read-shroud — withholds contents of gitignored/secret files from Read/Bash tool results before the model sees them (CLAW-043)",
+  "type": "module",
+  "devDependencies": {
+    "openclaw": "workspace:*",
+    "vitest": "^3.0.0"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

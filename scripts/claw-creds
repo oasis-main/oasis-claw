@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""
+claw-creds — list and refresh OAuth credentials across oasis-claw bots.
+
+Lives on the deployment management machine (your Mac). Talks to bots via
+`docker exec` and orchestrates gog's `--remote` two-step OAuth flow,
+auto-opening the consent page in your browser and catching the redirect on
+the host loopback so you don't have to copy/paste URLs back.
+
+  claw-creds list                          # one row per bot × account
+  claw-creds list --probe                  # add a live API call per account
+  claw-creds refresh nimbus                # every account on nimbus
+  claw-creds refresh nimbus kolmogorov     # subset of bots
+  claw-creds refresh nimbus --account x@y  # one specific account
+  claw-creds refresh --all                 # every account on every running bot
+  claw-creds refresh nimbus --paste        # disable auto-browser, paste back
+
+Discovery is compose-driven: every service that uses the `oasis-claw-runtime:local`
+image is a bot. Display names map `openclaw` → `nimbus`; bot overlay services
+keep their declared name.
+"""
+
+import argparse
+import http.server
+import json
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import webbrowser
+from datetime import datetime, timezone
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+RUNTIME_COMPOSE = REPO_ROOT / "docker-compose.runtime.yml"
+BOTS_COMPOSE = REPO_ROOT / "bots" / "docker-compose.bots.yml"
+RUNTIME_IMAGE = "oasis-claw-runtime:local"
+
+# `openclaw` is the root-compose runtime container; everyone calls it Nimbus.
+SERVICE_DISPLAY_NAMES = {"openclaw": "nimbus"}
+
+
+def color(s, c):
+    if not sys.stdout.isatty():
+        return s
+    codes = {"red": 31, "green": 32, "yellow": 33, "cyan": 36, "dim": 90}
+    return f"\033[{codes[c]}m{s}\033[0m"
+
+
+def visible_len(s):
+    out, i = 0, 0
+    while i < len(s):
+        if s[i] == "\x1b":
+            while i < len(s) and s[i] != "m":
+                i += 1
+            i += 1
+        else:
+            out += 1
+            i += 1
+    return out
+
+
+def discover_bots():
+    """Return [(display, service, container)] for every bot, nimbus first."""
+    cmd = ["docker", "compose", "-f", str(RUNTIME_COMPOSE)]
+    if BOTS_COMPOSE.exists():
+        cmd += ["-f", str(BOTS_COMPOSE)]
+    cmd += ["--project-directory", str(REPO_ROOT), "config", "--format", "json"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+    except FileNotFoundError:
+        sys.exit("docker not found on PATH")
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"docker compose config failed:\n{e.stderr}")
+    services = json.loads(out).get("services", {})
+    bots = []
+    for svc, cfg in services.items():
+        if cfg.get("image") != RUNTIME_IMAGE:
+            continue
+        bots.append((SERVICE_DISPLAY_NAMES.get(svc, svc),
+                     svc, cfg.get("container_name", svc)))
+    bots.sort(key=lambda b: (b[0] != "nimbus", b[0]))
+    return bots
+
+
+def container_state(container):
+    r = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Running}}", container],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return "absent"
+    return "running" if r.stdout.strip() == "true" else "stopped"
+
+
+def gog_exec(container, args, check=True):
+    return subprocess.run(
+        ["docker", "exec", container, "gog", *args],
+        capture_output=True, text=True, check=check,
+    )
+
+
+def list_accounts(container):
+    r = gog_exec(container, ["auth", "list", "-j"], check=False)
+    if r.returncode != 0:
+        return []
+    try:
+        return json.loads(r.stdout).get("accounts") or []
+    except json.JSONDecodeError:
+        return []
+
+
+def parse_created(s):
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+
+def human_age(dt):
+    if dt is None:
+        return "?"
+    secs = int((datetime.now(timezone.utc) - dt).total_seconds())
+    if secs < 90:
+        return f"{secs}s ago"
+    if secs < 5400:
+        return f"{secs // 60}m ago"
+    if secs < 172800:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
+
+
+def probe_account(container, account):
+    """Cheap live call. 'ok' | 'fail: <reason>' | 'skipped'."""
+    services = account.get("services") or []
+    email = account["email"]
+    if "gmail" in services:
+        cmd = ["gmail", "search", "in:inbox", "--max", "1",
+               "--account", email, "-j", "--no-input"]
+    elif "calendar" in services:
+        cmd = ["calendar", "calendars", "--account", email, "-j", "--no-input"]
+    elif "drive" in services:
+        cmd = ["drive", "search", "name contains '.'", "--max", "1",
+               "--account", email, "-j", "--no-input"]
+    else:
+        return "skipped"
+    r = gog_exec(container, cmd, check=False)
+    if r.returncode == 0:
+        return "ok"
+    tail = (r.stderr or r.stdout).strip().splitlines()
+    msg = tail[-1] if tail else "unknown"
+    return f"fail: {msg[:60]}"
+
+
+def cmd_list(args):
+    bots = discover_bots()
+    rows = [("BOT", "STATE", "ACCOUNT", "SERVICES", "REFRESHED", "STATUS")]
+    for display, _, container in bots:
+        state = container_state(container)
+        if state != "running":
+            rows.append((display, color(state, "yellow"), "—", "—", "—", "—"))
+            continue
+        accounts = list_accounts(container)
+        if not accounts:
+            rows.append((display, color("running", "green"),
+                         color("(none)", "dim"), "—", "—", "—"))
+            continue
+        for acc in accounts:
+            status = probe_account(container, acc) if args.probe else "—"
+            services = ",".join(acc.get("services") or [])
+            if len(services) > 38:
+                services = services[:35] + "..."
+            age = human_age(parse_created(acc.get("created_at")))
+            status_c = ("green" if status == "ok"
+                        else "red" if status.startswith("fail")
+                        else "dim")
+            rows.append((
+                display, color("running", "green"),
+                acc.get("email", "?"), services, age,
+                color(status, status_c) if args.probe else "—",
+            ))
+
+    widths = [max(visible_len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    for r in rows:
+        print("  ".join(cell + " " * (widths[i] - visible_len(cell))
+                        for i, cell in enumerate(r)))
+
+
+def capture_redirect(port, auth_url, timeout=300):
+    """One-shot host listener on 127.0.0.1:port; open auth_url; return the
+    redirect URL once the browser is bounced to it."""
+    captured = {"url": None}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            # Only the OAuth redirect carries `code` (or `error`). Ignore browser
+            # noise like /favicon.ico and keep listening, so a stray favicon fetch
+            # can't be mistaken for the callback (which would send step 2 a URL
+            # with no code and fail the exchange).
+            if "code" not in qs and "error" not in qs:
+                self.send_response(204)
+                self.end_headers()
+                return
+            captured["url"] = f"http://127.0.0.1:{port}{self.path}"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(
+                b"<html><body style='font-family:sans-serif;text-align:center;padding:4em'>"
+                b"<h2>Auth captured. You can close this tab.</h2></body></html>"
+            )
+
+        def log_message(self, *a, **kw):
+            pass
+
+    try:
+        srv = http.server.HTTPServer(("127.0.0.1", port), H)
+    except OSError as e:
+        raise RuntimeError(
+            f"Could not bind 127.0.0.1:{port} (another OAuth flow in progress?): {e}"
+        )
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        print(f"  Opening browser; listening on 127.0.0.1:{port} for redirect…")
+        print(f"  If the browser didn't open, paste this URL manually:")
+        print(f"  {auth_url}\n")
+        webbrowser.open(auth_url)
+        deadline = time.time() + timeout
+        while captured["url"] is None and time.time() < deadline:
+            time.sleep(0.2)
+    finally:
+        srv.shutdown()
+    if captured["url"] is None:
+        raise TimeoutError(f"No redirect captured within {timeout}s")
+    return captured["url"]
+
+
+def refresh_account(display, container, email, services_csv, paste):
+    print(color(f"\n[{display}] refreshing {email} ({services_csv})", "cyan"))
+
+    r = gog_exec(container, [
+        "auth", "add", email, "--remote", "--step", "1",
+        "--services", services_csv, "--force-consent", "-j",
+    ])
+    try:
+        auth_url = json.loads(r.stdout)["auth_url"]
+    except (json.JSONDecodeError, KeyError):
+        auth_url = None
+        for line in r.stdout.splitlines():
+            if line.startswith("auth_url\t"):
+                auth_url = line.split("\t", 1)[1].strip()
+                break
+        if not auth_url:
+            sys.exit(f"Could not parse step-1 output:\n{r.stdout}\n{r.stderr}")
+
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(auth_url).query)
+    redirect_uri = qs.get("redirect_uri", [""])[0]
+    port = urllib.parse.urlparse(redirect_uri).port
+    if not port:
+        sys.exit(f"Could not find redirect port in: {redirect_uri}")
+
+    if paste:
+        print(f"\n  Open this URL in your browser:\n\n  {auth_url}\n")
+        redirect = input("  Paste the redirect URL here: ").strip()
+        if not redirect:
+            sys.exit("  No URL pasted; aborting.")
+    else:
+        redirect = capture_redirect(port, auth_url)
+
+    gog_exec(container, [
+        "auth", "add", email, "--remote", "--step", "2",
+        "--auth-url", redirect, "--services", services_csv,
+        "--force-consent",
+    ])
+    print(color("  ✓ token rotated", "green"))
+
+    status = probe_account(container, {
+        "email": email, "services": services_csv.split(","),
+    })
+    if status == "ok":
+        print(color("  ✓ live probe ok", "green"))
+    else:
+        print(color(f"  ! live probe: {status}", "yellow"))
+
+
+def cmd_refresh(args):
+    bots = discover_bots()
+    by_display = {d: c for d, _, c in bots}
+    if args.all:
+        targets = [(d, c) for d, _, c in bots]
+    else:
+        if not args.bots:
+            sys.exit("refresh: pass one or more bots, or --all\n"
+                     f"Known bots: {', '.join(d for d, _, _ in bots)}")
+        unknown = [b for b in args.bots if b not in by_display]
+        if unknown:
+            sys.exit(f"Unknown bot(s): {', '.join(unknown)}\n"
+                     f"Known: {', '.join(d for d, _, _ in bots)}")
+        targets = [(b, by_display[b]) for b in args.bots]
+
+    for display, container in targets:
+        if container_state(container) != "running":
+            print(color(f"[{display}] skipped — container not running", "yellow"))
+            continue
+        accounts = list_accounts(container)
+        if not accounts:
+            print(color(f"[{display}] no accounts configured", "yellow"))
+            continue
+        if args.account:
+            accounts = [a for a in accounts if a.get("email") == args.account]
+            if not accounts:
+                print(color(f"[{display}] no account matching {args.account}", "yellow"))
+                continue
+        for acc in accounts:
+            services_csv = ",".join(acc.get("services") or []) or "user"
+            refresh_account(display, container, acc["email"], services_csv, args.paste)
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="claw-creds",
+        description="List and refresh OAuth credentials across oasis-claw bots.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pl = sub.add_parser("list", help="show every bot's gog accounts")
+    pl.add_argument("--probe", action="store_true",
+                    help="live-probe each account (one extra API call per account)")
+    pl.set_defaults(func=cmd_list)
+
+    pr = sub.add_parser("refresh", help="re-run the OAuth flow for one or more bots")
+    pr.add_argument("bots", nargs="*", help="bot names (e.g. nimbus kolmogorov)")
+    pr.add_argument("--all", action="store_true", help="every running bot")
+    pr.add_argument("--account",
+                    help="only this email (default: every account on each bot)")
+    pr.add_argument("--paste", action="store_true",
+                    help="disable auto-browser; paste the redirect URL via stdin")
+    pr.set_defaults(func=cmd_refresh)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
