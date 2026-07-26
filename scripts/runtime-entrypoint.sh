@@ -401,9 +401,18 @@ merge_config(
 # data. Skeleton config = SHADOW (audit-only, never blocks).
 merge_config(
     "oasis-reviewer",
-    {"mode": "shadow", "auditDir": str(home / ".openclaw/logs/reviewer")},
+    # Per-bot rollout control (§10 of UNIFIED_REVIEWER.md): mode from env,
+    # default SHADOW. Only a bot whose compose sets OASIS_REVIEWER_MODE=enforce
+    # actually blocks/escalates; every other bot audits silently. VH must never
+    # be flipped to enforce-with-widening — its constitution is read-only-analysis.
+    {"mode": os.environ.get("OASIS_REVIEWER_MODE", "shadow"),
+     "auditDir": str(home / ".openclaw/logs/reviewer")},
     hooks={"allowConversationAccess": True},
 )
+# mode is DEPLOYMENT-driven (per-bot rollout), so it must always reflect the env,
+# not a stale persisted value — merge_config setdefaults config keys, which would
+# otherwise pin whatever landed first. Force it every boot.
+entries["oasis-reviewer"]["config"]["mode"] = os.environ.get("OASIS_REVIEWER_MODE", "shadow")
 merge_config("dot-swarm", {
     "swarmDir": str(home / ".openclaw/.swarm"),
     "registerSwarmReadTool": True,
