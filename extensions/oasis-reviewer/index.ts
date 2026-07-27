@@ -5,6 +5,7 @@ import { registerReviewer } from "./src/reviewer.js";
 const configSchema = z.object({
   mode: z.enum(["shadow", "enforce"]).optional(),
   auditDir: z.string().optional(),
+  policyFile: z.string().optional(),
 });
 
 export type OasisReviewerConfig = z.infer<typeof configSchema>;
@@ -29,8 +30,9 @@ const plugin = {
     // of this phase is to learn the real before_tool_call param shapes on live
     // traffic before Layer 1 (hard) / Layer 2 (constitution) gate anything.
     const mode = cfg.mode ?? "shadow";
+    const policyFile = cfg.policyFile ?? "/app/extensions/oasis-reviewer/policy/reviewer-policy.json";
 
-    registerReviewer(api, { auditDir, mode });
+    registerReviewer(api, { auditDir, mode, policyFile });
 
     api.logger.info("oasis-reviewer plugin loaded", { auditDir, mode });
   },
