@@ -20,7 +20,8 @@ export interface HardPolicy {
   denyReadGlobs: string[];
   denyWriteRoots: string[]; // control-plane (always deny) — fleet-level
   gitignoredWrite: Verdict;
-  compoundExec: Verdict;
+  compoundExec: Verdict; // benign pipes/redirects/&&/|| (substitution handled separately)
+  substitutionExec: Verdict; // $( ) ` <( )  — eval vector
   destructiveExec: Verdict;
   // per-bot write scoping
   allowWriteRoots: string[]; // [] = no scoping (fleet-broad)
@@ -35,6 +36,7 @@ export const DEFAULT_HARD_POLICY: HardPolicy = {
   denyWriteRoots: ["/reach/runes/oasis-x/oasis-claw"],
   gitignoredWrite: "escalate",
   compoundExec: "escalate",
+  substitutionExec: "escalate",
   destructiveExec: "deny",
   allowWriteRoots: [],
   escalateWriteRoots: [],
@@ -54,7 +56,18 @@ const DESTRUCTIVE = [
   />\s*\/dev\/(sd|nvme|disk|hd)\w*/,
   /\bchmod\s+-R\s+0*\s+\//,
 ];
-const COMPOUND = /[|;&]|\$\(|`|(^|\s)>{1,2}(\s|$)|<\(/;
+// Download/decode → shell execution (obfuscated RCE): fetched or decoded content
+// piped/chained INTO a shell interpreter. Hard-deny even on a reviewer-gated bot
+// (a legit install is done in inspectable steps, or by Mike).
+const DOWNLOAD_EXEC = /(?:\||&&|;)\s*(?:sudo\s+)?(?:sh|bash|zsh|dash|ksh)\b|(?:^|\s|;|&|\|)eval\s+\S/i;
+// Command / process substitution = an eval vector that evades static inspection —
+// route to a human even on a reviewer-gated bot.
+const SUBSTITUTION = /\$\(|`|<\(/;
+// Benign shell composition: pipes, sequencing, output redirects. On a reviewer-
+// gated bot (Mike, 2026-07-27) these RUN — destructive / download-exec /
+// substitution are handled above; the write-target residual is the same one
+// mode=full already accepts. Deliberately excludes $( ` <( (see SUBSTITUTION).
+const BENIGN_COMPOUND = /[|;&]|(^|\s)>{1,2}(\s|$)/;
 
 // ── Policy file loading + per-bot resolution ──────────────────────────────────
 
@@ -69,6 +82,7 @@ interface PolicyFile {
       denyReadGlobs?: string[];
       destructiveExec?: Verdict;
       compoundExec?: Verdict;
+      substitutionExec?: Verdict;
       gitignoredWrite?: Verdict;
       escalateExecPatterns?: Record<string, string>;
       escalateExecAlways?: Record<string, string>; // fleet-always (no per-bot opt-in)
@@ -154,6 +168,7 @@ export function resolveHardPolicy(policy: PolicyFile | null, botKey: string): Ha
     denyWriteRoots: DEFAULT_HARD_POLICY.denyWriteRoots,
     gitignoredWrite: f.gitignoredWrite ?? "escalate",
     compoundExec: f.compoundExec ?? "escalate",
+    substitutionExec: f.substitutionExec ?? "escalate",
     destructiveExec: f.destructiveExec ?? "deny",
     allowWriteRoots: b.allowWriteRoots ?? [],
     escalateWriteRoots: b.escalateWriteRoots ?? [],
@@ -225,10 +240,12 @@ export function evaluateHard(input: EvalInput, policy: HardPolicy = DEFAULT_HARD
       for (const re of DESTRUCTIVE) {
         if (re.test(cmd)) return { verdict: policy.destructiveExec, principle: "hard:destructive-exec", reason: `refusing destructive command: ${cmd.slice(0, 120)}` };
       }
+      if (DOWNLOAD_EXEC.test(cmd)) return { verdict: "deny", principle: "hard:download-execute", reason: `refusing pipe/decode into a shell (obfuscated RCE): ${cmd.slice(0, 120)}` };
       for (const re of policy.escalateExecRegex) {
         if (re.test(cmd)) return { verdict: "escalate", principle: "hard:operator-consent-action", reason: `action needs Mike's slash-command approval: ${cmd.slice(0, 120)}` };
       }
-      if (COMPOUND.test(cmd)) return { verdict: policy.compoundExec, principle: "hard:compound-exec", reason: `compound/redirect argv routed to human: ${cmd.slice(0, 120)}` };
+      if (SUBSTITUTION.test(cmd)) return { verdict: policy.substitutionExec, principle: "hard:command-substitution", reason: `command/process substitution routed to human: ${cmd.slice(0, 120)}` };
+      if (BENIGN_COMPOUND.test(cmd)) return { verdict: policy.compoundExec, principle: "hard:compound-exec", reason: `compound/redirect: ${cmd.slice(0, 120)}` };
     }
     return ALLOW;
   }
