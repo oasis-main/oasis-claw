@@ -131,8 +131,16 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         enforced: mode === "enforce" && decision.verdict !== "allow",
       });
     } catch (err) {
-      write({ ts: new Date().toISOString(), phase: "before_tool_call", mode, bot: botKey, toolName, error: String((err as Error)?.message ?? err) });
-      return; // fail-open on internal reviewer error: a bug must not brick the fleet
+      write({ ts: new Date().toISOString(), phase: "before_tool_call", mode, bot: botKey, toolName, error: String((err as Error)?.message ?? err), enforced: mode === "enforce" });
+      // CLAW-073 FAIL-CLOSE: a reviewer that cannot form a verdict must not wave the
+      // call through. In ENFORCE this now DENIES the erroring call (matching the
+      // design's stated fail-closed posture — openclaw's hook-runner is fail-closed,
+      // but our own try/catch used to swallow that into an allow). Kept mode-aware:
+      // SHADOW bots still observe-only (never block), so a reviewer bug can brick
+      // neither a shadow bot nor the fleet — only the single erroring call on an
+      // already-enforcing bot is denied. Degrade-safe, not brick.
+      if (mode === "enforce") return { block: true, blockReason: "reviewer: internal error (fail-closed)" };
+      return;
     }
 
     if (mode !== "enforce") return; // shadow: log only
