@@ -152,7 +152,10 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
           title: "Reviewer approval required",
           description: `${decision.reason}\n(rule: ${decision.principle}, bot: ${botKey}, tool: ${toolName})`,
           severity: "warning" as const,
-          timeoutMs: 90_000,
+          // 3 min: the operator copy-pastes `/approve <id> <decision>` from the DM;
+          // 90s was too tight (a late reply hit "unknown or expired approval id").
+          // Unattended still fail-closes (timeoutBehavior:"deny").
+          timeoutMs: 180_000,
           timeoutBehavior: "deny" as const,
           allowedDecisions: ["allow-once", "allow-always", "deny"] as const,
         },

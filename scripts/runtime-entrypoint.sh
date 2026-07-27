@@ -1261,6 +1261,29 @@ elif _auto_review:
           f"security={_exec_security or '(unset)'}/ask={_exec_ask or '(unset)'} is not the "
           f"allowlist+on-miss shape; autoReview stays OFF")
 
+# ---- Layer 2e: EXPLICIT exec-mode override (CLAW-073, reviewer-gated exec) ----
+# When OASIS_EXEC_MODE is set it is AUTHORITATIVE and wins over Layer 2d + the raw
+# security/ask knobs (schema: "Normalized exec policy mode. Prefer this over raw
+# security/ask knobs."). openclaw's resolveExecPolicyForMode (dist, verified
+# 2026-07-27): full → security=full, ask=off, autoReview=false; allowlist →
+# security=allowlist, ask=off. mode=full removes the deny-by-default allowlist
+# FLOOR so the oasis-reviewer before_tool_call hook becomes the SOLE exec gate —
+# safe single commands auto-allow, compound/destructive/self-runtime escalate|deny,
+# and an APPROVED command actually RUNS (under allowlist it was vetoed AFTER
+# approval → the CLAW-072 conflict Mike hit). Set EXPLICITLY (not just via
+# OASIS_EXEC_SECURITY) because openclaw.json persists across recreates: a stale
+# tools.exec.mode from a prior boot would clamp security back down via
+# minSecurity(mode.security, agent.security). SAFETY: only meaningful with the
+# reviewer ENFORCING; the self-modification vector is covered by the reviewer's
+# fleet-always `openclaw` escalate + control-plane :ro mount + locked egress.
+_exec_mode_override = os.environ.get("OASIS_EXEC_MODE", "").strip()
+if _exec_mode_override:
+    tools_cfg = config.setdefault("tools", {})
+    exec_tcfg = tools_cfg.setdefault("exec", {})
+    exec_tcfg["mode"] = _exec_mode_override
+    print(f"[entrypoint] exec mode: {_exec_mode_override} (EXPLICIT override — the "
+          f"oasis-reviewer hook is the sole exec gate)")
+
 config_path.parent.mkdir(parents=True, exist_ok=True)
 config_path.write_text(json.dumps(config, indent=2) + "\n")
 print(f"[entrypoint] wrote {config_path}")

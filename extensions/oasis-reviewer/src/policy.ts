@@ -71,6 +71,7 @@ interface PolicyFile {
       compoundExec?: Verdict;
       gitignoredWrite?: Verdict;
       escalateExecPatterns?: Record<string, string>;
+      escalateExecAlways?: Record<string, string>; // fleet-always (no per-bot opt-in)
     };
     per_bot?: Record<
       string,
@@ -131,6 +132,21 @@ export function resolveHardPolicy(policy: PolicyFile | null, botKey: string): Ha
       regex.push(new RegExp(src, "i"));
     } catch {
       /* skip a malformed per-bot pattern rather than fail the whole policy */
+    }
+  }
+  // SELF-MODIFICATION backstop (fleet invariant, ALWAYS on — no per-bot opt-in):
+  // exec commands that drive the bot's OWN openclaw runtime CLI → escalate. This
+  // is the Layer 1 deterministic floor under the constitution's no-self-
+  // modification principle, and it is load-bearing the moment a bot runs
+  // mode=full (reviewer-gated exec): without an allowlist, `openclaw config set`
+  // in a live container would otherwise default-allow and drift the config into a
+  // crash. Fleet-wide because "a bot must not rewrite its own runtime" holds for
+  // every bot, not just the ones that opted into escalateActions.
+  for (const src of Object.values(f.escalateExecAlways ?? {})) {
+    try {
+      regex.push(new RegExp(src, "i"));
+    } catch {
+      /* skip a malformed fleet pattern rather than fail the whole policy */
     }
   }
   return {
