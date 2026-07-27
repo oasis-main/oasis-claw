@@ -314,6 +314,25 @@ if inbound_env_name:
     # wedges — recovered on wake; the fleet watchdog (make watchdog-install, 90s) is
     # the primary fast-recovery path. This is a modest secondary trim.
     tg["pollingStallThresholdMs"] = 75000
+    # CLAW-073: OPEN THE NATIVE EXEC/PLUGIN APPROVAL DELIVERY ROUTE. The reviewer's
+    # `escalate` returns openclaw's native {requireApproval}; openclaw's telegram
+    # approval capability only opens a delivery route when the approver count is > 0
+    # (dist approval-client-helpers isChannelExecApprovalClientEnabledFromConfig:
+    # approverCount<=0 → disabled, EVEN with enabled="auto" and a valid turn-source
+    # DM present). The approver list = channels.telegram.execApprovals.approvers ∪
+    # commands.ownerAllowFrom; both were empty, so every escalate bounced "Plugin
+    # approval unavailable (no approval route)". Setting ownerAllowFrom to the same
+    # operator id as allowFrom (Mike) makes approverCount=1 → the route opens and
+    # delivers "🛡️ … /approve <id> allow-once|allow-always|deny" to Mike's ORIGIN
+    # DM, AND authorizes that id to RESOLVE via /approve. enabled stays default
+    # "auto" (opens once an approver exists). No device pairing needed on the native
+    # channel path. Fleet-wide + harmless on shadow bots (they never escalate).
+    if operator_user_id and operator_user_id.lstrip("-").isdigit():
+        commands_cfg = config.setdefault("commands", {})
+        owner_allow = commands_cfg.get("ownerAllowFrom") or []
+        if operator_user_id not in owner_allow:
+            owner_allow.append(operator_user_id)
+        commands_cfg["ownerAllowFrom"] = owner_allow
 
 # ---- per-plugin config (registration is handled by `plugins install`) ----
 plugins = config.setdefault("plugins", {})
