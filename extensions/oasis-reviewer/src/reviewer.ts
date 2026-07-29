@@ -8,6 +8,7 @@ import {
   DEFAULT_HARD_POLICY,
   evaluateHard,
   loadPolicyFile,
+  NEVER_DOWNGRADE,
   resolveHardPolicy,
   type Decision,
   type HardPolicy,
@@ -18,6 +19,30 @@ import { judgeConstitution, type LlmComplete } from "./layer2.js";
 // burst of ambiguous calls can't spawn dozens of top-tier completions at once.
 const L2_MAX_INFLIGHT = 3;
 let l2InFlight = 0;
+
+// ── Unattended runs (CLAW-078) ────────────────────────────────────────────────
+// An escalate needs a human. In a cron- or webhook-triggered turn there is none,
+// so `requireApproval` just burns its timeout and fail-closes to deny — which is
+// how the 2026-07-29 Nimbus regression presented (working cron jobs "rejected").
+// openclaw tags those turns via the hook context's sessionKey:
+//   cron:<jobId>   gateway/server-cron.ts:226, cron/isolated-agent/run.ts:496
+//   hook:<uuid>    gateway/hooks.ts:345 (inbound webhook-triggered session)
+// Consent moves to AUTHORING time (hard:cron-mutation gates add/update/remove),
+// so at run time an ordinary escalate downgrades to allow. NEVER_DOWNGRADE
+// escalations still fail closed. Overridable per bot without a rebuild.
+// KNOWN GAP: a cron job with an explicit sessionTarget gets that session's key
+// instead of `cron:` (cron/session-target.ts:18), and heartbeat turns have no
+// distinct prefix at all — so both are still treated as attended. Every audit row
+// now records sessionKey, so the real prefixes can be read off live data instead
+// of guessed at.
+const UNATTENDED_PREFIXES = (process.env.OASIS_REVIEWER_UNATTENDED_PREFIXES ?? "cron:,hook:")
+  .split(",")
+  .map((p) => p.trim())
+  .filter((p) => p.length > 0);
+
+function isUnattended(sessionKey: string): boolean {
+  return UNATTENDED_PREFIXES.some((p) => sessionKey.startsWith(p));
+}
 
 // ── Unified reviewer (.swarm/UNIFIED_REVIEWER.md) ──────────────────────────────
 // before_tool_call hook → Layer 1 (hard, deterministic, per-bot from
@@ -138,12 +163,44 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
       const paramsJson = safeJson(params);
       const sessionId = ctx?.sessionId ?? "unknown";
 
+      // ── Unattended adjustment (CLAW-078) ──
+      // Applied BEFORE the audit write so the row records the decision actually
+      // enforced. Denies are untouched: an unattended run gets no free pass on
+      // destructive/exfil/control-plane. Only escalations move, because unattended
+      // they are unanswerable.
+      const sessionKey = String(ctx?.sessionKey ?? "");
+      const unattended = isUnattended(sessionKey);
+      let downgraded = false;
+      if (unattended && decision.verdict === "escalate") {
+        if (NEVER_DOWNGRADE.has(decision.principle)) {
+          decision = {
+            verdict: "deny",
+            principle: decision.principle,
+            reason: `${decision.reason} — no approver in an unattended run (${sessionKey}); failing closed`,
+          };
+        } else {
+          downgraded = true;
+          decision = {
+            verdict: "allow",
+            principle: `${decision.principle}+unattended-downgrade`,
+            reason: `${decision.reason} — allowed unattended (${sessionKey}); consent was given when the job was authored`,
+          };
+        }
+      }
+
       write({
         ts: new Date().toISOString(),
         phase: "before_tool_call",
         mode,
         bot: botKey,
         sessionId,
+        // sessionKey is the trigger fingerprint (cron:<jobId>, hook:<uuid>, or a
+        // channel session key). Recorded on EVERY row so the unattended-prefix list
+        // stays evidence-based — this is how we find the heartbeat/sessionTarget
+        // keys that prefix-matching misses today.
+        sessionKey: sessionKey || null,
+        unattended,
+        downgraded,
         agentId: ctx?.agentId ?? null,
         toolCallId: event.toolCallId ?? null,
         toolName,

@@ -29,6 +29,12 @@ export interface HardPolicy {
   denyWriteOutsideAllow: boolean;
   // exec commands matching any of these regexes → escalate (operator-consent)
   escalateExecRegex: RegExp[];
+  // SELF-MODIFICATION backstop, kept SEPARATE from escalateExecRegex so it carries
+  // its own principle (hard:self-runtime). Two reasons: (1) the audit used to label
+  // a `gog` call "operator-consent-action", which was actively misleading during the
+  // 2026-07-29 cron incident; (2) unattended runs may auto-downgrade ordinary
+  // escalations, and this one must NEVER be downgraded (see NEVER_DOWNGRADE).
+  selfRuntimeExecRegex: RegExp[];
 }
 
 export const DEFAULT_HARD_POLICY: HardPolicy = {
@@ -42,7 +48,24 @@ export const DEFAULT_HARD_POLICY: HardPolicy = {
   escalateWriteRoots: [],
   denyWriteOutsideAllow: false,
   escalateExecRegex: [],
+  selfRuntimeExecRegex: [],
 };
+
+// Cron job MUTATION actions on openclaw's native `cron` agent tool
+// (src/agents/tools/cron-tool.ts CRON_ACTIONS = status|list|add|update|remove|run|
+// runs|wake). add/update/remove change WHAT runs unattended later, so they are the
+// authoring-time consent point: gate these, and an unattended run needs no
+// per-call approval (CLAW-078). status/list/runs are reads; run/wake only trigger
+// an ALREADY-approved job, so both stay allow.
+const CRON_MUTATE_ACTIONS = new Set(["add", "update", "remove"]);
+
+// Escalations that must NEVER be auto-downgraded to allow in an unattended run.
+// Everything else may be downgraded (an unattended escalate is otherwise a
+// guaranteed fail-closed deny — nobody is there to answer). These two are the
+// privilege-escalation paths: a cron/webhook turn that can rewrite its own runtime
+// (`openclaw config set`) or author new cron jobs would be self-perpetuating, so
+// unattended they FAIL CLOSED (deny) instead.
+export const NEVER_DOWNGRADE = new Set(["hard:self-runtime", "hard:cron-mutation"]);
 
 const ALLOW: Decision = { verdict: "allow", principle: "hard:default-allow", reason: "" };
 
@@ -156,9 +179,10 @@ export function resolveHardPolicy(policy: PolicyFile | null, botKey: string): Ha
   // in a live container would otherwise default-allow and drift the config into a
   // crash. Fleet-wide because "a bot must not rewrite its own runtime" holds for
   // every bot, not just the ones that opted into escalateActions.
+  const selfRuntime: RegExp[] = [];
   for (const src of Object.values(f.escalateExecAlways ?? {})) {
     try {
-      regex.push(new RegExp(src, "i"));
+      selfRuntime.push(new RegExp(src, "i"));
     } catch {
       /* skip a malformed fleet pattern rather than fail the whole policy */
     }
@@ -174,6 +198,7 @@ export function resolveHardPolicy(policy: PolicyFile | null, botKey: string): Ha
     escalateWriteRoots: b.escalateWriteRoots ?? [],
     denyWriteOutsideAllow: b.denyWriteOutsideAllow === true,
     escalateExecRegex: regex,
+    selfRuntimeExecRegex: selfRuntime,
   };
 }
 
@@ -234,6 +259,23 @@ export function evaluateHard(input: EvalInput, policy: HardPolicy = DEFAULT_HARD
   const params = input.params ?? {};
   const cwd = firstString(params, "cwd", "workingDir", "dir") || undefined;
 
+  // ── Cron authoring is the consent point (CLAW-078) ──
+  // Gate MUTATIONS of the schedule itself (add/update/remove on openclaw's native
+  // `cron` tool). Reviewing at authoring time is what lets an unattended RUN skip
+  // per-call approval: Mike approves what will run, once, while he is present.
+  // Checked before the family dispatch because `cron` classifies as "other".
+  if (input.toolName === "cron") {
+    const action = firstString(params, "action").toLowerCase();
+    if (CRON_MUTATE_ACTIONS.has(action)) {
+      return {
+        verdict: "escalate",
+        principle: "hard:cron-mutation",
+        reason: `cron ${action} changes what runs unattended later — needs Mike's approval`,
+      };
+    }
+    return ALLOW; // status | list | runs | run | wake
+  }
+
   if (input.family === "exec") {
     const cmd = firstString(params, "command", "cmd", "script", "input", "code");
     if (cmd) {
@@ -241,6 +283,9 @@ export function evaluateHard(input: EvalInput, policy: HardPolicy = DEFAULT_HARD
         if (re.test(cmd)) return { verdict: policy.destructiveExec, principle: "hard:destructive-exec", reason: `refusing destructive command: ${cmd.slice(0, 120)}` };
       }
       if (DOWNLOAD_EXEC.test(cmd)) return { verdict: "deny", principle: "hard:download-execute", reason: `refusing pipe/decode into a shell (obfuscated RCE): ${cmd.slice(0, 120)}` };
+      for (const re of policy.selfRuntimeExecRegex) {
+        if (re.test(cmd)) return { verdict: "escalate", principle: "hard:self-runtime", reason: `driving this bot's own openclaw runtime needs Mike's approval: ${cmd.slice(0, 120)}` };
+      }
       for (const re of policy.escalateExecRegex) {
         if (re.test(cmd)) return { verdict: "escalate", principle: "hard:operator-consent-action", reason: `action needs Mike's slash-command approval: ${cmd.slice(0, 120)}` };
       }
@@ -265,7 +310,15 @@ export function evaluateHard(input: EvalInput, policy: HardPolicy = DEFAULT_HARD
         for (const root of policy.denyWriteRoots) {
           if (underRoot(p, root)) return { verdict: "deny", principle: "hard:deny-write-control-plane", reason: `write to control-plane path denied: ${p}` };
         }
-        if (policy.denyWriteOutsideAllow && policy.allowWriteRoots.length > 0) {
+        // Write-scoping applies to MIKE's real filesystem (/reach/*) only. A bot's
+        // own container-private dirs — /home/node/.openclaw (memory + workspace),
+        // /report, /tmp, its work volumes — are always its to write: the rootfs is
+        // read-only and the control-plane deny above already fences oasis-claw, so
+        // nothing sensitive lives outside /reach to protect. WITHOUT this gate, a
+        // scoped bot whose allowWriteRoots only names /reach paths would have its OWN
+        // memory writes denied as "out of scope" — the enforce brick that stops a bot
+        // from functioning at all (CLAW-074 companion-reach rollout).
+        if (policy.denyWriteOutsideAllow && policy.allowWriteRoots.length > 0 && underRoot(p, "/reach")) {
           const inScope = policy.allowWriteRoots.some((r) => underRoot(p, r));
           if (!inScope) return { verdict: "deny", principle: "hard:write-out-of-scope", reason: `write outside this bot's allowed roots (${policy.allowWriteRoots.join(", ")}) denied: ${p}` };
         }
