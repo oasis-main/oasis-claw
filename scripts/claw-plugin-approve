@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""
+claw-plugin-approve — Telegram-independent transport for PLUGIN approvals (CLAW-077).
+
+WHY THIS EXISTS
+
+The oasis-reviewer escalate path returns `{requireApproval}` from the
+before_tool_call hook. openclaw 2026.7.1-2 delivers that as a slash-command card
+("/approve <id> allow-once|allow-always|deny") into the turn-source Telegram DM,
+and the inbound /approve resolves it. That route WORKS, but it is RACY, and the
+race is structural rather than a bug we can tune away:
+
+  The hook BLOCKS the agent turn while it waits for the decision. The blocked
+  turn holds its per-chat Telegram ingress-spool lane. Mike's /approve arrives on
+  that SAME lane, so it queues BEHIND the thing it is meant to release and gets
+  adopted late. Measured 2026-07-27: 3 of 5 approvals landed; the other 2 died
+  "Approval timed out" / "unknown or expired approval id".
+
+This script sidesteps the lane entirely. It talks to the gateway RPC directly
+(`plugin.approval.list` / `plugin.approval.resolve`), so the decision never
+travels through Telegram and can never queue behind the turn it is releasing.
+Same transport claw-exec-approve uses for the older exec-approval subsystem —
+that one was written when the Telegram button path went silent (CLAW-070); this
+is the same medicine for the plugin subsystem.
+
+USAGE
+
+  scripts/claw-plugin-approve list yesman              # what is pending + ids
+  scripts/claw-plugin-approve resolve yesman <id>              # allow-once
+  scripts/claw-plugin-approve resolve yesman <id> allow-always
+  scripts/claw-plugin-approve resolve yesman <id> deny
+
+`list` is the important half: it means an approval is actionable even when the
+Telegram card never arrived, so you are never blind to a pending escalation.
+
+NOTES / TRAPS (both already paid for in claw-approve-v2 + claw-exec-approve)
+
+  • deviceIdentity=null + clientName=gateway-client + mode=backend is what lets a
+    headless caller request scopes at all (trap-2 in claw-approve).
+  • Caller scope MUST be operator.admin, NOT operator.approvals. Approval records
+    are device-bound to the requester (isApprovalRecordVisibleToClient in
+    gateway/server-methods/approval-shared.ts): it compares
+    requestedByDeviceId === clientDeviceId, and our headless client has
+    clientDeviceId=null, so the device match fails and the record reads back as
+    "unknown or expired". operator.admin trips the gate's first clause and skips
+    the device check. Verified live for exec approvals 2026-07-23.
+  • The gateway token IS an ephemeral scope elevation — it is read out of the
+    target container and never persisted here.
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+
+# Plugin-approval decisions the reviewer offers (PluginApprovalResolutions minus
+# the outcome-only values timeout/cancelled, which a caller cannot send).
+VALID_DECISIONS = ["allow-once", "allow-always", "deny"]
+
+# Nimbus is not a bots/ service — it IS the base `openclaw` service, so its
+# container name does not follow the oasis-claw-<bot> pattern.
+_CONTAINER_OVERRIDES = {
+    "nimbus": "oasis-claw-runtime",
+    "openclaw": "oasis-claw-runtime",
+}
+
+
+def container(bot):
+    return _CONTAINER_OVERRIDES.get(bot, f"oasis-claw-{bot}")
+
+
+def gateway_token(bot):
+    out = subprocess.run(
+        ["docker", "exec", container(bot), "python3", "-c",
+         "import json;print(json.load(open('/home/node/.openclaw/openclaw.json'))"
+         "['gateway']['auth']['token'])"],
+        capture_output=True, text=True, timeout=30,
+    )
+    tok = out.stdout.strip()
+    if not tok:
+        raise SystemExit(
+            f"[claw-plugin-approve] no gateway token in {container(bot)}: "
+            f"{out.stderr.strip()[:200]}"
+        )
+    return tok
+
+
+# Identical headless RPC harness to claw-exec-approve / claw-approve-v2.
+_NODE_HEADLESS_RPC = r"""
+import { callGatewayFromCli } from 'file:///usr/local/lib/node_modules/openclaw/dist/plugin-sdk/gateway-runtime.js';
+
+const method     = process.env.RPC_METHOD;
+const paramsJson = process.env.RPC_PARAMS;
+const scopesJson = process.env.RPC_SCOPES;
+const token      = process.env.GWT;
+if (!token || !method || !paramsJson || !scopesJson) {
+  console.error('missing env: need GWT, RPC_METHOD, RPC_PARAMS, RPC_SCOPES');
+  process.exit(2);
+}
+try {
+  const result = await callGatewayFromCli(
+    method,
+    { url: 'ws://127.0.0.1:18789', token, json: true, timeout: '15000' },
+    JSON.parse(paramsJson),
+    {
+      deviceIdentity: null,
+      clientName: 'gateway-client',
+      mode: 'backend',
+      scopes: JSON.parse(scopesJson),
+      progress: false,
+    }
+  );
+  process.stdout.write(JSON.stringify(result ?? {}));
+} catch (err) {
+  console.error(err && err.message ? err.message : String(err));
+  process.exit(1);
+}
+"""
+
+
+def call_gateway_headless(bot, token, method, params, scopes):
+    out = subprocess.run(
+        ["docker", "exec", "-i",
+         "-e", f"GWT={token}",
+         "-e", f"RPC_METHOD={method}",
+         "-e", f"RPC_PARAMS={json.dumps(params)}",
+         "-e", f"RPC_SCOPES={json.dumps(list(scopes))}",
+         container(bot),
+         "node", "--input-type=module", "-e", _NODE_HEADLESS_RPC],
+        capture_output=True, text=True, timeout=45,
+    )
+    if out.returncode != 0:
+        err = (out.stderr or out.stdout).strip()
+        raise RuntimeError(f"headless RPC failed ({method}): {err[:500]}")
+    try:
+        return json.loads(out.stdout.strip() or "{}")
+    except json.JSONDecodeError:
+        raise RuntimeError(
+            f"headless RPC returned non-JSON ({method}): {out.stdout[:300]}"
+        )
+
+
+def cmd_list(args):
+    token = gateway_token(args.bot)
+    result = call_gateway_headless(
+        args.bot, token, "plugin.approval.list", {}, ["operator.admin"],
+    )
+    # plugin.approval.list returns a BARE ARRAY (verified live 2026-07-29); older
+    # /related methods wrap it under approvals/requests, so accept both shapes.
+    if isinstance(result, list):
+        rows = result
+    elif isinstance(result, dict):
+        rows = result.get("approvals") or result.get("requests") or []
+    else:
+        rows = []
+    if not isinstance(rows, list) or not rows:
+        print(f"[claw-plugin-approve] no pending plugin approvals on {args.bot}")
+        return 0
+    print(f"[claw-plugin-approve] {len(rows)} pending on {args.bot}:")
+    for r in rows:
+        if not isinstance(r, dict):
+            print(f"  - {r}")
+            continue
+        rid = r.get("id") or r.get("approvalId") or "?"
+        title = r.get("title") or r.get("pluginId") or ""
+        desc = str(r.get("description") or "").replace("\n", " ")[:110]
+        print(f"  - id={rid}\n      {title}\n      {desc}")
+    print(f"\nResolve with: scripts/claw-plugin-approve resolve {args.bot} <id> [{'|'.join(VALID_DECISIONS)}]")
+    return 0
+
+
+def cmd_resolve(args):
+    token = gateway_token(args.bot)
+    print(
+        f"[claw-plugin-approve] resolving {args.approval_id} "
+        f"decision={args.decision} on {args.bot}"
+    )
+    result = call_gateway_headless(
+        args.bot, token, "plugin.approval.resolve",
+        {"id": args.approval_id, "decision": args.decision},
+        # operator.admin, not operator.approvals — see module docstring.
+        ["operator.admin"],
+    )
+    print(f"[claw-plugin-approve] resolved: {json.dumps(result)}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="List/resolve openclaw PLUGIN approvals out-of-band (no Telegram).",
+    )
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_list = sub.add_parser("list", help="show pending plugin approvals + ids")
+    p_list.add_argument("bot", help="bot short-name (yesman, house, nimbus, …)")
+    p_list.set_defaults(func=cmd_list)
+
+    p_res = sub.add_parser("resolve", help="resolve one pending approval")
+    p_res.add_argument("bot", help="bot short-name (yesman, house, nimbus, …)")
+    p_res.add_argument("approval_id", help="id from `list` or the Telegram card")
+    p_res.add_argument("decision", nargs="?", default="allow-once",
+                       choices=VALID_DECISIONS,
+                       help=f"one of {VALID_DECISIONS} (default: allow-once)")
+    p_res.set_defaults(func=cmd_resolve)
+
+    args = ap.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
