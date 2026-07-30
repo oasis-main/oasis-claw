@@ -12,8 +12,9 @@ import {
   resolveHardPolicy,
   type Decision,
   type HardPolicy,
+  type Verdict,
 } from "./policy.js";
-import { judgeConstitution, type LlmComplete } from "./layer2.js";
+import { judgeConstitution, type Layer2Decision, type LlmComplete } from "./layer2.js";
 
 // Layer 2 concurrency cap — bound the number of in-flight model judgments so a
 // burst of ambiguous calls can't spawn dozens of top-tier completions at once.
@@ -42,6 +43,21 @@ const UNATTENDED_PREFIXES = (process.env.OASIS_REVIEWER_UNATTENDED_PREFIXES ?? "
 
 function isUnattended(sessionKey: string): boolean {
   return UNATTENDED_PREFIXES.some((p) => sessionKey.startsWith(p));
+}
+
+// Layer 2 may only ever TIGHTEN Layer 1 — the constitution is a second lock, not a
+// key. A model that has just read attacker-controllable bytes must never be able to
+// talk the deterministic layer down, so the combined verdict is the stricter of the
+// two and a looser L2 opinion is discarded (recorded in the audit either way).
+const STRICTNESS: Record<Verdict, number> = { allow: 0, escalate: 1, deny: 2 };
+
+function tightenOnly(l1: Decision, l2: Layer2Decision): Decision {
+  if (STRICTNESS[l2.verdict] <= STRICTNESS[l1.verdict]) return l1;
+  return {
+    verdict: l2.verdict,
+    principle: `l2:${l2.principle || "constitution"}`,
+    reason: l2.reason || `constitution tightened ${l1.verdict} → ${l2.verdict}`,
+  };
 }
 
 // ── Unified reviewer (.swarm/UNIFIED_REVIEWER.md) ──────────────────────────────
@@ -123,11 +139,17 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
   const alwaysConstitutional = constitutionalReviewRequired(policy, botKey);
 
   // Layer 2 (constitution, model-judged). SHADOW-first: OASIS_REVIEWER_L2 ∈
-  // off|shadow (enforce is a later increment). Uses the plugin runtime's
-  // llm.complete (top-tier model). Degrades to off if the runtime doesn't expose
-  // it. Never blocks the hook — the judgment fires async and lands in the audit.
+  // off | shadow | enforce. Uses the plugin runtime's llm.complete; degrades to off
+  // if the runtime doesn't expose it. SHADOW is async/log-only. ENFORCE awaits the
+  // judgment and lets it TIGHTEN the L1 verdict — that costs real latency per judged
+  // call, which is the price of a verdict that can actually stop the call.
   const l2Mode = (process.env.OASIS_REVIEWER_L2 ?? "off").toLowerCase();
   const l2Model = process.env.OASIS_REVIEWER_MODEL || undefined; // default: agent's own model
+  const l2All = process.env.OASIS_REVIEWER_L2_ALL === "1";
+  // Enforce blocks the tool call on this call, so the default is tighter than the
+  // shadow-era 20s: a judge that has not answered in 12s is treated as unavailable
+  // (fail-closed for constitutionalReviewRequired bots, L1-fallback otherwise).
+  const l2TimeoutMs = Number(process.env.OASIS_REVIEWER_L2_TIMEOUT_MS ?? "12000") || 12_000;
   const runtime = (api as unknown as { runtime?: { llm?: { complete?: LlmComplete } } }).runtime;
   const l2Complete: LlmComplete | undefined =
     l2Mode !== "off" && typeof runtime?.llm?.complete === "function"
@@ -137,7 +159,7 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
     api.logger.info("oasis-reviewer: Layer 2 requested but runtime.llm.complete unavailable — L2 stays OFF");
   }
 
-  api.on("before_tool_call", (event: Record<string, unknown>, ctx: Record<string, unknown>) => {
+  api.on("before_tool_call", async (event: Record<string, unknown>, ctx: Record<string, unknown>) => {
     let decision: Decision = { verdict: "allow", principle: "hard:default-allow", reason: "" };
     let toolName = "unknown";
     let needsConstitution = false;
@@ -155,21 +177,78 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
       // ── Layer 2: constitution (model-judged) ──
       // Runs on the ambiguous middle (Layer 1 allowed) — and ALWAYS for bots
       // flagged constitutionalReviewRequired (nimbus/helloworld: judge every ask
-      // for secret-malicious use of google data). Layer 2 may only TIGHTEN. It
-      // fires below (async, shadow) when OASIS_REVIEWER_L2 != off.
+      // for secret-malicious use of google data). Layer 2 may only TIGHTEN.
       needsConstitution = constitution.length > 0 && (decision.verdict === "allow" || alwaysConstitutional);
 
       const subject = subjectOf(family, params, derivedPaths);
       const paramsJson = safeJson(params);
       const sessionId = ctx?.sessionId ?? "unknown";
-
-      // ── Unattended adjustment (CLAW-078) ──
-      // Applied BEFORE the audit write so the row records the decision actually
-      // enforced. Denies are untouched: an unattended run gets no free pass on
-      // destructive/exfil/control-plane. Only escalations move, because unattended
-      // they are unanswerable.
       const sessionKey = String(ctx?.sessionKey ?? "");
       const unattended = isUnattended(sessionKey);
+
+      // ── Which calls are worth a model judgment ──
+      // constitutionalReviewRequired bots (nimbus/helloworld) → EVERY call: their
+      // whole point is judging intent around Mike's Google data, and a read is
+      // exactly how exfil starts. Everyone else → the acting families (exec, file
+      // writes, web). Pure reads on those bots stay unjudged: L1 already denies
+      // secret reads, and a model call per `ls` is latency and spend for little
+      // signal. Set OASIS_REVIEWER_L2_ALL=1 to judge every call on every bot.
+      const isWriteLike =
+        family === "file" &&
+        (/write|edit|patch|create|append|mkdir|mv|cp|rm|delete|tee/i.test(toolName) ||
+          (!!params && ("content" in params || "text" in params)));
+      const l2Worthwhile = l2All || alwaysConstitutional || family === "exec" || isWriteLike || family === "web";
+      const l2Eligible = needsConstitution && l2Worthwhile && !!l2Complete && l2Mode !== "off";
+
+      let l2Row: Record<string, unknown> | null = null;
+
+      // ── Layer 2 ENFORCE: await the judgment and let it tighten ──
+      // Blocking on purpose. A verdict that lands after the tool ran is an audit
+      // note, not a control, so enforcement has to pay the latency (~2s measured).
+      // The concurrency cap deliberately does NOT apply here: skipping a judgment
+      // under load would silently drop governance instead of applying it. Parallel
+      // fan-out is bounded anyway — an agent issues its tool calls one at a time,
+      // so concurrency tracks the number of simultaneously-active turns.
+      if (l2Eligible && l2Mode === "enforce") {
+        const l1 = decision;
+        const r = await judgeConstitution(
+          l2Complete as LlmComplete,
+          { botKey, toolName, family, subject, params: paramsJson, constitution },
+          { model: l2Model, timeoutMs: l2TimeoutMs },
+        );
+        const combined = r.decision ? tightenOnly(l1, r.decision) : null;
+        if (combined) {
+          decision = combined;
+        } else if (alwaysConstitutional) {
+          // No verdict (timeout / unreachable model / unparseable JSON) on a bot
+          // whose constitution is MANDATORY. Falling back to L1 here would recreate
+          // exactly the "constitutionalReviewRequired has no teeth" gap, so this
+          // fails CLOSED instead.
+          decision = {
+            verdict: "deny",
+            principle: "l2:unavailable-fail-closed",
+            reason: `constitution could not be evaluated (${r.error ?? "unparseable verdict"}) and is mandatory for ${botKey}`,
+          };
+        }
+        // Other bots: keep the L1 verdict (L1 is still a real gate) — recorded below.
+        l2Row = {
+          l2Verdict: r.decision?.verdict ?? null,
+          l2Principle: r.decision?.principle ?? null,
+          l2Reason: r.decision?.reason ?? null,
+          l2AgreesWithL1: r.decision ? r.decision.verdict === l1.verdict : null,
+          l2Ms: r.ms,
+          l2ParseFail: r.decision ? undefined : (r.raw || null),
+          l2Error: r.error ?? null,
+          l2Tightened: !!combined && combined.verdict !== l1.verdict,
+          l2FailClosed: !r.decision && alwaysConstitutional,
+        };
+      }
+
+      // ── Unattended adjustment (CLAW-078) ──
+      // Applied to the COMBINED L1+L2 verdict, so an escalate the constitution
+      // raised is handled the same way as one L1 raised. Denies are untouched: an
+      // unattended run gets no free pass on destructive/exfil/control-plane. Only
+      // escalations move, because unattended they are unanswerable.
       let downgraded = false;
       if (unattended && decision.verdict === "escalate") {
         if (NEVER_DOWNGRADE.has(decision.principle)) {
@@ -189,6 +268,7 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
       }
 
       write({
+        ...(l2Row ?? {}),
         ts: new Date().toISOString(),
         phase: "before_tool_call",
         mode,
@@ -211,37 +291,28 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         verdict: decision.verdict,
         principle: decision.principle,
         reason: decision.reason,
-        layer2Pending: needsConstitution,
+        l2Mode,
+        l2Judged: l2Eligible,
+        layer2Pending: l2Eligible && l2Mode === "shadow",
         enforced: mode === "enforce" && decision.verdict !== "allow",
       });
 
-      // ── Layer 2 (constitution, model-judged) — SHADOW: fire-and-forget ──
-      // Non-blocking: the hook returns the Layer 1 verdict immediately; the model
-      // judgment lands in the audit as a separate `phase:"layer2"` row. Bounded by
-      // a concurrency cap so a burst can't spawn many top-tier completions. In
-      // shadow this NEVER changes the enforced decision — it only records what the
-      // constitution would say, so it can be calibrated before it enforces.
-      // Cost gate for the shadow increment: L2 judges the genuinely-ambiguous
-      // middle, not every benign read. Fire on file-WRITES + web + always for the
-      // google-data bots (nimbus/helloworld). Exec is deferred — it is already
-      // deterministically gated by L1 (destructive/download-exec/substitution/
-      // self-runtime), so L2-on-exec is a later increment.
-      const isWriteLike =
-        family === "file" &&
-        (/write|edit|patch|create|append|mkdir|mv|cp|rm|delete|tee/i.test(toolName) ||
-          (!!params && ("content" in params || "text" in params)));
-      const l2Worthwhile = alwaysConstitutional || isWriteLike || family === "web";
-      if (needsConstitution && l2Worthwhile && l2Complete && l2Mode !== "off" && l2InFlight < L2_MAX_INFLIGHT) {
+      // ── Layer 2 SHADOW: fire-and-forget ──
+      // Non-blocking: the hook returns the Layer 1 verdict immediately and the model
+      // judgment lands later as a separate `phase:"layer2"` row, recording what the
+      // constitution WOULD have said. Concurrency-capped, because in shadow a
+      // dropped judgment costs only a log line.
+      if (l2Eligible && l2Mode === "shadow" && l2InFlight < L2_MAX_INFLIGHT) {
         l2InFlight++;
         const l1Verdict = decision.verdict;
         const l1Principle = decision.principle;
         void judgeConstitution(
-          l2Complete,
+          l2Complete as LlmComplete,
           { botKey, toolName, family, subject, params: paramsJson, constitution },
           // No agentId: passing it is treated as a target-agent OVERRIDE and
           // rejected ("Plugin LLM completion cannot override the target agent").
           // Omitting it uses the ambient agent's own model/credentials.
-          { model: l2Model, timeoutMs: 20_000 },
+          { model: l2Model, timeoutMs: l2TimeoutMs },
         )
           .then((r) => {
             write({
@@ -310,6 +381,8 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
     constitutionPrinciples: constitution.length,
     alwaysConstitutional,
     allowWriteRoots: hardPolicy.allowWriteRoots,
-    layer2: l2Complete ? `${l2Mode} (model=${l2Model ?? "agent-default"})` : "off",
+    layer2: l2Complete
+      ? `${l2Mode} (model=${l2Model ?? "agent-default"}, timeout=${l2TimeoutMs}ms, scope=${l2All ? "all-calls" : alwaysConstitutional ? "all-calls(constitutional-bot)" : "exec+write+web"})`
+      : "off",
   });
 }
