@@ -64,8 +64,11 @@ const CASES: Case[] = [
   C("yesman", "escalate", "exec", "exec", ex("git push origin dev"), "operator-consent: git push"),
   C("yesman", "escalate", "exec", "exec", ex("docker compose restart yesman"), "operator-consent: fleet-reboot"),
   C("yesman", "escalate", "exec", "exec", ex("launchctl load ~/Library/LaunchAgents/x.plist"), "operator-consent: system-config"),
-  C("house", "escalate", "exec", "exec", ex("aws s3 ls s3://bucket"), "house: aws needs consent"),
-  C("vanhelsing", "escalate", "exec", "exec", ex("git clone https://github.com/x/y"), "VH: any git needs consent"),
+  C("house", "allow", "exec", "exec", ex("aws s3 ls s3://bucket"), "house: aws is full-rw, L1 allows (L2 judges intent)"),
+  C("house", "allow", "exec", "exec", ex("aws ec2 describe-instances"), "house: aws describe allowed"),
+  C("vanhelsing", "allow", "exec", "exec", ex("git clone https://github.com/x/y /sandboxes/x"), "VH: clone into sandbox allowed"),
+  C("vanhelsing", "escalate", "exec", "exec", ex("git push origin main"), "VH: push still escalates"),
+  C("vanhelsing", "escalate", "exec", "exec", ex("git remote add up https://x"), "VH: remote add escalates"),
 
   // ── cron: authoring is the consent point ────────────────────────────────────
   C("nimbus", "escalate", "other", "cron", { action: "add", name: "j" }, "cron add gated"),
