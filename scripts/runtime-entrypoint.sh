@@ -1036,15 +1036,16 @@ oasis_gen_url = (
     os.environ.get("OASIS_GENERATION_URL", "").strip() or "http://host.docker.internal:8800/v1"
 )
 if oasis_gen_token:
-    def _gen_model(mid, name, ctx):
-        # input=text only: the gateway's Bedrock passthrough is text-only in v0
-        # (images are dropped), so we don't advertise vision. cost=0 because
-        # metering happens at the gateway, not per-bot.
+    def _gen_model(mid, name, ctx, inputs=None):
+        # input modalities: text everywhere; gpt-5.6-sol also takes images (its
+        # mantle/Responses backend translates image_url -> input_image). The
+        # Converse-backed models stay text-only (that path still drops images).
+        # cost=0 because metering happens at the gateway, not per-bot.
         return {
             "id": mid,
             "name": name,
             "reasoning": True,
-            "input": ["text"],
+            "input": inputs or ["text"],
             "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
             "contextWindow": ctx,
             "maxTokens": 8192,
@@ -1057,13 +1058,16 @@ if oasis_gen_token:
     # generative plan.
     # Roster trimmed to match the gateway catalog (2026-07-24, oasis-generation
     # dev): removed sonnet-4-6 / haiku-4-5 / gpt-oss-120b / deepseek-v3.2 /
-    # llama-4-maverick; added claude-sonnet-5. Keep in sync with the gateway's
-    # catalog.py enabled Bedrock entries — a model NOT enabled there 404s here.
+    # llama-4-maverick; added claude-sonnet-5 and gpt-5.6-sol (the latter served
+    # via the gateway's bedrock_mantle/Responses backend, 272K ctx). Keep in sync
+    # with the gateway's catalog.py enabled entries — a model NOT enabled there
+    # 404s here.
     gen_models = [
         _gen_model("gemma-4-12b-coder", "Gemma-4 12B Coder (Local)", 32768),
         _gen_model("gemma-4-12b-agentic", "Gemma-4 12B Agentic (Local)", 32768),
-        _gen_model("claude-opus-4-8", "Claude Opus 4.8 (Bedrock)", 200000),
-        _gen_model("claude-sonnet-5", "Claude Sonnet 5 (Bedrock)", 200000),
+        _gen_model("claude-opus-4-8", "Claude Opus 4.8 (Bedrock)", 200000, ["text", "image"]),
+        _gen_model("claude-sonnet-5", "Claude Sonnet 5 (Bedrock)", 200000, ["text", "image"]),
+        _gen_model("gpt-5.6-sol", "GPT-5.6-sol (Bedrock)", 272000, ["text", "image"]),
         _gen_model("glm-5", "GLM-5 (Bedrock)", 131072),
     ]
     config.setdefault("models", {}).setdefault("providers", {})["oasis-generation"] = {
@@ -1283,6 +1287,25 @@ if _exec_mode_override:
     exec_tcfg["mode"] = _exec_mode_override
     print(f"[entrypoint] exec mode: {_exec_mode_override} (EXPLICIT override — the "
           f"oasis-reviewer hook is the sole exec gate)")
+
+# ---- Layer 2f: EXPLICIT thinking-level default (UX: reasoning off the answer lane) ----
+# openclaw's resolveThinkingDefault (agents/model-thinking-default.ts:58-63) HARD-CODES
+# anthropic claude-opus-4-7 → "off" unless a config override exists, and it consults
+# agents.defaults.thinkingDefault (line 54-56) BEFORE that hard-off. With thinking off a
+# no-thinking model does its between-step planning in the VISIBLE answer text — the exact
+# mechanism behind Yes Man's per-step re-greeting / narration (verified: session
+# 066066dc, 0 thinking blocks, 6 greetings fused with real planning). Setting this
+# relocates that reasoning into native thinking blocks, which openclaw routes to a
+# SEPARATE, in-place-edited reasoning lane (extensions/telegram bot-message-dispatch) —
+# so the answer lane stays clean (greet once + one report) and reasoning quality lifts.
+# Env-gated so only opted-in bots get it (yesman); unset → openclaw's per-model default
+# (off for opus-4-7) stands. Cost: modest thinking tokens/turn (output, not cached).
+_thinking_level = os.environ.get("OASIS_THINKING_LEVEL", "").strip().lower()
+if _thinking_level:
+    _agents_defaults = config.setdefault("agents", {}).setdefault("defaults", {})
+    _agents_defaults["thinkingDefault"] = _thinking_level
+    print(f"[entrypoint] thinking default: {_thinking_level} (EXPLICIT override — "
+          f"reasoning moves to native thinking blocks / reasoning lane)")
 
 config_path.parent.mkdir(parents=True, exist_ok=True)
 config_path.write_text(json.dumps(config, indent=2) + "\n")
