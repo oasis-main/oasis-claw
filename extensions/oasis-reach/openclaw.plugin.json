@@ -1,0 +1,24 @@
+{
+  "id": "oasis-reach",
+  "name": "Oasis Reach",
+  "description": "Inter-bot mail (CLAW-076). Provides the reach_send / reach_inbox / reach_read agent tools and injects an unread-count supplement into the agent memory prompt (via registerMemoryPromptSupplement, non-exclusive). Transport is a per-bot /reach/mail/outbox (rw) + /reach/mail/inbox (ro); a host-side relay moves outbox to recipient inboxes and owns all comms policy (routes, rate limits, size caps). Message bodies are delivered to the model nonce-delimited and tagged UNTRUSTED — a peer message may request work but never authorizes a privileged action.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "mailDir": {
+        "type": "string",
+        "description": "Container mail root holding outbox/ (rw) and inbox/ (ro). Default: /reach/mail"
+      },
+      "statePath": {
+        "type": "string",
+        "description": "Container-writable path for the read cursor (must NOT be under the RO inbox). Default: $HOME/.openclaw/reach-read.json"
+      },
+      "knownPeers": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Informational hint of peer bot keys this bot may message (the host relay is the real gate). Shown in the reach_send tool description."
+      }
+    }
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "@oasis-claw/oasis-reach",
+  "version": "0.1.0",
+  "description": "openclaw plugin: inter-bot mail (CLAW-076) — reach_send/reach_inbox/reach_read + unread-count memory supplement, backed by a per-bot outbox/inbox and a host-side relay",
+  "type": "module",
+  "devDependencies": {
+    "openclaw": "workspace:*",
+    "vitest": "^3.0.0"
+  },
+  "scripts": {
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest --passWithNoTests"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "zod": "^4.4.1"
+  }
+}

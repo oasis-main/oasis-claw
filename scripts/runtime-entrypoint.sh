@@ -182,6 +182,11 @@ declare -A PLUGINS=(
   # .swarm/UNIFIED_REVIEWER.md). Skeleton phase = SHADOW (audit-only, never
   # blocks). Gated per-bot via OASIS_REVIEWER_ENABLE so it lands on yesman first.
   [oasis-reviewer]=""
+  # oasis-reach: inter-bot mail (CLAW-076). Installs fleet-wide but stays DISABLED
+  # unless the bot's compose sets OASIS_REACH_ENABLE=1 (only bots that mount
+  # /reach/mail). Provides reach_send/reach_inbox/reach_read + an unread-count
+  # memory supplement; the host relay (claw-mail-relay) owns all comms policy.
+  [oasis-reach]=""
   [dot-swarm]=""
   # clawhub-skill-audit's audit-prompt.ts intentionally contains the
   # exact "dynamic code execution" string patterns the auditor looks
@@ -432,6 +437,18 @@ merge_config(
 # not a stale persisted value — merge_config setdefaults config keys, which would
 # otherwise pin whatever landed first. Force it every boot.
 entries["oasis-reviewer"]["config"]["mode"] = os.environ.get("OASIS_REVIEWER_MODE", "shadow")
+# oasis-reach (CLAW-076) inter-bot mail. enabled + peers are DEPLOYMENT-driven per
+# bot (env from the bot's compose overlay), so force them every boot rather than
+# letting merge_config pin a stale first value — same reasoning as the reviewer
+# mode above. A bot with OASIS_REACH_ENABLE unset registers nothing.
+merge_config("oasis-reach", {
+    "enabled": os.environ.get("OASIS_REACH_ENABLE", "") == "1",
+    "mailDir": os.environ.get("OASIS_REACH_MAILDIR", "/reach/mail"),
+    "statePath": str(home / ".openclaw/reach-read.json"),
+    "knownPeers": [p for p in os.environ.get("OASIS_REACH_PEERS", "").split(",") if p],
+})
+entries["oasis-reach"]["config"]["enabled"] = os.environ.get("OASIS_REACH_ENABLE", "") == "1"
+entries["oasis-reach"]["config"]["knownPeers"] = [p for p in os.environ.get("OASIS_REACH_PEERS", "").split(",") if p]
 merge_config("dot-swarm", {
     "swarmDir": str(home / ".openclaw/.swarm"),
     "registerSwarmReadTool": True,
