@@ -67,6 +67,17 @@ const CRON_MUTATE_ACTIONS = new Set(["add", "update", "remove"]);
 // unattended they FAIL CLOSED (deny) instead.
 export const NEVER_DOWNGRADE = new Set(["hard:self-runtime", "hard:cron-mutation"]);
 
+// Escalations that in-conversation operator consent can satisfy (CLAW-079).
+// These rules exist to make Mike approve an action; if he asked for it in the same
+// run and Layer 2 — which can now see the request — agrees, a second approval is
+// friction, not safety. Kept deliberately tiny and author-controlled: this is the
+// ONLY way L2 may loosen L1, so nothing belongs here whose whole point is a human
+// pause (self-runtime, destructive, control-plane, secret reads).
+// NOTE cron-mutation is in BOTH sets, and they never collide: NEVER_DOWNGRADE
+// applies to UNATTENDED runs (no operator present at all), CONSENT_SATISFIABLE to
+// attended ones where Mike just asked. A cron job editing cron still fails closed.
+export const CONSENT_SATISFIABLE = new Set(["hard:cron-mutation"]);
+
 const ALLOW: Decision = { verdict: "allow", principle: "hard:default-allow", reason: "" };
 
 const DESTRUCTIVE = [
