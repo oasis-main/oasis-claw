@@ -31,18 +31,28 @@ let l2InFlight = 0;
 // Consent moves to AUTHORING time (hard:cron-mutation gates add/update/remove),
 // so at run time an ordinary escalate downgrades to allow. NEVER_DOWNGRADE
 // escalations still fail closed. Overridable per bot without a rebuild.
+// Markers are matched as SEGMENTS (see isUnattended) because the live key is
+// agent-namespaced: `agent:main:cron:<jobId>`.
 // KNOWN GAP: a cron job with an explicit sessionTarget gets that session's key
-// instead of `cron:` (cron/session-target.ts:18), and heartbeat turns have no
-// distinct prefix at all — so both are still treated as attended. Every audit row
-// now records sessionKey, so the real prefixes can be read off live data instead
-// of guessed at.
+// instead of a cron: segment (cron/session-target.ts:18) — verified live: jobs with
+// sessionTarget "main" deliver into the main session, where an approval CAN reach
+// Mike, so treating those as attended is correct. Heartbeat turns still have no
+// distinct segment. Every audit row records sessionKey, so any further trigger
+// shapes can be read off live data instead of guessed at.
 const UNATTENDED_PREFIXES = (process.env.OASIS_REVIEWER_UNATTENDED_PREFIXES ?? "cron:,hook:")
   .split(",")
   .map((p) => p.trim())
   .filter((p) => p.length > 0);
 
+// Match the marker as a SEGMENT, not just a leading prefix. The keys openclaw
+// BUILDS are bare (`cron:<jobId>` at gateway/server-cron.ts:226), but by the time
+// one reaches the hook context it has been namespaced per agent — observed live
+// 2026-07-30: `agent:main:cron:78991974-1e56-…`. A startsWith("cron:") test
+// therefore returned FALSE on every real cron call and the downgrade never fired.
+// The bug was invisible because the same deploy also fixed the false-positive that
+// was causing the escalations, so the jobs passed without needing the downgrade.
 function isUnattended(sessionKey: string): boolean {
-  return UNATTENDED_PREFIXES.some((p) => sessionKey.startsWith(p));
+  return UNATTENDED_PREFIXES.some((p) => sessionKey.startsWith(p) || sessionKey.includes(`:${p}`));
 }
 
 // Layer 2 may only ever TIGHTEN Layer 1 — the constitution is a second lock, not a
