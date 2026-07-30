@@ -3,6 +3,7 @@ import { join } from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import {
   botKeyFor,
+  CONSENT_SATISFIABLE,
   constitutionalReviewRequired,
   constitutionFor,
   DEFAULT_HARD_POLICY,
@@ -55,10 +56,39 @@ function isUnattended(sessionKey: string): boolean {
   return UNATTENDED_PREFIXES.some((p) => sessionKey.startsWith(p) || sessionKey.includes(`:${p}`));
 }
 
+// ── Operator-request capture (CLAW-079) ───────────────────────────────────────
+// before_tool_call sees a bare tool call: name, params, paths. It cannot see what
+// Mike ASKED for, so the judge had no way to tell a requested action from one the
+// bot invented — and on 2026-07-30 it escalated a Gmail send Mike had just approved
+// out loud, reasoning (correctly, on the evidence it had) that an irreversible
+// outbound action "warrants explicit operator sign-off".
+// The `llm_input` hook carries `prompt` — the operator's turn — and both hooks
+// share `ctx.runId`, so we stash the request per run and hand it to the judge.
+// Requires hooks.allowConversationAccess (already set in the entrypoint).
+// For an unattended cron run the "prompt" is the job's authored payload, which is
+// exactly the instruction Mike approved when the job was created — so the same
+// mechanism supplies consent evidence there too.
+const REQUEST_CACHE_MAX = 64;
+const REQUEST_MAX_CHARS = 1500;
+const requestByRun = new Map<string, string>();
+
+function rememberRequest(runId: string, prompt: string): void {
+  if (!runId || !prompt) return;
+  // Keep the FIRST prompt of a run: that is the ask. Later ReAct steps re-enter
+  // this hook and would otherwise overwrite it with intermediate state.
+  if (requestByRun.has(runId)) return;
+  if (requestByRun.size >= REQUEST_CACHE_MAX) {
+    const oldest = requestByRun.keys().next().value;
+    if (oldest !== undefined) requestByRun.delete(oldest);
+  }
+  requestByRun.set(runId, prompt.slice(0, REQUEST_MAX_CHARS));
+}
+
 // Layer 2 may only ever TIGHTEN Layer 1 — the constitution is a second lock, not a
 // key. A model that has just read attacker-controllable bytes must never be able to
 // talk the deterministic layer down, so the combined verdict is the stricter of the
 // two and a looser L2 opinion is discarded (recorded in the audit either way).
+// The ONE author-controlled exception is CONSENT_SATISFIABLE (see policy.ts).
 const STRICTNESS: Record<Verdict, number> = { allow: 0, escalate: 1, deny: 2 };
 
 function tightenOnly(l1: Decision, l2: Layer2Decision): Decision {
@@ -169,6 +199,18 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
     api.logger.info("oasis-reviewer: Layer 2 requested but runtime.llm.complete unavailable — L2 stays OFF");
   }
 
+  // Capture the operator's ask for this run so the judge can evaluate intent, not
+  // just mechanics. Read-only and defensive — a failure here must never disturb the
+  // turn, it only costs the judge its context.
+  api.on("llm_input", (event: Record<string, unknown>, ctx: Record<string, unknown>) => {
+    try {
+      const runId = String(ctx?.runId ?? event?.runId ?? "");
+      rememberRequest(runId, String(event?.prompt ?? ""));
+    } catch {
+      /* never let request capture affect the run */
+    }
+  });
+
   api.on("before_tool_call", async (event: Record<string, unknown>, ctx: Record<string, unknown>) => {
     let decision: Decision = { verdict: "allow", principle: "hard:default-allow", reason: "" };
     let toolName = "unknown";
@@ -195,6 +237,8 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
       const sessionId = ctx?.sessionId ?? "unknown";
       const sessionKey = String(ctx?.sessionKey ?? "");
       const unattended = isUnattended(sessionKey);
+      // What Mike asked for this run — the judge's evidence for intent.
+      const operatorRequest = requestByRun.get(String(ctx?.runId ?? "")) ?? "";
 
       // ── Which calls are worth a model judgment ──
       // constitutionalReviewRequired bots (nimbus/helloworld) → EVERY call: their
@@ -223,10 +267,32 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         const l1 = decision;
         const r = await judgeConstitution(
           l2Complete as LlmComplete,
-          { botKey, toolName, family, subject, params: paramsJson, constitution },
+          { botKey, toolName, family, subject, params: paramsJson, constitution, operatorRequest },
           { model: l2Model, timeoutMs: l2TimeoutMs },
         );
-        const combined = r.decision ? tightenOnly(l1, r.decision) : null;
+        // ── Operator-consent downgrade (CLAW-079) — deliberately narrow ──
+        // Layer 2 is tighten-only by design, so a manipulated judge can never talk
+        // Layer 1 down. The one exception: rules the POLICY AUTHOR marked as
+        // satisfiable by consent (CONSENT_SATISFIABLE — currently just cron
+        // authoring). Those exist to make Mike approve an action, so if he already
+        // asked for it this run and the judge — now able to see the request —
+        // agrees, a second approval is pure friction. Requires all three: a
+        // consent-satisfiable principle, a captured request, and an explicit L2
+        // allow. Denies, self-runtime, and every other escalate stay untouchable.
+        const consentDowngrade =
+          l1.verdict === "escalate" &&
+          CONSENT_SATISFIABLE.has(l1.principle) &&
+          !!operatorRequest &&
+          r.decision?.verdict === "allow";
+        const combined = consentDowngrade
+          ? {
+              verdict: "allow" as const,
+              principle: `${l1.principle}+operator-consent`,
+              reason: `${r.decision?.reason ?? "constitution allowed"} — Mike requested this in the same run, so the authoring approval is already given`,
+            }
+          : r.decision
+            ? tightenOnly(l1, r.decision)
+            : null;
         if (combined) {
           decision = combined;
         } else if (alwaysConstitutional) {
@@ -303,6 +369,7 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         reason: decision.reason,
         l2Mode,
         l2Judged: l2Eligible,
+        hadOperatorRequest: !!operatorRequest,
         layer2Pending: l2Eligible && l2Mode === "shadow",
         enforced: mode === "enforce" && decision.verdict !== "allow",
       });
@@ -318,7 +385,7 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         const l1Principle = decision.principle;
         void judgeConstitution(
           l2Complete as LlmComplete,
-          { botKey, toolName, family, subject, params: paramsJson, constitution },
+          { botKey, toolName, family, subject, params: paramsJson, constitution, operatorRequest },
           // No agentId: passing it is treated as a target-agent OVERRIDE and
           // rejected ("Plugin LLM completion cannot override the target agent").
           // Omitting it uses the ambient agent's own model/credentials.
