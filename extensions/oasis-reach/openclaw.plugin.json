@@ -5,7 +5,12 @@
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
+    "description": "Must mirror the zod configSchema in index.ts field-for-field (same property names, same optionality). openclaw validates plugin config against THIS static schema at boot, not against index.ts's zod schema — a field present in one but not the other breaks boot for every bot that sets it.",
     "properties": {
+      "enabled": {
+        "type": "boolean",
+        "description": "Per-bot rollout gate. The plugin installs fleet-wide; only bots that mount /reach/mail should set this true. Default false."
+      },
       "mailDir": {
         "type": "string",
         "description": "Container mail root holding outbox/ (rw) and inbox/ (ro). Default: /reach/mail"

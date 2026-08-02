@@ -1,6 +1,10 @@
 import { MAIL_KINDS, MAX_BODY_CHARS, MAX_RECIPIENTS, MAX_SUBJECT_CHARS, newMessageId, validateOutbound, type MailKind, type OutboundEnvelope } from "../envelope.js";
 import { writeOutbound, type MailboxConfig } from "../mailbox.js";
 
+function strArray(v: unknown): string[] {
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+}
+
 export interface ReachSendConfig {
   mailbox: MailboxConfig;
   /** Peers this bot is allowed to name (informational — the relay is the real gate). */
@@ -33,13 +37,15 @@ export function createReachSendTool(config: ReachSendConfig) {
         subject: { type: "string", description: `Short subject line (<= ${MAX_SUBJECT_CHARS} chars).` },
         body: { type: "string", description: `Message body (<= ${MAX_BODY_CHARS} chars).` },
         kind: { type: "string", enum: [...MAIL_KINDS], description: 'Message kind: "dm" (default), "project", or "broadcast".' },
-        refs: { type: "array", items: { type: "string" }, description: "Optional references (message ids, file paths, work-item ids)." },
+        refs: { type: "array", items: { type: "string" }, description: "Optional free-form references (message ids, notes)." },
+        work_items: { type: "array", items: { type: "string" }, description: 'Optional .swarm work-item ids this message concerns (e.g. "CLAW-076"). Lets sender + recipient + reach_search track the concrete work — do NOT restate .swarm content here, just point at it.' },
+        work_repos: { type: "array", items: { type: "string" }, description: 'Optional repository ids this message concerns (e.g. "oasis-cloud" or "org/repo").' },
         thread_id: { type: "string", description: "Optional thread id to group a conversation." },
       },
     },
     async execute(
       _toolCallId: string,
-      args: { to?: string[]; subject?: string; body?: string; kind?: MailKind; refs?: string[]; thread_id?: string } = {},
+      args: { to?: string[]; subject?: string; body?: string; kind?: MailKind; refs?: string[]; work_items?: string[]; work_repos?: string[]; thread_id?: string } = {},
     ) {
       const env: OutboundEnvelope = {
         id: newMessageId(),
@@ -47,7 +53,8 @@ export function createReachSendTool(config: ReachSendConfig) {
         kind: (args.kind && MAIL_KINDS.includes(args.kind) ? args.kind : "dm") as MailKind,
         subject: typeof args.subject === "string" ? args.subject : "",
         body: typeof args.body === "string" ? args.body : "",
-        refs: Array.isArray(args.refs) ? args.refs : [],
+        refs: strArray(args.refs),
+        work: { items: strArray(args.work_items), repos: strArray(args.work_repos) },
         thread_id: typeof args.thread_id === "string" ? args.thread_id : "",
         ts: new Date().toISOString(),
       };

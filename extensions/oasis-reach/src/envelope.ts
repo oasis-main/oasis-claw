@@ -20,6 +20,28 @@ export const MAX_SUBJECT_CHARS = 200;
 export const MAX_BODY_CHARS = 16_000;
 export const MAX_RECIPIENTS = 8;
 export const MAX_REFS = 32;
+export const MAX_WORK_ITEMS = 16;
+export const MAX_WORK_REPOS = 16;
+
+// ── Structured work references (Mike 2026-07-31) ──────────────────────────────
+// A message may POINT AT concrete work: .swarm work-item ids (e.g. "CLAW-076")
+// and repositories (e.g. "oasis-cloud" or "org/repo"). This is deliberately NOT
+// meta-messaging ABOUT .swarm — .swarm is already the project-native board. It is
+// a typed handle so sender and recipient (and reach_search) can track exactly
+// which item/repo a conversation concerns without duplicating .swarm content.
+export interface WorkRefs {
+  items: string[]; // .swarm work-item ids
+  repos: string[]; // repository identifiers
+}
+
+/** A .swarm item id token: permissive but bounded, no whitespace/control. */
+export function isWorkItem(s: unknown): s is string {
+  return typeof s === "string" && /^[A-Za-z][A-Za-z0-9._-]{0,63}$/.test(s);
+}
+/** A repo identifier: slug or org/repo form, bounded, no whitespace/control. */
+export function isRepoRef(s: unknown): s is string {
+  return typeof s === "string" && /^[A-Za-z0-9][A-Za-z0-9._/-]{0,79}$/.test(s);
+}
 
 /** What a bot authors and writes to its outbox. No `from` — the relay stamps it. */
 export interface OutboundEnvelope {
@@ -29,6 +51,7 @@ export interface OutboundEnvelope {
   subject: string;
   body: string;
   refs: string[];
+  work: WorkRefs;
   thread_id: string;
   ts: string;
 }
@@ -80,8 +103,41 @@ export function validateOutbound(e: unknown): ValidationResult {
     else if (o.refs.length > MAX_REFS) errors.push(`refs: too many (max ${MAX_REFS})`);
     else for (const r of o.refs) if (typeof r !== "string") errors.push("refs: entries must be strings");
   }
+  if (o.work !== undefined) {
+    const w = o.work as Record<string, unknown>;
+    if (typeof w !== "object" || w === null) errors.push("work: must be an object {items[],repos[]}");
+    else {
+      if (w.items !== undefined) {
+        if (!Array.isArray(w.items) || w.items.length > MAX_WORK_ITEMS) errors.push(`work.items: array, max ${MAX_WORK_ITEMS}`);
+        else for (const it of w.items) if (!isWorkItem(it)) errors.push(`work.items: "${String(it)}" is not a valid .swarm item id`);
+      }
+      if (w.repos !== undefined) {
+        if (!Array.isArray(w.repos) || w.repos.length > MAX_WORK_REPOS) errors.push(`work.repos: array, max ${MAX_WORK_REPOS}`);
+        else for (const rp of w.repos) if (!isRepoRef(rp)) errors.push(`work.repos: "${String(rp)}" is not a valid repo id`);
+      }
+    }
+  }
   if (o.thread_id !== undefined && typeof o.thread_id !== "string") errors.push("thread_id: must be a string");
   if (typeof o.ts !== "string") errors.push("ts: must be an ISO timestamp string");
 
   return { ok: errors.length === 0, errors };
+}
+
+// ── Read receipts (retention support) ─────────────────────────────────────────
+// The read cursor lives inside the bot's container home, which the host relay
+// cannot see. So when a bot reads mail, the plugin also drops a tiny receipt into
+// its OUTBOX; the relay consumes it (never delivers it) and records read-status
+// host-side, which lets the relay's retention sweep archive READ+old messages
+// without ever touching UNREAD mail (so the unread-count invariant holds). The
+// receipt filename is prefixed `_receipt_` so the relay routes it before the
+// peer-message loop and it never counts against the send rate limit.
+export const RECEIPT_PREFIX = "_receipt_";
+export interface ReadReceipt {
+  type: "read_receipt";
+  ids: string[];
+  ts: string;
+}
+export function isReadReceipt(o: unknown): o is ReadReceipt {
+  const r = o as Record<string, unknown>;
+  return !!r && r.type === "read_receipt" && Array.isArray(r.ids);
 }

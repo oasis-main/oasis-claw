@@ -5,6 +5,7 @@ import type { MailboxConfig } from "./src/mailbox.js";
 import { unreadCount } from "./src/mailbox.js";
 import { createReachInboxTool } from "./src/tools/reach-inbox.js";
 import { createReachReadTool } from "./src/tools/reach-read.js";
+import { createReachSearchTool, type LlmComplete } from "./src/tools/reach-search.js";
 import { createReachSendTool } from "./src/tools/reach-send.js";
 
 // ── oasis-reach: inter-bot mail (CLAW-076) ────────────────────────────────────
@@ -54,11 +55,20 @@ const plugin = {
     // recreate via the named home volume).
     const home = process.env.HOME ?? "/home/node";
     const statePath = cfg.statePath ?? path.join(home, ".openclaw", "reach-read.json");
-    const mailbox: MailboxConfig = { mailDir, statePath };
+    // Archive lives at mailDir/archive by default (RO mount the relay writes).
+    const mailbox: MailboxConfig = { mailDir, statePath, archiveDir: path.join(mailDir, "archive") };
+
+    // reach_search's synthesis pass uses the plugin runtime's llm.complete — the
+    // same handle the reviewer uses (api.runtime.llm.complete). Optional: search
+    // degrades to a ranked list if the runtime does not expose it.
+    const runtime = (api as unknown as { runtime?: { llm?: { complete?: LlmComplete } } }).runtime;
+    const complete: LlmComplete | undefined =
+      typeof runtime?.llm?.complete === "function" ? (runtime.llm.complete.bind(runtime.llm) as LlmComplete) : undefined;
 
     api.registerTool(createReachSendTool({ mailbox, knownPeers: cfg.knownPeers }), { name: "reach_send" });
     api.registerTool(createReachInboxTool({ mailbox }), { name: "reach_inbox" });
     api.registerTool(createReachReadTool({ mailbox }), { name: "reach_read" });
+    api.registerTool(createReachSearchTool({ mailbox, complete }), { name: "reach_search" });
 
     // Unread-COUNT supplement — the only thing injected per turn. No bodies, no
     // subjects: just a nudge to pull. Non-exclusive; coexists with dot-swarm's
@@ -81,7 +91,9 @@ const plugin = {
     api.logger.info("oasis-reach plugin loaded", {
       mailDir,
       statePath,
-      tools: ["reach_send", "reach_inbox", "reach_read"],
+      archiveDir: mailbox.archiveDir,
+      tools: ["reach_send", "reach_inbox", "reach_read", "reach_search"],
+      searchSynthesis: complete ? "llm" : "list-only (runtime.llm.complete unavailable)",
       knownPeers: cfg.knownPeers ?? [],
     });
   },

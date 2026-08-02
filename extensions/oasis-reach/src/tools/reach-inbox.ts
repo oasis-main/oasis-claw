@@ -31,7 +31,7 @@ export function createReachInboxTool(config: ReachInboxConfig) {
       }
       const items = listInbox(config.mailbox)
         .filter((i) => (args.unread_only ? i.unread : true))
-        .map(({ id, from, kind, subject, ts, unread }) => ({ id, from, kind, subject, ts, unread }));
+        .map(({ id, from, kind, subject, ts, unread, work }) => ({ id, from, kind, subject, ts, unread, work }));
       const result = { count: items.length, unread: items.filter((i) => i.unread).length, messages: items };
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     },
