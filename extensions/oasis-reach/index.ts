@@ -46,8 +46,18 @@ const plugin = {
 
   register(api: OpenClawPluginApi) {
     const cfg = configSchema.parse(api.pluginConfig ?? {});
-    if (!cfg.enabled) {
-      api.logger.info("oasis-reach plugin loaded but DISABLED (no mail mount for this bot) — no tools registered");
+    // Gate on the ENV var, not cfg.enabled. The agent's tool set is resolved by
+    // openclaw's resolvePluginTools in a FRESH plugin-load context
+    // (resolvePluginToolRegistry) that does NOT thread the gateway's
+    // plugins.entries.<id>.config, so api.pluginConfig is empty there and
+    // cfg.enabled is undefined — the gate would silently register NO tools and the
+    // agent falls back to running `reach_inbox` as a shell command (verified live
+    // 2026-08-03 on House). process.env is process-global and present in both the
+    // gateway registry context and the tool-resolution context, so it gates
+    // consistently. cfg.enabled kept as an OR for any config-only caller.
+    const enabled = process.env.OASIS_REACH_ENABLE === "1" || cfg.enabled === true;
+    if (!enabled) {
+      api.logger.info("oasis-reach plugin loaded but DISABLED (OASIS_REACH_ENABLE!=1) — no tools registered");
       return;
     }
     const mailDir = cfg.mailDir ?? "/reach/mail";
