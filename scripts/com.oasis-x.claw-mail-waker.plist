@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  claw-mail-waker (CLAW-076) — event-driven wake for inter-bot mail.
+
+  A persistent host daemon that starts a cheap isolated turn on a bot when new
+  peer mail lands in its inbox, so bots respond within ~1 poll interval without
+  interrupting their main work.
+
+  ██ macOS TCC — READ THIS ██
+  A launchd LaunchAgent CANNOT read ~/Documents (same trap that silently killed
+  nimbus-watchdog). So:
+   - ProgramArguments points at a COPY of the daemon under ~/Library/Application
+     Support, NOT at the repo script under ~/Documents.
+   - The daemon reads NOTHING under ~/Documents: it inspects inboxes THROUGH the
+     containers (`docker exec <bot> ls /reach/mail/inbox`) and keeps its cursor
+     under ~/Library. Only `docker` is needed — no Full Disk Access grant.
+
+  DEPLOY (copy the daemon out of ~/Documents, then load):
+    mkdir -p "$HOME/Library/Application Support/oasis-x"
+    cp scripts/claw-mail-waker.mjs "$HOME/Library/Application Support/oasis-x/claw-mail-waker.mjs"
+    cp scripts/com.oasis-x.claw-mail-waker.plist "$HOME/Library/LaunchAgents/"
+    launchctl unload "$HOME/Library/LaunchAgents/com.oasis-x.claw-mail-waker.plist" 2>/dev/null
+    launchctl load   "$HOME/Library/LaunchAgents/com.oasis-x.claw-mail-waker.plist"
+  Re-copy the .mjs after any edit — the deployed copy does not track the repo.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.oasis-x.claw-mail-waker</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/node</string>
+        <string>/Users/Michaellee/Library/Application Support/oasis-x/claw-mail-waker.mjs</string>
+    </array>
+
+    <!-- Persistent daemon: it runs its own 60s poll loop, so KeepAlive (restart
+         on crash) rather than StartInterval (re-run). -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/Michaellee</string>
+        <!-- 60s poll (Mike 2026-08-03). Override here if needed. -->
+        <key>CLAW_WAKER_POLL_MS</key>
+        <string>60000</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/Michaellee/Library/Logs/claw-mail-waker.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/Michaellee/Library/Logs/claw-mail-waker.stderr.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

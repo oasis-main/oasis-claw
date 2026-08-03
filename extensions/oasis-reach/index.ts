@@ -3,6 +3,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { z } from "zod";
 import type { MailboxConfig } from "./src/mailbox.js";
 import { unreadCount } from "./src/mailbox.js";
+import { createReachHelpTool } from "./src/tools/reach-help.js";
 import { createReachInboxTool } from "./src/tools/reach-inbox.js";
 import { createReachReadTool } from "./src/tools/reach-read.js";
 import { createReachSearchTool, type LlmComplete } from "./src/tools/reach-search.js";
@@ -69,6 +70,7 @@ const plugin = {
     api.registerTool(createReachInboxTool({ mailbox }), { name: "reach_inbox" });
     api.registerTool(createReachReadTool({ mailbox }), { name: "reach_read" });
     api.registerTool(createReachSearchTool({ mailbox, complete }), { name: "reach_search" });
+    api.registerTool(createReachHelpTool(), { name: "reach_help" });
 
     // Unread-COUNT supplement — the only thing injected per turn. No bodies, no
     // subjects: just a nudge to pull. Non-exclusive; coexists with dot-swarm's
@@ -92,7 +94,7 @@ const plugin = {
       mailDir,
       statePath,
       archiveDir: mailbox.archiveDir,
-      tools: ["reach_send", "reach_inbox", "reach_read", "reach_search"],
+      tools: ["reach_send", "reach_inbox", "reach_read", "reach_search", "reach_help"],
       searchSynthesis: complete ? "llm" : "list-only (runtime.llm.complete unavailable)",
       knownPeers: cfg.knownPeers ?? [],
     });
