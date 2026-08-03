@@ -696,6 +696,19 @@ if entries["sleep-cycle"]["config"]["enabled"]:
         also.append("sleep_deep")
 else:
     also = [x for x in also if x != "sleep_deep"]
+# oasis-reach (CLAW-076): re-admit the mail tools past the tools.profile filter,
+# exactly like sleep_deep. The plugin registers reach_* via api.registerTool, but
+# tools.profile="coding" drops unknown plugin tools unless they are allowlisted
+# here — verified live 2026-08-03: House ran `reach_inbox` / `which reach_send` as
+# SHELL commands (and hit the exec reviewer) because the tools were registered but
+# not exposed. Gate on the same env the plugin's `enabled` uses.
+REACH_TOOLS = ("reach_send", "reach_inbox", "reach_read", "reach_search", "reach_help")
+if os.environ.get("OASIS_REACH_ENABLE", "") == "1":
+    for t in REACH_TOOLS:
+        if t not in also:
+            also.append(t)
+else:
+    also = [x for x in also if x not in REACH_TOOLS]
 if also:
     tools_cfg["alsoAllow"] = also
 elif "alsoAllow" in tools_cfg:
