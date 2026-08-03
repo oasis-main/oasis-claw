@@ -97,6 +97,19 @@ const DOWNLOAD_EXEC = /(?:\||&&|;)\s*(?:sudo\s+)?(?:sh|bash|zsh|dash|ksh)\b|(?:^
 // Command / process substitution = an eval vector that evades static inspection —
 // route to a human even on a reviewer-gated bot.
 const SUBSTITUTION = /\$\(|`|<\(/;
+// NARROW carve-out (2026-07-30, Nimbus sheets friction): `$(cat /tmp/<file>)`
+// reading back a scratch file the bot just staged with the `write` tool (already
+// reviewed), e.g. `gog sheets update ... --values-json "$(cat /tmp/reno.json)"`.
+// `cat` cannot execute the file's bytes, only surface them as a literal argument,
+// and /tmp is container-private scratch space that nothing but the bot itself
+// ever populates (read-only rootfs elsewhere) — so this exact shape carries none
+// of the eval-vector risk SUBSTITUTION exists to catch. Any OTHER command inside
+// $(), any nested $()/backtick, or a path outside /tmp still hits the escalate
+// below untouched.
+const SAFE_TMP_CAT_SUBSTITUTION = /\$\(\s*cat\s+\/tmp\/[^\s$`()|;&<>]+\s*\)/g;
+function hasOnlySafeTmpCatSubstitution(cmd: string): boolean {
+  return !SUBSTITUTION.test(cmd.replace(SAFE_TMP_CAT_SUBSTITUTION, ""));
+}
 // Benign shell composition: pipes, sequencing, output redirects. On a reviewer-
 // gated bot (Mike, 2026-07-27) these RUN — destructive / download-exec /
 // substitution are handled above; the write-target residual is the same one
@@ -300,7 +313,7 @@ export function evaluateHard(input: EvalInput, policy: HardPolicy = DEFAULT_HARD
       for (const re of policy.escalateExecRegex) {
         if (re.test(cmd)) return { verdict: "escalate", principle: "hard:operator-consent-action", reason: `action needs Mike's slash-command approval: ${cmd.slice(0, 120)}` };
       }
-      if (SUBSTITUTION.test(cmd)) return { verdict: policy.substitutionExec, principle: "hard:command-substitution", reason: `command/process substitution routed to human: ${cmd.slice(0, 120)}` };
+      if (SUBSTITUTION.test(cmd) && !hasOnlySafeTmpCatSubstitution(cmd)) return { verdict: policy.substitutionExec, principle: "hard:command-substitution", reason: `command/process substitution routed to human: ${cmd.slice(0, 120)}` };
       if (BENIGN_COMPOUND.test(cmd)) return { verdict: policy.compoundExec, principle: "hard:compound-exec", reason: `compound/redirect: ${cmd.slice(0, 120)}` };
     }
     return ALLOW;

