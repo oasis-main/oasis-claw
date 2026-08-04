@@ -147,12 +147,18 @@ async function tick() {
       const ls = await docker(["exec", container, "sh", "-c", "ls -1 /reach/mail/inbox 2>/dev/null"], 15_000);
       if (ls.err) continue; // inbox not mounted yet / container mid-boot
       const msgs = parseInbox(ls.stdout);
+      // First time we ever see this bot (no cursor yet): SEED silently — mark all
+      // current inbox mail as already-woken and do NOT wake. Otherwise a waker
+      // (re)start would wake every bot for mail that predates the daemon (already
+      // read, or covered by the unread-count supplement). Only genuinely new mail
+      // that arrives AFTER the daemon is running should trigger a wake.
+      const firstSeen = state[bot] === undefined;
       const woken = new Set(state[bot] ?? []);
       const fresh = msgs.filter((m) => !woken.has(m.id));
       // Cursor auto-prunes to the current inbox contents (ids that were archived
       // out drop off), and every current id is marked woken.
       state[bot] = msgs.map((m) => m.id);
-      if (fresh.length > 0) void wake(bot, container, fresh);
+      if (!firstSeen && fresh.length > 0) void wake(bot, container, fresh);
     } catch (err) {
       log({ evt: "tick_bot_error", bot, error: String(err?.message ?? err) });
     }
