@@ -2,6 +2,10 @@
   "id": "dot-swarm",
   "name": "Dot-Swarm",
   "description": "Shared .swarm/ stigmergy plugin. Injects .swarm/state.md + queue.md (and any configured peer files) into the agent's memory section via registerMemoryPromptSupplement (non-exclusive — coexists with the memory-core kind:\"memory\" backend, does not replace it). Also provides the swarm_read + compact agent tools and the swarm-compact CompactionProvider (handoff-driven context compaction backed by .swarm/state.md).",
+  "contracts": {
+    "_doc": "REQUIRED for agent-tool exposure (openclaw 2026.7.1 plugins/tools.ts:566-634): registerTool'd tools materialize ONLY if declared here. Without this, swarm_read + compact were never agent-callable (CLAW-076 find, 2026-08-03). Keep in sync with the api.registerTool names in index.ts.",
+    "tools": ["swarm_read", "compact"]
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
