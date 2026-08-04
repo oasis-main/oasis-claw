@@ -2,6 +2,12 @@
   "id": "prompt-injection-reporting",
   "name": "Prompt Injection Reporting",
   "description": "Agent-callable report_injection tool + signed JSONL attack log + Telegram alert. The model self-reports detected injection attempts; the plugin persists them and notifies the operator.",
+  "contracts": {
+    "_doc": "REQUIRED for agent-tool exposure (openclaw 2026.7.1 plugins/tools.ts:566-634): a plugin's registerTool'd tools materialize ONLY if declared here. Added 2026-08-04 (CLAW-076 find). Keep in sync with the api.registerTool names in index.ts.",
+    "tools": [
+      "report_injection"
+    ]
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
