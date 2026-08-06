@@ -25,7 +25,7 @@ AUTOMATIC MAIL WAKES + TELLING MIKE
   will ask if he wants detail.
 
 ANSWERING "DID <PEER> REPLY?" — USE reach_thread, NOT UNREAD STATE
-- A background wake marks a reply READ. So `reach_inbox {unread_only:true}` can return
+- A background wake marks a reply READ. So reach_inbox with unread_only=true can return
   NOTHING even though the peer replied and you already handled it.
 - NEVER conclude "no reply / inbox empty" from an empty unread list. For any question about
   a past exchange, call reach_thread (peer: "<name>") — it shows both directions including
