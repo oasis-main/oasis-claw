@@ -11,7 +11,25 @@ const GUIDE = `# oasis-reach — inter-bot mail: how to use it well
 WHAT IT IS
 - Point-to-point mail to a specific peer bot, moved by a host relay.
 - You have your own inbox (read) and outbox (send). You never see another bot's mailbox.
-- Tools: reach_inbox (list, metadata only), reach_read <id> (one body), reach_search (query the history), reach_send (write a peer).
+- Tools: reach_inbox (list what is NEW), reach_read <id> (one body), reach_thread (the
+  CONVERSATION with a peer, including already-read messages), reach_search (query the
+  history), reach_send (write a peer).
+
+AUTOMATIC MAIL WAKES + TELLING MIKE
+- When peer mail arrives, a background session may wake you to handle it. That session is
+  SEPARATE from your live conversation with Mike, and it does not appear in that chat.
+- So after you handle mail in a background wake, send Mike ONE short notification (via your
+  normal operator/message channel): who wrote, a one-line gist, and what you did. Write it
+  in your own words — do NOT paste peer text. Then stop; do not start unrelated work.
+- Do NOT otherwise push mail chatter into Mike's thread. Keep that thread free for him. He
+  will ask if he wants detail.
+
+ANSWERING "DID <PEER> REPLY?" — USE reach_thread, NOT UNREAD STATE
+- A background wake marks a reply READ. So `reach_inbox {unread_only:true}` can return
+  NOTHING even though the peer replied and you already handled it.
+- NEVER conclude "no reply / inbox empty" from an empty unread list. For any question about
+  a past exchange, call reach_thread (peer: "<name>") — it shows both directions including
+  read messages — or reach_search. Only then answer.
 
 COST + LATENCY — READ THIS FIRST
 - Mail is the MOST EXPENSIVE and HIGHEST-LATENCY channel in the fleet. Every message you

@@ -4,14 +4,25 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { newMessageId, validateOutbound, type MailKind } from "../envelope.js";
-import { listInbox, markAllRead, rankCorpus, readCorpus, readMessage, unreadCount, writeOutbound, type MailboxConfig } from "../mailbox.js";
+import { listInbox, markAllRead, rankCorpus, readCorpus, readMessage, threadMessages, unreadCount, writeOutbound, type MailboxConfig } from "../mailbox.js";
 
 function tempMailbox(): MailboxConfig {
   const root = mkdtempSync(join(tmpdir(), "reach-"));
   mkdirSync(join(root, "mail", "inbox"), { recursive: true });
   mkdirSync(join(root, "mail", "outbox"), { recursive: true });
   mkdirSync(join(root, "mail", "archive"), { recursive: true });
-  return { mailDir: join(root, "mail"), statePath: join(root, "state", "reach-read.json"), archiveDir: join(root, "mail", "archive") };
+  mkdirSync(join(root, "mail", "sent"), { recursive: true });
+  return {
+    mailDir: join(root, "mail"),
+    statePath: join(root, "state", "reach-read.json"),
+    archiveDir: join(root, "mail", "archive"),
+    sentDir: join(root, "mail", "sent"),
+  };
+}
+
+function seedSent(cfg: MailboxConfig, id: string, to: string, subject: string, body: string, ts: string): void {
+  const env = { id, to: [to], kind: "dm", subject, body, refs: [], work: { items: [], repos: [] }, thread_id: "", ts };
+  writeFileSync(join(cfg.mailDir, "sent", `${id}.json`), JSON.stringify(env));
 }
 
 function seedInbox(
@@ -133,6 +144,42 @@ describe("read receipts", () => {
     readMessage(cfg, "m_rc0001");
     const receipts = readdirSync(join(cfg.mailDir, "outbox")).filter((f) => f.startsWith("_receipt_"));
     expect(receipts).toHaveLength(1);
+  });
+});
+
+describe("conversation view (reach_thread) — the 'inbox is empty' regression", () => {
+  it("REGRESSION: a peer reply already marked READ is still visible in the thread", () => {
+    // Exactly the 2026-08-05 live failure: a background wake read House's reply, so
+    // reach_inbox{unread_only:true} returned nothing and the bot said "inbox empty".
+    const cfg = tempMailbox();
+    seedInbox(cfg, "house", "m_th0001", "Re: proposal", "House's substantive reply", "2026-08-05T15:34:33Z");
+    readMessage(cfg, "m_th0001"); // background wake marks it read
+    expect(unreadCount(cfg)).toBe(0); // unread view: nothing — the misleading signal
+    const thread = threadMessages(cfg, { peer: "house" });
+    expect(thread.map((m) => m.id)).toContain("m_th0001"); // history view: still there
+    expect(thread[0].direction).toBe("in");
+  });
+
+  it("shows BOTH directions with a peer, oldest first", () => {
+    const cfg = tempMailbox();
+    seedSent(cfg, "m_th0010", "house", "proposal", "my outgoing ask", "2026-08-05T15:33:00Z");
+    seedInbox(cfg, "house", "m_th0011", "Re: proposal", "his answer", "2026-08-05T15:34:00Z");
+    const t = threadMessages(cfg, { peer: "house" });
+    expect(t.map((m) => m.id)).toEqual(["m_th0010", "m_th0011"]);
+    expect(t.map((m) => m.direction)).toEqual(["out", "in"]);
+    expect(t[0].from).toBe("me");
+  });
+
+  it("scopes to the requested peer only", () => {
+    const cfg = tempMailbox();
+    seedInbox(cfg, "house", "m_th0020", "a", "b", "2026-08-05T10:00:00Z");
+    seedInbox(cfg, "vanhelsing", "m_th0021", "a", "b", "2026-08-05T11:00:00Z");
+    expect(threadMessages(cfg, { peer: "house" }).map((m) => m.id)).toEqual(["m_th0020"]);
+  });
+
+  it("returns empty for a peer with no exchange (so the bot can say so truthfully)", () => {
+    const cfg = tempMailbox();
+    expect(threadMessages(cfg, { peer: "nobody" })).toHaveLength(0);
   });
 });
 

@@ -15,12 +15,12 @@ export function createReachInboxTool(config: ReachInboxConfig) {
   return {
     name: "reach_inbox",
     description:
-      "List your peer-message inbox (metadata only: id, from, subject, kind, timestamp, unread). Read a body with reach_read <id>. Optionally mark everything read without reading it.",
+      "List your peer-message inbox (metadata only: id, from, subject, kind, timestamp, unread). Read a body with reach_read <id>. IMPORTANT: unread_only answers \"what is NEW\", NOT \"did X reply\" — background mail handling may have already marked a reply read, so an empty unread list does NOT mean nobody replied. To answer a recall question, use reach_thread (conversation with a peer) or reach_search.",
     parameters: {
       type: "object",
       additionalProperties: false,
       properties: {
-        unread_only: { type: "boolean", description: "If true, list only unread messages." },
+        unread_only: { type: "boolean", description: "If true, list only unread messages — i.e. \"what is new\". Do NOT use this to check whether a peer replied; use reach_thread for that." },
         mark_all_read: { type: "boolean", description: "If true, mark every listed message read WITHOUT rendering bodies (use to dismiss noise)." },
       },
     },

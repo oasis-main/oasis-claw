@@ -702,7 +702,7 @@ else:
 # here — verified live 2026-08-03: House ran `reach_inbox` / `which reach_send` as
 # SHELL commands (and hit the exec reviewer) because the tools were registered but
 # not exposed. Gate on the same env the plugin's `enabled` uses.
-REACH_TOOLS = ("reach_send", "reach_inbox", "reach_read", "reach_search", "reach_help")
+REACH_TOOLS = ("reach_send", "reach_inbox", "reach_read", "reach_search", "reach_thread", "reach_help")
 if os.environ.get("OASIS_REACH_ENABLE", "") == "1":
     for t in REACH_TOOLS:
         if t not in also:

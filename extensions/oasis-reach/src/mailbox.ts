@@ -21,6 +21,12 @@ export interface MailboxConfig {
    * shards). Search reads it alongside the live inbox. Default: mailDir/archive.
    */
   archiveDir?: string;
+  /**
+   * RO dir where the relay files this bot's DELIVERED outbound originals. Lets
+   * reach_thread show BOTH sides of a conversation ("what did I ask House, and
+   * what did he answer?"). Default: mailDir/sent.
+   */
+  sentDir?: string;
 }
 
 export interface InboxItem {
@@ -101,6 +107,29 @@ export function listInbox(cfg: MailboxConfig): InboxItem[] {
 /** Count unread inbox messages — the ONLY thing injected into context each turn. */
 export function unreadCount(cfg: MailboxConfig): number {
   return listInbox(cfg).filter((i) => i.unread).length;
+}
+
+/**
+ * Peers this bot has received mail from — derived from inbox FILENAMES
+ * (`<from>__<id>.json`) with no JSON parsing, so it is cheap enough to run on
+ * every turn. Used by the memory supplement to point at reach_thread: without
+ * that pointer a bot answers "did House reply?" from unread state or memory and
+ * gets it wrong (observed live 2026-08-05).
+ */
+export function peersWithHistory(cfg: MailboxConfig): string[] {
+  const dir = inboxDir(cfg);
+  if (!existsSync(dir)) return [];
+  const peers = new Set<string>();
+  try {
+    for (const file of readdirSync(dir)) {
+      if (!file.endsWith(".json") || file.startsWith(".") || file.startsWith("_receipt_")) continue;
+      const sep = file.indexOf("__");
+      if (sep > 0) peers.add(file.slice(0, sep));
+    }
+  } catch {
+    return [];
+  }
+  return [...peers].sort();
 }
 
 export interface ReadResult {
@@ -261,18 +290,23 @@ export interface CorpusMessage {
   refs: string[];
   work: { items: string[]; repos: string[] };
   thread_id: string;
-  source: "inbox" | "archive";
+  source: "inbox" | "archive" | "sent";
+  /** "in" = received from a peer; "out" = this bot sent it. */
+  direction: "in" | "out";
+  /** Recipients — only meaningful for direction "out". */
+  to: string[];
 }
 
 function archiveDirOf(cfg: MailboxConfig): string {
   return cfg.archiveDir ?? join(cfg.mailDir, "archive");
 }
 
-function toCorpus(e: Partial<DeliveredEnvelope>, source: "inbox" | "archive"): CorpusMessage | null {
+function toCorpus(e: Partial<DeliveredEnvelope>, source: "inbox" | "archive" | "sent"): CorpusMessage | null {
   if (!e || typeof e.id !== "string") return null;
+  const direction: "in" | "out" = source === "sent" ? "out" : "in";
   return {
     id: e.id,
-    from: typeof e.from === "string" ? e.from : "unknown",
+    from: direction === "out" ? "me" : typeof e.from === "string" ? e.from : "unknown",
     kind: typeof e.kind === "string" ? e.kind : "dm",
     subject: typeof e.subject === "string" ? e.subject : "",
     body: typeof e.body === "string" ? e.body : "",
@@ -281,6 +315,8 @@ function toCorpus(e: Partial<DeliveredEnvelope>, source: "inbox" | "archive"): C
     work: workOf(e),
     thread_id: typeof e.thread_id === "string" ? e.thread_id : "",
     source,
+    direction,
+    to: Array.isArray(e.to) ? (e.to as string[]) : [],
   };
 }
 
@@ -302,6 +338,20 @@ export function readCorpus(cfg: MailboxConfig): CorpusMessage[] {
       if (!file.endsWith(".json") || file.startsWith(".")) continue;
       try {
         push(toCorpus(JSON.parse(readFileSync(join(inbox, file), "utf8")), "inbox"));
+      } catch {
+        /* skip corrupt */
+      }
+    }
+  }
+
+  // This bot's DELIVERED outbound originals (relay-filed, RO). Gives the "out"
+  // side of a conversation so reach_thread can show both directions.
+  const sent = cfg.sentDir ?? join(cfg.mailDir, "sent");
+  if (existsSync(sent)) {
+    for (const file of readdirSync(sent)) {
+      if (!file.endsWith(".json") || file.startsWith(".") || file.startsWith("_receipt_")) continue;
+      try {
+        push(toCorpus(JSON.parse(readFileSync(join(sent, file), "utf8")), "sent"));
       } catch {
         /* skip corrupt */
       }
@@ -397,4 +447,40 @@ export function rankCorpus(cfg: MailboxConfig, query: string, filter: SearchFilt
   const filtered = terms.length === 0 ? scored : scored.filter((m) => m.score > 0);
   filtered.sort((a, b) => (b.score - a.score) || (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0));
   return filtered.slice(0, Math.max(1, limit));
+}
+
+// ── Conversation view (reach_thread) ──────────────────────────────────────────
+// Answers "did <peer> reply, and what did we say?" from HISTORY — independent of
+// read/unread state. This exists because unread state is the wrong tool for
+// recall: a background mail-wake marks a reply read, so a later `reach_inbox
+// {unread_only:true}` returns nothing and the bot wrongly reports "inbox empty"
+// (observed live 2026-08-05, Kolmogorov ⇄ House). Recall must read history.
+
+export interface ThreadOptions {
+  /** Peer bot key — both directions with that peer. */
+  peer?: string;
+  /** Or a specific thread_id. */
+  thread_id?: string;
+  /** Max messages, newest kept. Default 20. */
+  limit?: number;
+}
+
+/** Chronological (oldest → newest) conversation with a peer or within a thread. */
+export function threadMessages(cfg: MailboxConfig, opts: ThreadOptions = {}): CorpusMessage[] {
+  const peer = opts.peer;
+  const threadId = opts.thread_id;
+  const limit = opts.limit && opts.limit > 0 ? Math.min(100, Math.floor(opts.limit)) : 20;
+
+  const matches = readCorpus(cfg).filter((m) => {
+    if (threadId && m.thread_id !== threadId) return false;
+    if (peer) {
+      const involved = m.direction === "in" ? m.from === peer : m.to.includes(peer);
+      if (!involved) return false;
+    }
+    return true;
+  });
+
+  // Sort chronological, then keep the most recent `limit` (still chronological).
+  matches.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+  return matches.slice(-limit);
 }
