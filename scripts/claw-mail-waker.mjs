@@ -40,7 +40,16 @@ import { dirname, join } from "node:path";
 
 // bot key → container name. Console is intentionally absent (it is Mike's manual
 // console, not a bot to wake). Override via CLAW_WAKER_BOTS="house=oasis-claw-house,...".
-const DEFAULT_BOTS = { house: "oasis-claw-house", kolmogorov: "oasis-claw-kolmogorov", vanhelsing: "oasis-claw-vanhelsing" };
+const DEFAULT_BOTS = {
+  house: "oasis-claw-house",
+  kolmogorov: "oasis-claw-kolmogorov",
+  vanhelsing: "oasis-claw-vanhelsing",
+  yesman: "oasis-claw-yesman",
+  butterbolt: "oasis-claw-butterbolt",
+  // Nimbus IS the base openclaw service.
+  nimbus: "oasis-claw-runtime",
+  helloworld: "oasis-claw-hello-world",
+};
 function resolveBots() {
   const raw = process.env.CLAW_WAKER_BOTS;
   if (!raw) return DEFAULT_BOTS;
@@ -182,6 +191,14 @@ async function tick() {
       // (re)start would wake every bot for mail that predates the daemon (already
       // read, or covered by the unread-count supplement). Only genuinely new mail
       // that arrives AFTER the daemon is running should trigger a wake.
+      //
+      // KNOWN RACE (narrow, observed 2026-08-06): mail that lands DURING the very
+      // first tick — after the daemon starts but before this bot's listing — is
+      // seeded instead of woken, so no wake fires for it. Window is one tick and
+      // only on a cursor-less start (fresh install / cursor deleted). Backstop: the
+      // unread-count memory supplement still surfaces it on the bot's next natural
+      // turn, and any LATER message wakes normally. Not worth per-message ts reads
+      // on every start to close; revisit if operators hit it in practice.
       const firstSeen = state[bot] === undefined;
       const woken = new Set(state[bot] ?? []);
       const fresh = msgs.filter((m) => !woken.has(m.id));
