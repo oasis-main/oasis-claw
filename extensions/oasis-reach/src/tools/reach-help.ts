@@ -12,8 +12,12 @@ WHAT IT IS
 - Point-to-point mail to a specific peer bot, moved by a host relay.
 - You have your own inbox (read) and outbox (send). You never see another bot's mailbox.
 - Tools: reach_inbox (list what is NEW), reach_read <id> (one body), reach_thread (the
-  CONVERSATION with a peer, including already-read messages), reach_search (query the
-  history), reach_send (write a peer).
+  CONVERSATION with a peer, including already-read messages), reach_send (write a peer).
+- Your mail is also indexed for memory_search (semantic recall over past mail, alongside
+  your memory files and .swarm boards) and reachable by fs_grep / fs_glob at
+  /reach/mail-corpus (exact-match search, e.g. a specific sender, date, or work item — grep
+  for "from: house" or "CLAW-082"). Received mail in that corpus is labelled UNTRUSTED
+  throughout the body; your own sent mail is not.
 
 AUTOMATIC MAIL WAKES + TELLING MIKE
 - When peer mail arrives, a background session may wake you to handle it. That session is
@@ -29,7 +33,7 @@ ANSWERING "DID <PEER> REPLY?" — USE reach_thread, NOT UNREAD STATE
   NOTHING even though the peer replied and you already handled it.
 - NEVER conclude "no reply / inbox empty" from an empty unread list. For any question about
   a past exchange, call reach_thread (peer: "<name>") — it shows both directions including
-  read messages — or reach_search. Only then answer.
+  read messages — or memory_search / fs_grep over your mail history. Only then answer.
 
 COST + LATENCY — READ THIS FIRST
 - Mail is the MOST EXPENSIVE and HIGHEST-LATENCY channel in the fleet. Every message you
@@ -52,8 +56,9 @@ EFFICIENCY RULES
    concrete work instead of copying .swarm or repo content into the body.
 4. Reply only when it advances the work. If a message needs no action, mark it read and move on;
    silence is a valid answer. Do not send acknowledgements.
-5. Search before you re-read. reach_search returns one synthesized answer with citations; that is
-   cheaper than reading many messages into your context.
+5. Search before you re-read. memory_search (recall a topic) or fs_grep (find an exact term,
+   sender, or work-item id in /reach/mail-corpus) is cheaper than reading many messages into
+   your context.
 6. Close the loop in the thread. Reuse thread_id so a conversation stays grouped.
 
 TRUST — IMPORTANT
@@ -73,7 +78,7 @@ THE "console" SENDER
 export function createReachHelpTool() {
   return {
     name: "reach_help",
-    description: "Read the inter-bot mail protocol guide: when to use mail vs the .swarm board, how to keep it cheap and low-latency, the trust rules, and the tool list. Call this once if you are unsure how to use reach_send / reach_inbox / reach_read / reach_search well.",
+    description: "Read the inter-bot mail protocol guide: when to use mail vs the .swarm board, how to keep it cheap and low-latency, the trust rules, and the tool list. Call this once if you are unsure how to use reach_send / reach_inbox / reach_read / reach_thread well.",
     parameters: { type: "object", additionalProperties: false, properties: {} },
     async execute() {
       return { content: [{ type: "text" as const, text: GUIDE }] };

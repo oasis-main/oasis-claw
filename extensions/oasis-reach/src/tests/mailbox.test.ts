@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { newMessageId, validateOutbound, type MailKind } from "../envelope.js";
-import { listInbox, markAllRead, rankCorpus, readCorpus, readMessage, threadMessages, unreadCount, writeOutbound, type MailboxConfig } from "../mailbox.js";
+import { listInbox, markAllRead, readCorpus, readMessage, threadMessages, unreadCount, writeOutbound, type MailboxConfig } from "../mailbox.js";
 
 function tempMailbox(): MailboxConfig {
   const root = mkdtempSync(join(tmpdir(), "reach-"));
@@ -183,7 +183,11 @@ describe("conversation view (reach_thread) — the 'inbox is empty' regression",
   });
 });
 
-describe("search corpus + ranking", () => {
+// readCorpus backs reach_thread (recall) and, indirectly, the CLAW-082 phase 4
+// mail corpus (a separate host-side script reads the same raw files and derives
+// a searchable markdown copy — reach_search's ranking layer was retired once
+// memory_search + fs_grep could search that derived corpus directly).
+describe("search corpus", () => {
   it("reads both the live inbox and archive shards (plain + gzip), de-duped", () => {
     const cfg = tempMailbox();
     seedInbox(cfg, "house", "m_live001", "live one", "current inbox body", "2026-08-02T10:00:00Z");
@@ -191,22 +195,6 @@ describe("search corpus + ranking", () => {
     seedArchiveShard(cfg, "2026-05", [{ id: "m_arch002", from: "house", kind: "dm", subject: "old gz", body: "archived gzip", refs: [], work: { items: [], repos: [] }, ts: "2026-05-15T10:00:00Z" }], true);
     const ids = readCorpus(cfg).map((m) => m.id).sort();
     expect(ids).toEqual(["m_arch001", "m_arch002", "m_live001"]);
-  });
-
-  it("ranks by term overlap, weighting subject and metadata over body", () => {
-    const cfg = tempMailbox();
-    seedInbox(cfg, "house", "m_rk0001", "transition matrix regime", "off-topic body", "2026-07-30T10:00:00Z");
-    seedInbox(cfg, "house", "m_rk0002", "unrelated", "a passing mention of matrix here", "2026-07-30T11:00:00Z");
-    const ranked = rankCorpus(cfg, "matrix");
-    expect(ranked[0].id).toBe("m_rk0001"); // subject hit outranks body hit
-  });
-
-  it("filters by work-item and by sender", () => {
-    const cfg = tempMailbox();
-    seedInbox(cfg, "house", "m_ft0001", "a", "b", "2026-07-30T10:00:00Z", { items: ["CLAW-076"], repos: [] });
-    seedInbox(cfg, "vanhelsing", "m_ft0002", "a", "b", "2026-07-30T11:00:00Z", { items: ["CLAW-099"], repos: [] });
-    expect(rankCorpus(cfg, "", { item: "CLAW-076" }).map((m) => m.id)).toEqual(["m_ft0001"]);
-    expect(rankCorpus(cfg, "", { from: "vanhelsing" }).map((m) => m.id)).toEqual(["m_ft0002"]);
   });
 });
 

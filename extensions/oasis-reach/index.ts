@@ -6,7 +6,6 @@ import { peersWithHistory, unreadCount } from "./src/mailbox.js";
 import { createReachHelpTool } from "./src/tools/reach-help.js";
 import { createReachInboxTool } from "./src/tools/reach-inbox.js";
 import { createReachReadTool } from "./src/tools/reach-read.js";
-import { createReachSearchTool, type LlmComplete } from "./src/tools/reach-search.js";
 import { createReachSendTool } from "./src/tools/reach-send.js";
 import { createReachThreadTool } from "./src/tools/reach-thread.js";
 
@@ -77,17 +76,9 @@ const plugin = {
       sentDir: path.join(mailDir, "sent"),
     };
 
-    // reach_search's synthesis pass uses the plugin runtime's llm.complete — the
-    // same handle the reviewer uses (api.runtime.llm.complete). Optional: search
-    // degrades to a ranked list if the runtime does not expose it.
-    const runtime = (api as unknown as { runtime?: { llm?: { complete?: LlmComplete } } }).runtime;
-    const complete: LlmComplete | undefined =
-      typeof runtime?.llm?.complete === "function" ? (runtime.llm.complete.bind(runtime.llm) as LlmComplete) : undefined;
-
     api.registerTool(createReachSendTool({ mailbox, knownPeers: cfg.knownPeers }), { name: "reach_send" });
     api.registerTool(createReachInboxTool({ mailbox }), { name: "reach_inbox" });
     api.registerTool(createReachReadTool({ mailbox }), { name: "reach_read" });
-    api.registerTool(createReachSearchTool({ mailbox, complete }), { name: "reach_search" });
     api.registerTool(createReachThreadTool({ mailbox }), { name: "reach_thread" });
     api.registerTool(createReachHelpTool(), { name: "reach_help" });
 
@@ -127,8 +118,7 @@ const plugin = {
       mailDir,
       statePath,
       archiveDir: mailbox.archiveDir,
-      tools: ["reach_send", "reach_inbox", "reach_read", "reach_search", "reach_thread", "reach_help"],
-      searchSynthesis: complete ? "llm" : "list-only (runtime.llm.complete unavailable)",
+      tools: ["reach_send", "reach_inbox", "reach_read", "reach_thread", "reach_help"],
       knownPeers: cfg.knownPeers ?? [],
     });
   },

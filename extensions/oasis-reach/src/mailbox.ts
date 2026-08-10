@@ -274,10 +274,12 @@ export function writeOutbound(cfg: MailboxConfig, env: OutboundEnvelope): string
   return finalPath;
 }
 
-// ── Search corpus (reach_search) ──────────────────────────────────────────────
+// ── Corpus (backs reach_thread; CLAW-082 phase 4 also derives a markdown copy
+// of this same data outside the bot, in scripts/claw-mail-corpus.mjs, so it is
+// searchable via memory_search / fs_grep) ──────────────────────────────────────
 // The corpus is the live inbox PLUS the relay's compressed archive shards
 // (<archiveDir>/<YYYY-MM>.jsonl and .jsonl.gz — old READ mail rolled up for
-// retention). Reading both means search sees the whole history, not just the
+// retention). Reading both means recall sees the whole history, not just the
 // working set, while the live inbox stays small and cheap for the unread count.
 
 export interface CorpusMessage {
@@ -381,72 +383,6 @@ export function readCorpus(cfg: MailboxConfig): CorpusMessage[] {
     }
   }
   return out;
-}
-
-export interface SearchFilter {
-  from?: string;
-  since?: string; // ISO, inclusive
-  until?: string; // ISO, inclusive
-  item?: string; // .swarm work-item id
-  repo?: string; // repository id
-}
-
-export interface ScoredMessage extends CorpusMessage {
-  score: number;
-  snippet: string;
-}
-
-function tokenize(s: string): string[] {
-  return s.toLowerCase().match(/[a-z0-9][a-z0-9_-]{1,}/g) ?? [];
-}
-
-function snippetAround(body: string, terms: string[], width = 240): string {
-  const low = body.toLowerCase();
-  let at = -1;
-  for (const t of terms) {
-    const i = low.indexOf(t);
-    if (i >= 0 && (at < 0 || i < at)) at = i;
-  }
-  if (at < 0) return body.slice(0, width).replace(/\s+/g, " ").trim();
-  const start = Math.max(0, at - width / 4);
-  return (start > 0 ? "…" : "") + body.slice(start, start + width).replace(/\s+/g, " ").trim() + "…";
-}
-
-/**
- * Lexical prefilter: term-overlap scoring across subject (weighted), body, from,
- * refs, and work refs. Applies structured filters first. Returns top-`limit`
- * candidates — this is the cheap stage that narrows the corpus BEFORE any
- * (optional) model synthesis pass.
- */
-export function rankCorpus(cfg: MailboxConfig, query: string, filter: SearchFilter = {}, limit = 20): ScoredMessage[] {
-  const terms = [...new Set(tokenize(query))];
-  const corpus = readCorpus(cfg).filter((m) => {
-    if (filter.from && m.from !== filter.from) return false;
-    if (filter.since && m.ts && m.ts < filter.since) return false;
-    if (filter.until && m.ts && m.ts > filter.until) return false;
-    if (filter.item && !m.work.items.includes(filter.item)) return false;
-    if (filter.repo && !m.work.repos.includes(filter.repo)) return false;
-    return true;
-  });
-
-  const scored: ScoredMessage[] = corpus.map((m) => {
-    const subjTokens = new Set(tokenize(m.subject));
-    const bodyTokens = new Set(tokenize(m.body));
-    const metaTokens = new Set([...tokenize(m.from), ...m.refs.flatMap(tokenize), ...m.work.items.map((x) => x.toLowerCase()), ...m.work.repos.flatMap(tokenize)]);
-    let score = 0;
-    for (const t of terms) {
-      if (subjTokens.has(t)) score += 3;
-      if (bodyTokens.has(t)) score += 1;
-      if (metaTokens.has(t)) score += 2;
-    }
-    return { ...m, score, snippet: snippetAround(m.body, terms) };
-  });
-
-  // If the query had no usable terms (e.g. filter-only search), keep everything
-  // and rank by recency; otherwise drop zero-score messages.
-  const filtered = terms.length === 0 ? scored : scored.filter((m) => m.score > 0);
-  filtered.sort((a, b) => (b.score - a.score) || (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0));
-  return filtered.slice(0, Math.max(1, limit));
 }
 
 // ── Conversation view (reach_thread) ──────────────────────────────────────────

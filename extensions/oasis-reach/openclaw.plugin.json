@@ -8,7 +8,6 @@
       "reach_send",
       "reach_inbox",
       "reach_read",
-      "reach_search",
       "reach_thread",
       "reach_help"
     ]

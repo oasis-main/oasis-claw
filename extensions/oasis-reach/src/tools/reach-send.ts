@@ -38,7 +38,7 @@ export function createReachSendTool(config: ReachSendConfig) {
         body: { type: "string", description: `Message body (<= ${MAX_BODY_CHARS} chars).` },
         kind: { type: "string", enum: [...MAIL_KINDS], description: 'Message kind: "dm" (default), "project", or "broadcast".' },
         refs: { type: "array", items: { type: "string" }, description: "Optional free-form references (message ids, notes)." },
-        work_items: { type: "array", items: { type: "string" }, description: 'Optional .swarm work-item ids this message concerns (e.g. "CLAW-076"). Lets sender + recipient + reach_search track the concrete work — do NOT restate .swarm content here, just point at it.' },
+        work_items: { type: "array", items: { type: "string" }, description: 'Optional .swarm work-item ids this message concerns (e.g. "CLAW-076"). Lets sender + recipient (and a later memory_search / fs_grep) track the concrete work — do NOT restate .swarm content here, just point at it.' },
         work_repos: { type: "array", items: { type: "string" }, description: 'Optional repository ids this message concerns (e.g. "oasis-cloud" or "org/repo").' },
         thread_id: { type: "string", description: "Optional thread id to group a conversation." },
       },

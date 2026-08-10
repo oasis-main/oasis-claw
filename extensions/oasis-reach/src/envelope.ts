@@ -27,8 +27,9 @@ export const MAX_WORK_REPOS = 16;
 // A message may POINT AT concrete work: .swarm work-item ids (e.g. "CLAW-076")
 // and repositories (e.g. "oasis-cloud" or "org/repo"). This is deliberately NOT
 // meta-messaging ABOUT .swarm — .swarm is already the project-native board. It is
-// a typed handle so sender and recipient (and reach_search) can track exactly
-// which item/repo a conversation concerns without duplicating .swarm content.
+// a typed handle so sender and recipient (and a later memory_search / fs_grep)
+// can track exactly which item/repo a conversation concerns without duplicating
+// .swarm content.
 export interface WorkRefs {
   items: string[]; // .swarm work-item ids
   repos: string[]; // repository identifiers

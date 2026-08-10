@@ -754,6 +754,15 @@ fetch_cfg["useTrustedEnvProxy"] = True
 # active). Under a permissive profile (`full`) this is a harmless no-op.
 also = tools_cfg.get("alsoAllow")
 also = list(also) if isinstance(also, list) else []
+# `also` is read from the PERSISTED, volume-mounted config, so a tool name
+# added on a prior boot never goes away on its own — nothing below actively
+# prunes an entry unless it is currently in one of the ADD/REMOVE tuples for an
+# ENABLED feature. A retired tool with no owning tuple (e.g. reach_search,
+# retired 2026-08-10) would sit in alsoAllow forever, allowlisting a tool that
+# no longer exists. Harmless (verified live: no phantom tool appears, since the
+# plugin simply never registers it) but is config drift worth not shipping.
+RETIRED_TOOLS = ("reach_search",)
+also = [x for x in also if x not in RETIRED_TOOLS]
 role_also_allow = os.environ.get("OASIS_TOOLS_ALSO_ALLOW", "").strip()
 if role_also_allow:
     for item in (x.strip() for x in role_also_allow.split(",") if x.strip()):
@@ -770,7 +779,14 @@ else:
 # here — verified live 2026-08-03: House ran `reach_inbox` / `which reach_send` as
 # SHELL commands (and hit the exec reviewer) because the tools were registered but
 # not exposed. Gate on the same env the plugin's `enabled` uses.
-REACH_TOOLS = ("reach_send", "reach_inbox", "reach_read", "reach_search", "reach_thread", "reach_help")
+# reach_search retired 2026-08-10 (CLAW-082 phase 4): its lexical ranking +
+# optional LLM-synthesis pass is now redundant. Mail is indexed for
+# memory_search (semantic recall, framed UNTRUSTED throughout — see
+# claw-mail-corpus.mjs) and reachable by fs_grep/fs_glob at /reach/mail-corpus
+# (exact-match, incl. its structured filters — grep "from: house" or a work-item
+# id) for any bot with OASIS_FIND_ROOTS set. Two cheap general primitives beat
+# one purpose-built tool with its own ranking code and a second model call.
+REACH_TOOLS = ("reach_send", "reach_inbox", "reach_read", "reach_thread", "reach_help")
 if os.environ.get("OASIS_REACH_ENABLE", "") == "1":
     for t in REACH_TOOLS:
         if t not in also:
