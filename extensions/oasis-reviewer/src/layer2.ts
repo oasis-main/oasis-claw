@@ -41,6 +41,7 @@ export type LlmComplete = (params: {
   temperature?: number;
   purpose?: string;
   agentId?: string;
+  thinkingLevel?: string;
   signal?: AbortSignal;
 }) => Promise<{ text: string }>;
 
@@ -131,12 +132,27 @@ export async function judgeConstitution(
       messages: [{ role: "user", content: user }],
       ...(opts.model ? { model: opts.model } : {}),
       ...(opts.agentId ? { agentId: opts.agentId } : {}),
-      // 220 was too tight for a longer/compound call: the judge sometimes explains
-      // BEFORE the JSON despite the system prompt's instruction, and got cut off
-      // mid-explanation before ever emitting the verdict (2026-07-30, l2ParseFail
-      // fail-closed deny on a 3-statement Nimbus command). Paired with the
-      // JSON-first prompt change above (belt) this token bump is the suspenders.
-      maxTokens: 320,
+      // Without this, the call silently inherits the CALLING AGENT's own
+      // thinking level (Nimbus runs "high"). Extended thinking is charged
+      // against the same maxTokens budget as the visible response, so a high
+      // thinking level can consume the entire budget on reasoning and leave
+      // ZERO tokens for the verdict — res.text comes back empty, no error, no
+      // parse-fail text, just a silent fail-closed deny (2026-08-03, Nimbus:
+      // several denies with l2Verdict/l2Error/l2ParseFail all null).
+      // "off" fixed that but throws out the reasoning entirely — Mike's call
+      // (2026-08-03): an INDEPENDENT reviewer should still think a little,
+      // not pattern-match blind. "minimal" is the cheapest non-off rung on
+      // openclaw's ladder (off < minimal < low < medium < high < xhigh <
+      // max) — real deliberation, bounded. Paired with the much larger
+      // maxTokens below as the hard ceiling, so minimal-level thinking can
+      // never plausibly exhaust the budget before the verdict gets written.
+      thinkingLevel: "minimal",
+      // Was 220, then 320 (2026-07-30) to fix a truncated-explanation case.
+      // Raised again (2026-08-03) alongside thinkingLevel:"minimal" above —
+      // that reasoning needs its own room on top of the JSON verdict, and
+      // this is the hard cap on the two combined. Still a ~1-2s cost for a
+      // per-call judge; cheap relative to getting a real verdict every time.
+      maxTokens: 2048,
       temperature: 0,
       purpose: "oasis-reviewer:layer2-constitution",
       signal: ac.signal,

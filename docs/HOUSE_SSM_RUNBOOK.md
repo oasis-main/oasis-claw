@@ -9,26 +9,42 @@ that deploys `main` of `exp` (see `exp/DEPLOY.md`, `exp/README.md`).
 
 ---
 
-## Status: DEFERRED behind the uid-exec sandbox (task #8)
+## Status: precondition VOID — superseded, then largely overtaken (2026-08-08)
 
-Decision (Mike, 2026-07-19): do the **whole** SSM grant *after* #8 lands, with a
-standing key. Rationale: until exec is uid-split, House's own `exec` can `cat` any
-standing credential in its container, and House is a high-adversarial-exposure bot.
+**The "#8" this document waits on will never land.** CLAW-054 (the uid-split /
+token-free exec runner) was **SUPERSEDED 2026-07-24** by the boundary-first
+scope-down — "DO NOT BUILD THE RUNNER". The replacement control model is the
+**egress boundary + credential scoping**, with exec running in-container at
+container granularity. Anything below that still says "apply at #8" should be read
+against that newer model, not the old one.
 
-So the role/seed edits were **reverted** (House's active policy advertises no SSM
-capability today); only the design artifacts below are kept, ready to apply.
+Separately, Mike granted House full systems-administration scope on his personal
+AWS on **2026-08-08** (trading infrastructure + deploys + financial/business
+OSINT), which moots most of the "should House touch AWS at all" framing here.
 
 | Artifact | State |
 |---|---|
-| `bots/house/role.yaml` — `aws` + `session-manager-plugin` in `exec.allow` | **to apply at #8** (placeholder comment left in file) |
-| `bots/house/role.yaml` — 4 SSM endpoints in `origins.trusted` | **to apply at #8** (placeholder comment left in file) |
-| `sandbox/egress-proxy/seeds/house/allowlist.txt` — re-emit after the role edit | **to apply at #8** |
-| `bots/house/iam/house-ssm-readonly.policy.json` — least-priv IAM policy | written, parked |
+| `bots/house/role.yaml` — `aws` in `exec.allow` | **DONE 2026-08-08** |
+| `bots/house/role.yaml` — `git` in `exec.allow` (deploys) | **DONE 2026-08-08** |
+| `bots/house/role.yaml` — SSM endpoints in `origins.trusted` | **not needed** — `.amazonaws.com` was already trusted 2026-07-30 and covers `ssm`/`ssmmessages`/`ec2messages`/`sts` |
+| `sandbox/egress-proxy/seeds/house/allowlist.txt` | **re-emitted 2026-08-08** (also added `.kalshi.com`) |
+| `session-manager-plugin` in the runtime image | **STILL MISSING** — an interactive SSM shell will not work until §5 is done |
+| `bots/house/iam/house-ssm-readonly.policy.json` — least-priv IAM policy | written, parked — see the outstanding item below |
 | `bots/house/iam/SSM-House-ReadOnly-Shell.doc.json` — read-only SM document | written, parked |
 
-**To apply at #8:** put the 4 endpoints back in `origins.trusted` and `aws` +
-`session-manager-plugin` in `exec.allow` (comments in `role.yaml` mark both spots),
-re-run `compile-role.py --emit-egress-allowlist`, then follow the steps below.
+### Outstanding, and it is the real one: scope the credential
+
+The superseding model replaced cred-*separation* with cred-*scoping* — and the
+scoping half is **not done**. House currently holds **Mike's full personal AWS
+credentials** (mounted RO at `~/.aws` since 2026-07-30), not a dedicated
+least-privilege principal. His own `exec` can read that file: it matches no entry
+in the fleet `denyReadGlobs` (`*.pem`, `id_*`, `*.key`, `*_rsa`, `*_ed25519`,
+`.env*`, `*.env`), so the reviewer governs that read, not the filesystem.
+
+That is the same exposure the original #8 deferral existed to prevent, now carried
+by a different control. It is acceptable only if the credential is scoped. §3 below
+already has the least-privilege policy written. Only Mike can apply it — minting an
+IAM user and issuing keys is not something Claude can do.
 
 ---
 

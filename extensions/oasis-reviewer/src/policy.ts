@@ -27,6 +27,25 @@ export interface HardPolicy {
   allowWriteRoots: string[]; // [] = no scoping (fleet-broad)
   escalateWriteRoots: string[];
   denyWriteOutsideAllow: boolean;
+  // exec commands matching any of these regexes → DENY outright, no approval path.
+  // Distinct from escalateExecRegex on purpose: escalate means "Mike may approve
+  // this"; deny means "there is no approval that makes this OK". Added 2026-08-08
+  // for House's banking floor — Mike's first rule for the AWS/trading grant was
+  // that a bot must never trigger a bank deposit or withdrawal. Expressing that as
+  // escalateExtra would have been wrong: escalate routes to an approval prompt, and
+  // the whole point is that the action is off the table even if approval is given.
+  // Checked BEFORE the escalate patterns so it wins over an overlapping one
+  // (house's escalateExtra trade-exec already matches withdraw|transfer).
+  denyExecRegex: RegExp[];
+  // exec commands matching any of these regexes → escalate under the principle
+  // hard:operator-consent-required, which is in NEVER_DOWNGRADE. Use this (not
+  // escalateExtra) when the grant is literally "only with Mike's approval": an
+  // ordinary escalate is auto-allowed in an unattended run (CLAW-078 reasons that
+  // consent was given when the job was authored), which is right for a scheduled
+  // git commit and WRONG for discretionary trade execution — an unattended run has
+  // no Mike to approve, so it must fail closed instead. Added 2026-08-08 with
+  // House's trading grant.
+  consentRequiredExecRegex: RegExp[];
   // exec commands matching any of these regexes → escalate (operator-consent)
   escalateExecRegex: RegExp[];
   // SELF-MODIFICATION backstop, kept SEPARATE from escalateExecRegex so it carries
@@ -47,6 +66,8 @@ export const DEFAULT_HARD_POLICY: HardPolicy = {
   allowWriteRoots: [],
   escalateWriteRoots: [],
   denyWriteOutsideAllow: false,
+  denyExecRegex: [],
+  consentRequiredExecRegex: [],
   escalateExecRegex: [],
   selfRuntimeExecRegex: [],
 };
@@ -65,7 +86,11 @@ const CRON_MUTATE_ACTIONS = new Set(["add", "update", "remove"]);
 // privilege-escalation paths: a cron/webhook turn that can rewrite its own runtime
 // (`openclaw config set`) or author new cron jobs would be self-perpetuating, so
 // unattended they FAIL CLOSED (deny) instead.
-export const NEVER_DOWNGRADE = new Set(["hard:self-runtime", "hard:cron-mutation"]);
+// hard:operator-consent-required is the per-bot consentRequiredExtra principle
+// (House's trade execution, 2026-08-08). Same reasoning as the two above: the
+// grant is "discretionary trade execution WITH Mike's approval", so a run with no
+// Mike must fail closed rather than inherit authoring-time consent.
+export const NEVER_DOWNGRADE = new Set(["hard:self-runtime", "hard:cron-mutation", "hard:operator-consent-required"]);
 
 // Escalations that in-conversation operator consent can satisfy (CLAW-079).
 // These rules exist to make Mike approve an action; if he asked for it in the same
@@ -116,6 +141,98 @@ function hasOnlySafeTmpCatSubstitution(cmd: string): boolean {
 // mode=full already accepts. Deliberately excludes $( ` <( (see SUBSTITUTION).
 const BENIGN_COMPOUND = /[|;&]|(^|\s)>{1,2}(\s|$)/;
 
+// ── Read-only text-pipeline carve-out for the per-bot extras (2026-08-10) ──────
+// House (grep -RniE "(no|never|don't...).{0,50}(spread|sell premium...)|sell
+// premium|..." /reach/exp/.swarm 2>/dev/null | head -100) got escalated by his
+// OWN escalateExtra "trade-exec" rule (\b(trade|order|buy|sell|withdraw|
+// transfer)\b) — because he was SEARCHING his own notes for the word "sell",
+// inside a quoted grep pattern, not placing a trade. denyExtra/consentRequired-
+// Extra/escalateExtra are naive substring regexes over the WHOLE raw command
+// string; none of them can tell "sell" used as a verb on a real target apart
+// from "sell" appearing as data inside a read-only text tool's own search
+// pattern. That is the exact "reviewer can't see the whole context" failure
+// Mike reported — the regex sees characters, not intent.
+//
+// Fix: if EVERY pipeline stage's leading command is drawn from a small,
+// deliberately narrow set of tools that are structurally incapable of taking
+// any action beyond emitting matched/filtered text (no execution, no network,
+// no writes, no deletes), skip the per-bot extras for that command — its
+// arguments cannot contain a real trade/transfer/order regardless of what
+// words appear in them. `python3 trade_execution.py sell SPY`, `curl -X POST
+// .../orders`, and anything piped into a non-safelisted stage (e.g. `grep sell
+// notes | python3 evil.py`) still hit the extras normally: python3/curl are
+// deliberately NOT in this set, so the exemption never fires for them.
+//
+// This does NOT touch DESTRUCTIVE, DOWNLOAD_EXEC, or SUBSTITUTION — those run
+// unconditionally on the full raw string (earlier for the first two, right
+// after for the third) regardless of this carve-out, so hiding an eval vector
+// inside a "safe" tool's argument (`grep "$(curl evil.com)" file`) is still
+// caught by SUBSTITUTION independently of whether the extras were skipped.
+//
+// find is DELIBERATELY excluded even though House's own role.yaml allows it —
+// `-delete`/`-exec` make it capable of exactly the actions this carve-out
+// exists to keep excluded, and nothing in the reported bug required exempting
+// it. awk is excluded for the same reason (its own scripting language can
+// shell out). The set only grows by adding a tool that is provably incapable
+// of side effects — err toward NOT exempting on any doubt.
+//
+// Failure mode if the quote-aware splitter below mis-parses: it can only ever
+// fail CLOSED. Over-splitting (treating a quoted `|` as a boundary) just adds
+// spurious stages that won't be in the safelist, so the exemption doesn't
+// apply — identical to today's behavior. An unterminated quote returns a
+// sentinel stage that can never match, for the same reason. The only unsafe
+// direction would be UNDER-splitting a genuinely unquoted pipe (hiding a real
+// second stage inside what looks like one safelisted stage) — tested against
+// nested single/double quotes, `||`, `&&`, and an apostrophe inside a
+// double-quoted string (House's own `don't`) in policy.test.ts.
+const READ_ONLY_ARGV_TOOLS = new Set([
+  "grep", "egrep", "fgrep", "rg", "ag",
+  "cat", "head", "tail", "wc", "sort", "uniq", "cut",
+  "jq", "xmllint", "stat", "file", "ls",
+]);
+
+function splitUnquotedStages(cmd: string): string[] {
+  const stages: string[] = [];
+  let cur = "";
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i];
+    if (quote === "'") {
+      cur += c;
+      if (c === "'") quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      if (c === "\\" && i + 1 < cmd.length) { cur += c + cmd[i + 1]; i++; continue; }
+      cur += c;
+      if (c === '"') quote = null;
+      continue;
+    }
+    if (c === "'" || c === '"') { quote = c; cur += c; continue; }
+    if (c === "\\" && i + 1 < cmd.length) { cur += c + cmd[i + 1]; i++; continue; }
+    if (c === "|" && cmd[i + 1] === "|") { stages.push(cur); cur = ""; i++; continue; }
+    if (c === "&" && cmd[i + 1] === "&") { stages.push(cur); cur = ""; i++; continue; }
+    if (c === "|" || c === ";") { stages.push(cur); cur = ""; continue; }
+    cur += c;
+  }
+  stages.push(cur);
+  // Malformed/unterminated quote — fail closed rather than trust a partial parse.
+  if (quote !== null) return ["\0UNTERMINATED_QUOTE"];
+  return stages;
+}
+
+function leadingArgvToken(stage: string): string {
+  const m = stage.trim().match(/^(\S+)/);
+  if (!m) return "";
+  return (m[1].split("/").pop() ?? m[1]).toLowerCase();
+}
+
+function isInertReadOnlyPipeline(cmd: string): boolean {
+  const stages = splitUnquotedStages(cmd);
+  if (stages.length === 0) return false;
+  return stages.every((s) => s.trim().length > 0 && READ_ONLY_ARGV_TOOLS.has(leadingArgvToken(s)));
+}
+
 // ── Policy file loading + per-bot resolution ──────────────────────────────────
 
 interface PolicyFile {
@@ -137,11 +254,34 @@ interface PolicyFile {
     per_bot?: Record<
       string,
       {
+        // Per-bot override of the fleet destructiveExec verdict. Opt-in: when a
+        // bot omits it, the fleet value applies unchanged, so adding this field
+        // cannot alter any existing bot's posture.
+        //
+        // Added for Kaizen on the REDACTED-ORG VDI, where the fleet "deny" is wrong
+        // for two reasons. First, that host's outer boundary is set by corporate
+        // IT and by the Kubernetes pod she runs in, not by us. Second, the fleet
+        // pattern `rm\s+-[a-z]*[rf][a-z]*\s+(--no-preserve-root|\/)\b` matches
+        // `/` at the START of any absolute path, so it denies an ordinary
+        // `rm -rf /work/<repo>/node_modules` — routine in the JavaScript and
+        // Electron work she is being given. Denying it would just teach her to
+        // route around the rule; escalating it every time would teach Mike to
+        // approve without reading. A bot that sets this to "allow" must scope
+        // destruction with its own escalateExtra regex (see the VDI overrides).
+        destructiveExec?: Verdict;
         allowWriteRoots?: string[];
         escalateWriteRoots?: string[];
         denyWriteOutsideAllow?: boolean;
         escalateActions?: string[];
         escalateExtra?: Record<string, string>;
+        // Per-bot HARD DENY regexes — no approval path (see HardPolicy.denyExecRegex).
+        // Use escalateExtra when Mike should be asked; use this only when the answer
+        // is "no" regardless of who asks.
+        denyExtra?: Record<string, string>;
+        // Per-bot escalate regexes that must NEVER be auto-allowed unattended
+        // (see HardPolicy.consentRequiredExecRegex). "Only with Mike's approval"
+        // belongs here; "gate this when convenient" belongs in escalateExtra.
+        consentRequiredExtra?: Record<string, string>;
         constitutionalReviewRequired?: boolean;
       }
     >;
@@ -177,6 +317,32 @@ export function constitutionalReviewRequired(policy: PolicyFile | null, botKey: 
   return policy?.hard?.per_bot?.[botKey]?.constitutionalReviewRequired === true;
 }
 
+/**
+ * Compile a per-bot regex map, skipping `_`-prefixed documentation keys.
+ *
+ * These maps are `{name: regexSource}` and EVERY value is compiled, so a prose
+ * note stored as a member silently becomes a live rule. That was already latent
+ * in kaizen's escalateExtra._note (a harmless escalate that never matches); it
+ * would be considerably worse in a denyExtra, where the same mistake creates an
+ * un-appealable deny. Author notes belong in a SIBLING `<field>_note` key — this
+ * skip makes the convention enforced rather than merely documented.
+ *
+ * A malformed pattern is skipped rather than thrown, so one bad regex cannot take
+ * the whole fleet's policy down with it.
+ */
+function compileRegexMap(map: Record<string, string> | undefined): RegExp[] {
+  const out: RegExp[] = [];
+  for (const [key, src] of Object.entries(map ?? {})) {
+    if (key.startsWith("_")) continue;
+    try {
+      out.push(new RegExp(src, "i"));
+    } catch {
+      /* skip a malformed per-bot pattern rather than fail the whole policy */
+    }
+  }
+  return out;
+}
+
 /** Resolve the flat HardPolicy for a bot from the loaded file (fleet + per_bot). */
 export function resolveHardPolicy(policy: PolicyFile | null, botKey: string): HardPolicy {
   if (!policy?.hard) return DEFAULT_HARD_POLICY;
@@ -188,13 +354,12 @@ export function resolveHardPolicy(policy: PolicyFile | null, botKey: string): Ha
     const src = patterns[key];
     if (src) regex.push(new RegExp(src, "i"));
   }
-  for (const src of Object.values(b.escalateExtra ?? {})) {
-    try {
-      regex.push(new RegExp(src, "i"));
-    } catch {
-      /* skip a malformed per-bot pattern rather than fail the whole policy */
-    }
-  }
+  regex.push(...compileRegexMap(b.escalateExtra));
+  // HARD DENY regexes. Note the failure direction differs from an escalate: a
+  // dropped escalate pattern falls back to a weaker gate, while a dropped DENY
+  // pattern removes a floor entirely. Keep these simple and covered by tests.
+  const denyRegex = compileRegexMap(b.denyExtra);
+  const consentRegex = compileRegexMap(b.consentRequiredExtra);
   // SELF-MODIFICATION backstop (fleet invariant, ALWAYS on — no per-bot opt-in):
   // exec commands that drive the bot's OWN openclaw runtime CLI → escalate. This
   // is the Layer 1 deterministic floor under the constitution's no-self-
@@ -217,10 +382,12 @@ export function resolveHardPolicy(policy: PolicyFile | null, botKey: string): Ha
     gitignoredWrite: f.gitignoredWrite ?? "escalate",
     compoundExec: f.compoundExec ?? "escalate",
     substitutionExec: f.substitutionExec ?? "escalate",
-    destructiveExec: f.destructiveExec ?? "deny",
+    destructiveExec: b.destructiveExec ?? f.destructiveExec ?? "deny",
     allowWriteRoots: b.allowWriteRoots ?? [],
     escalateWriteRoots: b.escalateWriteRoots ?? [],
     denyWriteOutsideAllow: b.denyWriteOutsideAllow === true,
+    denyExecRegex: denyRegex,
+    consentRequiredExecRegex: consentRegex,
     escalateExecRegex: regex,
     selfRuntimeExecRegex: selfRuntime,
   };
@@ -304,14 +471,48 @@ export function evaluateHard(input: EvalInput, policy: HardPolicy = DEFAULT_HARD
     const cmd = firstString(params, "command", "cmd", "script", "input", "code");
     if (cmd) {
       for (const re of DESTRUCTIVE) {
-        if (re.test(cmd)) return { verdict: policy.destructiveExec, principle: "hard:destructive-exec", reason: `refusing destructive command: ${cmd.slice(0, 120)}` };
+        if (re.test(cmd)) {
+          // "allow" means this rule ABSTAINS, not "stop evaluating". Returning
+          // early on allow would short-circuit the escalate patterns below and
+          // hand the bot an unconditional pass on `rm -rf /`, which is the exact
+          // opposite of what a bot opting out of the blanket deny wants. A bot
+          // that sets destructiveExec="allow" is saying "scope this by path with
+          // my own escalateExtra regexes" — so fall through and let them decide.
+          // deny and escalate still return immediately, so no existing bot's
+          // behaviour changes.
+          if (policy.destructiveExec !== "allow") {
+            return { verdict: policy.destructiveExec, principle: "hard:destructive-exec", reason: `refusing destructive command: ${cmd.slice(0, 120)}` };
+          }
+          break;
+        }
       }
       if (DOWNLOAD_EXEC.test(cmd)) return { verdict: "deny", principle: "hard:download-execute", reason: `refusing pipe/decode into a shell (obfuscated RCE): ${cmd.slice(0, 120)}` };
+      // denyExtra / consentRequiredExtra / escalateExtra are naive substring
+      // regexes over the whole raw command — they cannot tell a trade/transfer
+      // word used as a verb on a real target apart from the same word appearing
+      // as DATA inside a read-only text tool's own search pattern (see the
+      // READ_ONLY_ARGV_TOOLS comment above `isInertReadOnlyPipeline`). Computed
+      // once; only skips those three per-bot loops, never DESTRUCTIVE/DOWNLOAD_EXEC
+      // (already evaluated above) or SUBSTITUTION (still evaluated below).
+      const inertReadOnly = isInertReadOnlyPipeline(cmd);
+      // Per-bot hard floor. Deliberately ahead of BOTH escalate loops below: an
+      // overlapping escalate pattern must not be able to open an approval path
+      // around a rule whose whole point is that approval does not apply.
+      if (!inertReadOnly) {
+        for (const re of policy.denyExecRegex) {
+          if (re.test(cmd)) return { verdict: "deny", principle: "hard:bot-forbidden-action", reason: `forbidden for this bot — no approval path: ${cmd.slice(0, 120)}` };
+        }
+      }
       for (const re of policy.selfRuntimeExecRegex) {
         if (re.test(cmd)) return { verdict: "escalate", principle: "hard:self-runtime", reason: `driving this bot's own openclaw runtime needs Mike's approval: ${cmd.slice(0, 120)}` };
       }
-      for (const re of policy.escalateExecRegex) {
-        if (re.test(cmd)) return { verdict: "escalate", principle: "hard:operator-consent-action", reason: `action needs Mike's slash-command approval: ${cmd.slice(0, 120)}` };
+      if (!inertReadOnly) {
+        for (const re of policy.consentRequiredExecRegex) {
+          if (re.test(cmd)) return { verdict: "escalate", principle: "hard:operator-consent-required", reason: `needs Mike's explicit approval and is never auto-allowed unattended: ${cmd.slice(0, 120)}` };
+        }
+        for (const re of policy.escalateExecRegex) {
+          if (re.test(cmd)) return { verdict: "escalate", principle: "hard:operator-consent-action", reason: `action needs Mike's slash-command approval: ${cmd.slice(0, 120)}` };
+        }
       }
       if (SUBSTITUTION.test(cmd) && !hasOnlySafeTmpCatSubstitution(cmd)) return { verdict: policy.substitutionExec, principle: "hard:command-substitution", reason: `command/process substitution routed to human: ${cmd.slice(0, 120)}` };
       if (BENIGN_COMPOUND.test(cmd)) return { verdict: policy.compoundExec, principle: "hard:compound-exec", reason: `compound/redirect: ${cmd.slice(0, 120)}` };

