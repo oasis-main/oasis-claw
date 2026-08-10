@@ -110,22 +110,10 @@ describe("readSwarmSnapshot — byte budget", () => {
     expect(snap.content).toContain("[truncated");
   });
 
-  it("shares budget across multiple files in order", () => {
-    write("a.md", "A".repeat(60));
-    write("b.md", "B".repeat(60));
-    const result = readSwarmSnapshot({
-      swarmDir,
-      includeFiles: ["a.md", "b.md"],
-      maxBytes: 80,
-    });
-    // a.md gets 60 bytes (fits), b.md gets 20 bytes then truncated
-    expect(result[0].truncated).toBe(false);
-    expect(result[0].content).toBe("A".repeat(60));
-    expect(result[1].truncated).toBe(true);
-    expect(result[1].content).toContain("B".repeat(20));
-  });
-
-  it("marks later files as truncated:true with empty content when budget is 0", () => {
+  // CLAW-082: the budget is split fairly, NOT consumed in includeFiles order.
+  // The old sequential reader starved the last file to empty content on every
+  // real board, which an agent reads as "that file is empty".
+  it("splits the budget so an oversized first file cannot starve the second", () => {
     write("a.md", "A".repeat(100));
     write("b.md", "B".repeat(100));
     const result = readSwarmSnapshot({
@@ -135,7 +123,36 @@ describe("readSwarmSnapshot — byte budget", () => {
     });
     expect(result[0].truncated).toBe(true);
     expect(result[1].truncated).toBe(true);
-    expect(result[1].content).toBe(""); // budget exhausted before reaching b.md
+    // Both get 25 bytes, not 50/0.
+    expect(result[0].content).toContain("A".repeat(25));
+    expect(result[1].content).toContain("B".repeat(25));
+    expect(result[1].content).not.toBe("");
+  });
+
+  it("returns the surplus of a small file to the files that need it", () => {
+    write("a.md", "A".repeat(10));
+    write("b.md", "B".repeat(500));
+    const result = readSwarmSnapshot({
+      swarmDir,
+      includeFiles: ["a.md", "b.md"],
+      maxBytes: 100,
+    });
+    // a.md needs only 10 of its 50-byte share; b.md gets the remaining 90.
+    expect(result[0].truncated).toBe(false);
+    expect(result[0].content).toBe("A".repeat(10));
+    expect(result[1].truncated).toBe(true);
+    expect(result[1].content).toContain("B".repeat(90));
+  });
+
+  it("reports the TRUE on-disk size of a truncated file, not the shown size", () => {
+    write("state.md", "S".repeat(5000));
+    const [snap] = readSwarmSnapshot({
+      swarmDir,
+      includeFiles: ["state.md"],
+      maxBytes: 100,
+    });
+    expect(snap.truncated).toBe(true);
+    expect(snap.bytes).toBe(5000);
   });
 
   it("budget of 0 marks all existing files as truncated", () => {
@@ -229,6 +246,27 @@ describe("renderSnapshotAsPromptLines", () => {
     ];
     const lines = renderSnapshotAsPromptLines(swarmDir, snap);
     expect(lines.join("\n")).toContain("queue.md (truncated)");
+  });
+
+  // CLAW-082: a heading with nothing under it reads as "this file is empty".
+  it("never renders a truncated file as a bare heading with no body", () => {
+    const snap = [
+      { filename: "queue.md", exists: true, bytes: 195_069, truncated: true, content: "" },
+    ];
+    const joined = renderSnapshotAsPromptLines(swarmDir, snap).join("\n");
+    expect(joined).toContain("195069 bytes on disk");
+    expect(joined).toContain("did not fit the prompt budget");
+    expect(joined).toContain('swarm_read with filename="queue.md"');
+  });
+
+  it("points a partially-shown file at swarm_read for the rest", () => {
+    const snap = [
+      { filename: "state.md", exists: true, bytes: 57_111, truncated: true, content: "head..." },
+    ];
+    const joined = renderSnapshotAsPromptLines(swarmDir, snap).join("\n");
+    expect(joined).toContain("head...");
+    expect(joined).toContain("57111 bytes on disk");
+    expect(joined).toContain("only the head is shown");
   });
 
   it("skips missing files (does not add heading for them)", () => {

@@ -39,23 +39,14 @@ if [[ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
   export OPENCLAW_GATEWAY_TOKEN
 fi
 
-# ---- seed .swarm/ for dot-swarm first-boot -----------------------------
-if [[ ! -f "${CONFIG_DIR}/.swarm/state.md" ]]; then
-  cat > "${CONFIG_DIR}/.swarm/state.md" <<'MD'
-# oasis-claw swarm state
-
-First-boot placeholder. Replace with current handoff state, or let
-dot-swarm's `compact` tool append a handoff section on its next run.
-MD
-fi
-if [[ ! -f "${CONFIG_DIR}/.swarm/queue.md" ]]; then
-  cat > "${CONFIG_DIR}/.swarm/queue.md" <<'MD'
-# oasis-claw swarm queue
-
-- [ ] verify all 6 plugins loaded (`openclaw plugins list`)
-- [ ] add Anthropic credentials to start an LLM turn
-MD
-fi
+# ---- .swarm/ first-boot seed: REMOVED 2026-08-10 (CLAW-082) -------------
+# This block used to write a "First-boot placeholder" state.md + queue.md into
+# ${CONFIG_DIR}/.swarm, which was also dot-swarm's swarmDir. Nothing ever
+# replaced them, so six of seven bots injected that placeholder into the memory
+# prompt of every session from 2026-07-08 to 2026-08-10. dot-swarm now points at
+# the bot's REAL project board (OASIS_SWARM_DIR, set per bot in its compose
+# overlay) and is DISABLED when a bot has no board. A private placeholder board
+# has no remaining reader, so seeding one is dead work.
 
 # ---- pre-install: scrub known-bad keys from the persisted config -----
 # Each `openclaw plugins install --link` below validates the existing
@@ -369,7 +360,7 @@ TELEGRAM_KEYS = {"telegramBotToken", "telegramChatId", "telegramAlertChatId"}
 # 127.0.0.1:8731 stuck after we changed the default to
 # http://oasis-voice:8731 (sibling container), and the plugin kept
 # resolving to the openclaw container's own loopback (no listener).
-TOPOLOGY_KEYS = {"endpoint", "tts_voice", "reachRoots", "enforce"}
+TOPOLOGY_KEYS = {"endpoint", "tts_voice", "reachRoots", "enforce", "swarmDir", "maxBytes"}
 
 def merge_config(plugin_id, defaults, hooks=None):
     entry = entries.setdefault(plugin_id, {})
@@ -449,10 +440,42 @@ merge_config("oasis-reach", {
 })
 entries["oasis-reach"]["config"]["enabled"] = os.environ.get("OASIS_REACH_ENABLE", "") == "1"
 entries["oasis-reach"]["config"]["knownPeers"] = [p for p in os.environ.get("OASIS_REACH_PEERS", "").split(",") if p]
+# dot-swarm (CLAW-082, 2026-08-10): point swarmDir at the bot's REAL project
+# board instead of its private container home.
+#
+# WHY this changed. Until now every bot ran swarmDir=~/.openclaw/.swarm — a path
+# nothing else can see. Six of seven held ONLY the 2026-07-08 first-boot
+# placeholder above, and dot-swarm injected that placeholder into the memory
+# prompt of every session for a month. House mounted the real boards at
+# /reach/oasis-swarm and /reach/claw-swarm and was still pointed at the
+# placeholder. `.swarm` is a git-tracked, per-project planning artifact, so the
+# right value is always a path inside the bot's own reach mounts.
+#
+# OASIS_SWARM_DIR is a TOPOLOGY key: force-set every boot, so re-pointing a bot
+# in its compose overlay propagates on the next recreate. Empty => the bot has no
+# board (hello-world has no reach mount at all) and dot-swarm is DISABLED rather
+# than left injecting a placeholder.
+#
+# maxBytes is the shared prompt budget across state.md + queue.md. 24576 (~6K
+# tokens, once per session) is chosen so every SMALL board renders in full
+# (alignment_research 17,285 B, bounty-hunter 15,998 B, oasis-firmware 20,536 B)
+# while the two large boards truncate with an explicit pointer. As of CLAW-082
+# the reader splits that budget FAIRLY instead of consuming it in file order —
+# the old behavior starved queue.md to empty on oasis-x/.swarm (state.md 57 KB,
+# queue.md 195 KB) and rendered it as a heading with nothing under it, which
+# reads as "the queue is empty". Detail beyond the budget is PULLED with
+# swarm_read, the same pull-not-push rule CLAW-076 uses for mail.
+swarm_dir = os.environ.get("OASIS_SWARM_DIR", "").strip()
+try:
+    swarm_max_bytes = int(os.environ.get("OASIS_SWARM_MAX_BYTES", "").strip() or "24576")
+except ValueError:
+    swarm_max_bytes = 24576
 merge_config("dot-swarm", {
-    "swarmDir": str(home / ".openclaw/.swarm"),
+    "swarmDir": swarm_dir or str(home / ".openclaw/.swarm"),
     "registerSwarmReadTool": True,
+    "maxBytes": swarm_max_bytes,
 })
+entries["dot-swarm"]["enabled"] = bool(swarm_dir)
 # operating-system-sandbox (CLAW-043 gitignore read-shroud). BUNDLED into
 # openclaw/dist/extensions at image build (NOT in the --link loop) so its
 # tool-result middleware seam is honored — openclaw gates that seam to
@@ -480,7 +503,13 @@ merge_config("operating-system-sandbox", {
 config.setdefault("agents", {})
 config["agents"].setdefault("defaults", {})
 config["agents"]["defaults"].setdefault("compaction", {})
-config["agents"]["defaults"]["compaction"]["provider"] = "swarm-compact"
+# Only pin the provider when dot-swarm is actually enabled. A bot with no board
+# (OASIS_SWARM_DIR empty) has dot-swarm disabled, and naming an unregistered
+# provider makes the safeguard hook log "configured but not registered" forever.
+if entries["dot-swarm"]["enabled"]:
+    config["agents"]["defaults"]["compaction"]["provider"] = "swarm-compact"
+elif config["agents"]["defaults"]["compaction"].get("provider") == "swarm-compact":
+    del config["agents"]["defaults"]["compaction"]["provider"]
 
 # compaction reserve — the headroom kept below the model window. The runtime's
 # auto-compaction threshold is `contextWindow - reserveTokensFloor - softThreshold`
@@ -709,6 +738,35 @@ if os.environ.get("OASIS_REACH_ENABLE", "") == "1":
             also.append(t)
 else:
     also = [x for x in also if x not in REACH_TOOLS]
+
+# ---- CLAW-082: the OTHER half of the CLAW-076 plugin-tool gotcha -----------
+# contracts.tools in the manifest makes a registerTool'd tool MATERIALIZE.
+# tools.profile="coding" then FILTERS it out again unless alsoAllow re-admits it.
+# Both gates must pass. Verified live 2026-08-10: Kolmogorov's tool list held 33
+# tools and none of swarm_read / compact / report_injection / forward_captcha /
+# deposit_secret, although every one of them had shipped its manifest fix.
+#
+# swarm_read is read-only over the bot's own board — safe wherever a board exists.
+SWARM_TOOLS = ("swarm_read",)
+if swarm_dir:
+    for t in SWARM_TOOLS:
+        if t not in also:
+            also.append(t)
+else:
+    also = [x for x in also if x not in SWARM_TOOLS]
+#
+# `compact` is DELIBERATELY NOT admitted here. It fs.appendFileSync's straight
+# into <swarmDir>/state.md from inside the plugin, so it carries no derivedPaths
+# and the oasis-reviewer's allowWriteRoots governance never sees it — the same
+# blind spot oasis-reach has, but now aimed at a git-tracked board that several
+# bots share. It would also grow the very state.md files whose size caused the
+# starvation bug this ticket fixes. Governance decision first, then admit it.
+#
+# The three security tools Mike approved (2026-08-10). None was ever callable.
+SECURITY_TOOLS = ("report_injection", "forward_captcha", "deposit_secret")
+for t in SECURITY_TOOLS:
+    if t not in also:
+        also.append(t)
 if also:
     tools_cfg["alsoAllow"] = also
 elif "alsoAllow" in tools_cfg:
