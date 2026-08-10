@@ -2,6 +2,67 @@
 
 Vanilla [openclaw](https://github.com/openclaw/openclaw) is a capable AI gateway, but it ships without answers to four production concerns: **what happens when the model is manipulated**, **where credentials go when the user pastes them**, **how you audit what the agent actually did**, and **what stops a malicious skill from the registry running before you ever look at it**. oasis-claw is a thin plugin layer that fills exactly those gaps — no fork, no divergence from upstream, eleven focused extensions on top of the standard plugin SDK. Six are the security/observability surface; five ship capability: voice (`oasis-voice`), LLM routing (`model-switcher`), headless browser (`browser`), local embeddings (`oasis-semantics`), and the biomimetic sleep/wake lifecycle (`sleep-cycle` — doze mutex, nightly session compact+reset, waking summary). Private long-term memory is the bundled upstream `memory-core` plugin, enabled and configured (not forked) with nightly dreaming consolidation on by default. Anything we vendor in from upstream (currently just `browser`) is pinned, audited, and refresh-gated — see [AUDIT_LOG.md](./AUDIT_LOG.md).
 
+## Concepts — the mental model
+
+New to this repo? Read this section first. Everything below assumes it.
+
+**Gateway.** One long-running process per bot. It owns the model connection, the
+channels, the plugins, and the session state. Nothing talks to the model
+directly — everything goes through the gateway. When a bot "is down", this is
+what is down.
+
+**Bot (agent).** An identity: a name, a workspace, a model, a set of channels,
+and a policy. Each bot in this fleet is one container running its own gateway.
+Bots share the runtime *image* but never share state.
+
+**Channel.** How a human reaches a bot — Telegram, Microsoft Teams, a terminal,
+the browser Control UI. A bot can have several at once. Channels are pluggable;
+`openclaw channels list --all` shows what is installable.
+
+**Session.** One conversation thread, keyed by name (`main` by default). Sessions
+carry history and compact themselves when they approach the context ceiling.
+
+**Workspace.** The bot's own files at `~/.openclaw/workspace` inside its
+container. `IDENTITY.md` and `SOUL.md` define who it is; `.swarm/` holds
+coordination state it manages itself.
+
+**Plugin (extension).** A capability, loaded at boot. The eleven in this repo are
+listed in the table below. A plugin's agent tools are silently uncallable unless
+they are also declared in the manifest's `contracts.tools` — a real and
+easy-to-miss trap.
+
+**Sidecar.** A separate container the bot depends on: `oasis-voice` (speech),
+`oasis-semantics` (embeddings), `oasis-egress-proxy` (the only way out to the
+internet). Sidecars are reached by container name over a private network.
+
+**Reviewer.** The gate between the agent deciding to run something and it
+actually running. Layer 1 is deterministic regex; Layer 2 is a model judging the
+call against a written constitution. Verdicts are allow, deny, or escalate —
+where escalate means a human is asked and a timeout means no.
+
+**Role file.** `role.yaml`, the declarative per-bot policy: which commands are
+allowed, which hosts are reachable, which directories are mounted.
+
+### How one message flows
+
+```
+  you ──▶ channel ──▶ gateway ──▶ agent turn ──▶ model (via provider)
+                          │                          │
+                          │                          ▼
+                          │                    wants a tool
+                          │                          │
+                          │                          ▼
+                          │                     REVIEWER ──▶ deny
+                          │                          │        escalate ──▶ you approve
+                          │                          ▼ allow
+                          │                     tool runs
+                          ▼                          │
+  you ◀── reply ◀─────────┴──────────────────────────┘
+```
+
+Every step above is logged. That is the point of the security layer: the
+transcript exists whatever the model claims it did.
+
 ## What this adds over vanilla openclaw
 
 | Gap in vanilla openclaw | oasis-claw plugin | What it does |
@@ -90,6 +151,106 @@ current pin exposes no UI theming — personality lives in the avatar plus
 `IDENTITY.md`/`SOUL.md`).
 
 ---
+
+## Talking to your bots: terminal and browser
+
+Two interfaces ship with the runtime. Neither needs a messaging account, so both
+work when a chat channel is unavailable — on a locked-down corporate host, for
+example.
+
+### The terminal interface (TUI)
+
+`openclaw chat` opens a terminal UI against the gateway. It is a full two-way
+conversation: the same agent, sessions, tools, and reviewer prompts you get from
+a chat channel.
+
+Most bots in this fleet publish **no host port** — they sit on an internal
+network with the egress proxy as their only exit. So run the TUI *inside* the
+container:
+
+```bash
+docker exec -it oasis-claw-kolmogorov openclaw chat
+```
+
+Podman is identical — swap the command:
+
+```bash
+podman exec -it oasis-claw-kolmogorov openclaw chat
+```
+
+Useful flags (`openclaw tui --help` for the rest):
+
+| Flag | Use |
+|---|---|
+| `--session <key>` | Pick a conversation thread. Defaults to `main`. |
+| `--message "<text>"` | Send one message on connect — good for scripting. |
+| `--history-limit <n>` | How much backlog to load. Defaults to 200. |
+| `--thinking <level>` | Override the reasoning effort for this session. |
+| `--url` / `--token` | Attach to a *remote* gateway rather than the local one. |
+| `--local` | Bypass the gateway and run an embedded agent. Rarely what you want. |
+
+Leave with `Ctrl-C`. The session persists — reconnecting resumes it.
+
+### The browser Control UI
+
+`openclaw dashboard` prints the Control UI URL and opens a browser:
+
+```bash
+docker exec oasis-claw-runtime openclaw dashboard --no-open
+```
+
+The gateway serves it at `http://127.0.0.1:<published-port>/`, and it is
+**token-authenticated**. Inside a container there is no browser to hand the token
+to, so append it yourself as a URL fragment:
+
+```
+http://127.0.0.1:18789/#token=<gateway-token>
+```
+
+Get the token with `make BOT=<name> token`, or read
+`/home/node/.openclaw/.gateway-token` in the container.
+
+The Control UI gives you chat, session history, channel status, model and plugin
+configuration, and the approval queue — approving a reviewer escalation here is
+usually easier than over a chat channel.
+
+**Only bots with a published port are reachable this way.** In this fleet that
+is deliberate: sandboxed bots publish nothing, so their Control UI is
+unreachable from the host by design. Use the TUI for those, or publish a
+loopback port for that bot if you want the browser.
+
+## Everyday operations
+
+A cookbook for the tasks that come up most. `BOT=<name>` selects the bot;
+`make list` shows the names.
+
+| Task | Command |
+|---|---|
+| Start everything | `make up-all` |
+| Start or restart one bot | `make BOT=house up` / `make BOT=house restart` |
+| Pick up an `.env` or `role.yaml` change | `make BOT=house recreate` |
+| Pick up a Dockerfile or extension change | `make BOT=house rebuild` |
+| Watch what a bot is doing | `make BOT=house logs` |
+| Health and plugin count | `make BOT=house status` |
+| Shell inside a bot | `make BOT=house shell` |
+| Talk to a bot | `docker exec -it oasis-claw-house openclaw chat` |
+| Stop everything, keep data | `make down` |
+| Which engine am I on? | `make engine` |
+
+Reading further:
+
+- **Model not answering?** `make BOT=<name> logs` first. A provider error, an
+  expired key, and a reviewer denial look nothing alike in the log.
+- **Tool calls all failing?** Check the reviewer. `OASIS_REVIEWER_L2=enforce`
+  with an unreachable judge model fails *closed* — every call is denied. This
+  has bitten this fleet before.
+- **Bot can't reach a host?** It is the egress proxy allowlist, not DNS. Each
+  sandboxed bot exits through one proxy with an explicit host list.
+- **Changed a plugin?** `rebuild`, not `recreate`. Extensions are baked into the
+  image at build time.
+- **Changed the reviewer policy?** It is baked in too. If you iterate on it
+  often, bind-mount the host copy read-only over the baked path instead — same
+  file, no image rebuild, and the agent gains no extra reach.
 
 ## Language cortex hot-swapping
 

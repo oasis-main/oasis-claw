@@ -1,11 +1,22 @@
 # oasis-claw runtime shortcuts
 #
-# All targets are thin wrappers around `docker compose -f docker-compose.runtime.yml`.
+# All targets are thin wrappers around `<compose> -f docker-compose.runtime.yml`.
 # See .swarm/security-notes.md for when to use each.
+#
+# The container engine is Docker or Podman, resolved by the include below.
+# `make engine` prints which one this host uses. Override with ENGINE=podman.
 
-COMPOSE := docker compose -f docker-compose.runtime.yml
+.DEFAULT_GOAL := help
+include scripts/container-engine.mk
+
+COMPOSE := $(COMPOSE_CMD) -f docker-compose.runtime.yml
 
 .PHONY: help up restart recreate rebuild down logs status token healthz shell smoke creds-list creds-refresh assets-list assets-set assets-show
+
+# Every target that starts a container first checks that an engine exists. A
+# rule with prerequisites and no recipe only ADDS prerequisites, so each target
+# keeps the recipe it declares below.
+up restart recreate rebuild down logs status token healthz shell smoke: _require-engine
 
 help:
 	@awk 'BEGIN{FS=":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -46,7 +57,7 @@ shell: ## interactive shell inside the runtime container
 	$(COMPOSE) exec openclaw bash
 
 smoke: ## run plugin-registration smoke test (mock API, no live LLM)
-	docker compose -f docker-compose.smoke.yml up --build --abort-on-container-exit
+	$(COMPOSE_CMD) -f docker-compose.smoke.yml up --build --abort-on-container-exit
 
 creds-list: ## list gog OAuth accounts across every bot (PROBE=1 for live probe)
 	@./scripts/claw-creds list $(if $(PROBE),--probe,)
