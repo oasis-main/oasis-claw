@@ -196,6 +196,12 @@ declare -A PLUGINS=(
   # memory supplement; the host relay (claw-mail-relay) owns all comms policy.
   [oasis-reach]=""
   [dot-swarm]=""
+  # oasis-find: root-confined filesystem search (CLAW-082 phase 3). Gives the
+  # agent fs_glob / fs_grep / fs_help — the cheap exact-search primitives
+  # Claude Code has and openclaw does not. Installs fleet-wide but DISABLES
+  # ITSELF when OASIS_FIND_ROOTS names no readable directory (hello-world has
+  # no reach mounts at all).
+  [oasis-find]=""
   # clawhub-skill-audit's audit-prompt.ts intentionally contains the
   # exact "dynamic code execution" string patterns the auditor looks
   # FOR in third-party skills. openclaw's install-time scanner reads
@@ -493,6 +499,22 @@ merge_config("dot-swarm", {
     "maxBytes": swarm_max_bytes,
 })
 entries["dot-swarm"]["enabled"] = bool(swarm_dir)
+
+# oasis-find (CLAW-082 phase 3): the search roots. Set EXPLICITLY per bot rather
+# than defaulting to /reach, because /reach also contains /reach/mail — and
+# grepping mail directly would return peer message text WITHOUT the
+# nonce-delimited UNTRUSTED framing that reach_read applies. Peer text is a
+# prompt-injection channel inside the trust boundary; it must arrive through the
+# tool that labels it. Naming the work trees explicitly keeps mail out by
+# construction instead of by a deny rule someone can weaken later.
+#
+# The plugin re-reads OASIS_FIND_ROOTS from process.env at register() and drops
+# any path that is not a readable directory in THIS container, so a stale entry
+# degrades to "not searched" rather than to a silent empty result set.
+find_roots = [p.strip() for p in os.environ.get("OASIS_FIND_ROOTS", "").split(",") if p.strip()]
+merge_config("oasis-find", {"roots": find_roots})
+entries["oasis-find"]["config"]["roots"] = find_roots
+entries["oasis-find"]["enabled"] = bool(find_roots)
 # operating-system-sandbox (CLAW-043 gitignore read-shroud). BUNDLED into
 # openclaw/dist/extensions at image build (NOT in the --link loop) so its
 # tool-result middleware seam is honored — openclaw gates that seam to
@@ -784,6 +806,16 @@ SECURITY_TOOLS = ("report_injection", "forward_captcha", "deposit_secret")
 for t in SECURITY_TOOLS:
     if t not in also:
         also.append(t)
+
+# oasis-find (CLAW-082 phase 3). Read-only, root-confined, refuses secret-shaped
+# files, and never sees /reach/mail. Gated on the same roots the plugin needs.
+FIND_TOOLS = ("fs_glob", "fs_grep", "fs_help")
+if find_roots:
+    for t in FIND_TOOLS:
+        if t not in also:
+            also.append(t)
+else:
+    also = [x for x in also if x not in FIND_TOOLS]
 if also:
     tools_cfg["alsoAllow"] = also
 elif "alsoAllow" in tools_cfg:

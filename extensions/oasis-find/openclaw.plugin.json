@@ -1,0 +1,35 @@
+{
+  "id": "oasis-find",
+  "name": "Oasis Find",
+  "description": "Root-confined filesystem search for agents: fs_glob (find files by name), fs_grep (find files by content), fs_help (which search tool to use when). Read-only, refuses secret-shaped files, and cannot escape the bot's configured roots.",
+  "contracts": {
+    "_doc": "REQUIRED for agent-tool exposure (openclaw 2026.7.1 plugins/tools.ts:566-634): registerTool'd tools materialize ONLY if declared here. This is HALF the gate — tools.alsoAllow must ALSO re-admit them past tools.profile='coding' (CLAW-082). Keep in sync with the api.registerTool names in index.ts.",
+    "tools": ["fs_glob", "fs_grep", "fs_help"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": { "type": "boolean" },
+      "roots": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Absolute directories the bot may search. Overridden by OASIS_FIND_ROOTS."
+      },
+      "denyGlobs": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Basename globs never listed or read. Defaults mirror reviewer-policy.json hard.fleet.denyReadGlobs."
+      },
+      "denyDirs": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Directory names skipped during the walk (includes pliny and noise trees)."
+      },
+      "maxResults": { "type": "number" },
+      "maxFileBytes": { "type": "number" },
+      "maxMatchesPerFile": { "type": "number" },
+      "maxScannedFiles": { "type": "number" }
+    }
+  }
+}

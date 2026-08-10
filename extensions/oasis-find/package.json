@@ -1,0 +1,20 @@
+{
+  "name": "@oasis-claw/oasis-find",
+  "version": "0.1.0",
+  "description": "openclaw plugin: root-confined filesystem search (fs_glob / fs_grep / fs_help) — CLAW-082 phase 3",
+  "type": "module",
+  "devDependencies": {
+    "openclaw": "workspace:*",
+    "vitest": "^3.0.0"
+  },
+  "scripts": {
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest --passWithNoTests"
+  },
+  "dependencies": {
+    "zod": "^4.4.1"
+  },
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  }
+}
