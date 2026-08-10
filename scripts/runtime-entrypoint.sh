@@ -22,9 +22,26 @@ CONFIG_FILE="${CONFIG_DIR}/openclaw.json"
 PORT="${OPENCLAW_GATEWAY_PORT:-18789}"
 BIND="${OPENCLAW_GATEWAY_BIND:-lan}"
 
+# ---- SQLITE_TMPDIR — the memory index silently stops without it ---------
+# /tmp in these containers is a 64 MB tmpfs. SQLite spills large transactions
+# to temp files under SQLITE_TMPDIR (falling back to /tmp), so a big memory
+# reindex exhausts it and the CLI reports "Memory index failed: database or
+# disk is full" while /home/node/.openclaw still has ~69 GB free.
+#
+# Found live on Nimbus 2026-08-10 (CLAW-082 phase 2): the index sat at
+# 561/568 files across three consecutive passes, and the 5 new .swarm corpus
+# files never landed. Re-running the SAME command with SQLITE_TMPDIR pointed
+# at the volume completed it immediately — 568/568 files, 2,518 chunks.
+#
+# Exported here so BOTH the gateway (which syncs on session start and on
+# search) and any `docker exec openclaw memory index` inherit it. TMPDIR is
+# deliberately left alone: redirecting all temp writes into the persisted
+# volume would accumulate there instead of being cleared with the tmpfs.
+export SQLITE_TMPDIR="${CONFIG_DIR}/tmp"
+
 mkdir -p "${CONFIG_DIR}" "${CONFIG_DIR}/workspace" "${CONFIG_DIR}/logs/attacks" \
          "${CONFIG_DIR}/logs/history" "${CONFIG_DIR}/state/secrets" \
-         "${CONFIG_DIR}/.swarm"
+         "${CONFIG_DIR}/.swarm" "${SQLITE_TMPDIR}"
 
 # ---- gateway auth token (mint + persist on first boot) -----------------
 if [[ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
@@ -896,6 +913,108 @@ if (os.environ.get("OASIS_SESSION_MEMORY", "").strip() or "1") == "1":
     _ms.setdefault("experimental", {})["sessionMemory"] = True
     tools_cfg.setdefault("sessions", {})["visibility"] = "agent"
     config["agents"]["defaults"].setdefault("sandbox", {})["sessionToolsVisibility"] = "all"
+
+# ── CLAW-082 phase 2: .swarm project boards as a memory-search corpus ──────
+#
+# memorySearch.extraPaths adds directories to the index. It is CONFIG ONLY — no
+# upstream change, no plugin. But it is blunt, and the bluntness decides the
+# whole design (host/internal.ts:92-215):
+#   * a directory is walked RECURSIVELY and every .md under it is taken;
+#   * there is NO exclude, NO ignore list, NO glob;
+#   * SYMLINKS ARE SKIPPED, so a curated symlink farm indexes nothing.
+# So the path list has to be exact. Pointing at a repo root is a trap: the
+# oasis-x tree holds 35,373 .md files / 167 MB (21,836 of them under
+# oasis-hardware/"External Reference Repos", 1,979 under oasis-claw/vendor),
+# which is ~105,000 chunks plus a 35,000-entry chokidar watcher. Upstream warns
+# above 2,000 watched entries (watch-pressure.ts:4).
+#
+# Rather than hand-maintain a per-bot path list that silently rots when a new
+# project gets a board, we DERIVE it: scan the roots the bot actually mounts and
+# take the directories literally named `.swarm`. A new project board joins the
+# corpus on the next recreate; a deleted one drops out. Same derive-don't-repeat
+# rule as the reach volumes.
+#
+# EXCLUDES are load-bearing, not hygiene. `.claude/worktrees` in particular
+# holds two 69-file NEAR-COPIES of oasis-x/.swarm — indexing them puts three
+# slightly different versions of the same brief in the index, which is the
+# stale-brief failure at scale.
+SWARM_CORPUS_EXCLUDE = (
+    "node_modules", ".git", ".venv", "venv", "vendor", "forks", "worktrees",
+    ".claude", "External Reference Repos", "dist", "build", ".next", "__pycache__",
+)
+SWARM_CORPUS_MAX_DIRS = 200
+SWARM_CORPUS_MAX_DEPTH = 6
+
+
+def _discover_swarm_dirs(roots):
+    found = []
+    for root in roots:
+        root = root.strip()
+        if not root or not os.path.isdir(root):
+            continue
+        # A root may itself BE the board (House mounts oasis-x/.swarm directly
+        # at /reach/oasis-swarm, so the directory is not named `.swarm`).
+        if os.path.isdir(root) and (
+            os.path.basename(root) == ".swarm"
+            or os.path.isfile(os.path.join(root, "queue.md"))
+            or os.path.isfile(os.path.join(root, "state.md"))
+        ):
+            found.append(os.path.realpath(root))
+            continue
+        base_depth = root.rstrip("/").count("/")
+        for dirpath, dirnames, _files in os.walk(root, followlinks=False):
+            if dirpath.rstrip("/").count("/") - base_depth >= SWARM_CORPUS_MAX_DEPTH:
+                dirnames[:] = []
+                continue
+            dirnames[:] = [d for d in dirnames if d not in SWARM_CORPUS_EXCLUDE]
+            if ".swarm" in dirnames:
+                found.append(os.path.realpath(os.path.join(dirpath, ".swarm")))
+                # Do NOT descend into it; it has no nested boards.
+                dirnames.remove(".swarm")
+    return found
+
+
+_corpus_roots = [p for p in os.environ.get("OASIS_MEMORY_SWARM_ROOTS", "").split(",") if p.strip()]
+_literal_paths = [p.strip() for p in os.environ.get("OASIS_MEMORY_EXTRA_PATHS", "").split(",") if p.strip()]
+if _corpus_roots or _literal_paths:
+    _paths = _discover_swarm_dirs(_corpus_roots) + [
+        os.path.realpath(p) for p in _literal_paths if os.path.isdir(p) or os.path.isfile(p)
+    ]
+    # Deterministic order: the prompt cache keys off the config bytes.
+    _paths = sorted(dict.fromkeys(_paths))
+    if len(_paths) > SWARM_CORPUS_MAX_DIRS:
+        print(
+            f"[entrypoint] WARN: .swarm corpus found {len(_paths)} dirs, capping at "
+            f"{SWARM_CORPUS_MAX_DIRS} — DROPPED: {_paths[SWARM_CORPUS_MAX_DIRS:]}",
+            file=sys.stderr,
+        )
+        _paths = _paths[:SWARM_CORPUS_MAX_DIRS]
+    _md = 0
+    for _p in _paths:
+        for _dp, _dn, _fn in os.walk(_p, followlinks=False):
+            _md += sum(1 for f in _fn if f.endswith(".md"))
+    print(f"[entrypoint] memory corpus: {len(_paths)} paths, {_md} markdown files")
+    config["agents"]["defaults"]["memorySearch"]["extraPaths"] = _paths
+elif "extraPaths" in config["agents"]["defaults"]["memorySearch"]:
+    del config["agents"]["defaults"]["memorySearch"]["extraPaths"]
+
+# MMR (maximal marginal relevance) — DEFAULT IS OFF (memory-search.ts:127).
+# Turn it on. Without it a query returns near-duplicate chunks from one cluster:
+# the query that opened CLAW-082 returned five hits at 0.609 that were all the
+# same dream-diary material, and a Nimbus query returned three of four hits from
+# a SINGLE session file. Six results from six places is worth more than six
+# views of one place, which is the whole point of a cross-project corpus.
+# lambda 0.7 keeps relevance dominant over diversity.
+#
+# NOT enabled: query.hybrid.temporalDecay. It also defaults off, and it is the
+# wrong tool here — it multiplies the score by exp(-ln2/halfLife * ageDays)
+# (temporal-decay.ts:36-42), so with the default 30-day half life and
+# minScore 0.35 a 90-day-old brief scores 0.75 -> 0.09 and disappears. Mike
+# asked for the .swarm archive to stay reachable (2026-08-10); decay would bury
+# it. Left off deliberately.
+_hyb = config["agents"]["defaults"]["memorySearch"].setdefault("query", {}).setdefault("hybrid", {})
+_hyb.setdefault("mmr", {})["enabled"] = True
+_hyb["mmr"].setdefault("lambda", 0.7)
 
 # oasis-voice: speech (TTS) + media-understanding audio (inbound voice
 # messages from Telegram / iMessage) + realtime streaming STT (for future

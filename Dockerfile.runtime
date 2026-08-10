@@ -219,7 +219,15 @@ ENV HOME=/home/node \
     OPENCLAW_GATEWAY_BIND=lan \
     OPENCLAW_GATEWAY_PORT=18789 \
     OPENCLAW_DISABLE_BONJOUR=1 \
-    OPENCLAW_TZ=UTC
+    OPENCLAW_TZ=UTC \
+    # CLAW-082: /tmp is a 64 MB tmpfs. SQLite spills large transactions there
+    # and a big memory reindex exhausts it — "Memory index failed: database or
+    # disk is full" while the volume still has ~69 GB free. Declared HERE, not
+    # only exported in the entrypoint, because `docker exec` gets the
+    # container's env and NOT the entrypoint's exports: without this line a
+    # manual `docker exec ... openclaw memory index` still hits the tmpfs.
+    # The entrypoint creates the directory.
+    SQLITE_TMPDIR=/home/node/.openclaw/tmp
 
 EXPOSE 18789
 
