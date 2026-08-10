@@ -854,6 +854,49 @@ config["agents"]["defaults"].setdefault("memorySearch", {})
 config["agents"]["defaults"]["memorySearch"]["provider"] = "oasis-semantics"
 config["agents"]["defaults"]["memorySearch"]["model"] = oasis_semantics_text_model
 
+# ── CLAW-082 phase 1: index session transcripts, and let a bot SEE its own ──
+#
+# Two separate switches are needed. Setting only the first indexes transcripts
+# that the agent then cannot retrieve, which is what we measured on Nimbus.
+#
+# 1. memorySearch.sources + experimental.sessionMemory. DEFAULT_SOURCES is
+#    ["memory"] and experimental.sessionMemory defaults FALSE
+#    (memory-search.ts:132, :174, :221), and "sessions" is DROPPED from sources
+#    unless that flag is true. Before this, every bot reported `Sources: memory`
+#    and its whole semantic index was MEMORY.md plus dream prose — 669 dream
+#    artifacts against 18 real memory notes fleet-wide.
+#
+# 2. tools.sessions.visibility. resolveSessionToolsVisibility defaults to "tree"
+#    (session-visibility.ts:77-85), so memory_search hits from any session
+#    outside the requester's own tree are filtered out before the agent sees
+#    them. Measured on Nimbus: the CLI found the Roxborough seller-credit
+#    discrepancy at score 0.790 while the AGENT answered "no genuine memory of
+#    this exists". "agent" scopes recall to the bot's OWN sessions; it does NOT
+#    cross the agent boundary the way "all" would, so the nimbus/helloworld
+#    partition is unaffected.
+#
+# SANDBOX CLAMP: resolveEffectiveSessionToolsVisibility forces "tree" back on a
+# sandboxed agent unless agents.defaults.sandbox.sessionToolsVisibility is "all"
+# (session-visibility.ts:88-101). We set that too, so the setting means the same
+# thing on every bot instead of silently degrading on some.
+#
+# KNOWN WIDENING, accepted deliberately: a transcript that captured a secret
+# becomes searchable through memory_search. The reviewer's denyReadGlobs stops
+# secret FILE reads, not recall of a conversation the bot already had — and
+# sessions_history already exposed the same bytes. Set OASIS_SESSION_MEMORY=0
+# per bot to opt out.
+#
+# COST measured on Nimbus, the largest corpus in the fleet: 293 session files /
+# 24.5 MB indexed in ~10 min on the CPU sidecar, 1,258 -> 2,485 chunks. The
+# 271 MB of *.trajectory.jsonl is NOT indexed — the corpus enumerator walks
+# <sessionId>.jsonl only (session-transcript-corpus.ts:281).
+if (os.environ.get("OASIS_SESSION_MEMORY", "").strip() or "1") == "1":
+    _ms = config["agents"]["defaults"]["memorySearch"]
+    _ms["sources"] = ["memory", "sessions"]
+    _ms.setdefault("experimental", {})["sessionMemory"] = True
+    tools_cfg.setdefault("sessions", {})["visibility"] = "agent"
+    config["agents"]["defaults"].setdefault("sandbox", {})["sessionToolsVisibility"] = "all"
+
 # oasis-voice: speech (TTS) + media-understanding audio (inbound voice
 # messages from Telegram / iMessage) + realtime streaming STT (for future
 # telephony / WebRTC) backed by the oasis-voice sidecar.
