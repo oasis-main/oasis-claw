@@ -73,6 +73,20 @@ RUN case "${TARGETARCH:-amd64}" in \
 # apt packages needed on bookworm-slim.
 RUN npm install -g openclaw@${OPENCLAW_VERSION} tsx@4 sharp@0.34
 
+# CLAW-083 interim patch: openclaw's plugin-loader cache restore replaces
+# instead of merges memory-prompt-supplement state, so a scoped load (e.g.
+# tool-schema discovery) can silently evict dot-swarm's/oasis-reach's
+# supplement. Fixed upstream by openclaw/openclaw#117372, but only from
+# v2026.8.1-beta.1 onward — nowhere near our pinned stable line yet (checked
+# 2026-08-11: v2026.7.1-2 and main have diverged, 224 commits / 3+ weeks
+# apart; adopting the beta is its own deliberate migration, not a drop-in).
+# This patches the COMPILED global install directly (root, before USER node
+# below) and fails the build loudly if OPENCLAW_VERSION ever changes the
+# compiled shape it expects — see scripts/patch-openclaw-cache-state.mjs for
+# the full writeup and the removal plan once we adopt a release with #117372.
+COPY scripts/patch-openclaw-cache-state.mjs /tmp/patch-openclaw-cache-state.mjs
+RUN node /tmp/patch-openclaw-cache-state.mjs && rm /tmp/patch-openclaw-cache-state.mjs
+
 # Playwright + Chromium for the vendored `browser` plugin (extensions/browser/).
 # Three layered pins; bump independently per AUDIT_LOG.md and extensions/browser/UPSTREAM:
 #   PLAYWRIGHT_VERSION  — JS library
