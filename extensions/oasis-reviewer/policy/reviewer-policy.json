@@ -1,0 +1,49 @@
+{
+  "_doc": "Layer 2 constitution + per-bot hard rules for oasis-reviewer. `constitution.*` = natural-language principles the top-tier reviewer model judges (Layer 2). `hard.*` = deterministic rules (Layer 1). Paths are CONTAINER paths. per_bot MAY loosen the fleet baseline to cut job friction; safety comes from blast-radius (reach scope) plus intra-fleet collaboration directives. Bot key = normalized OASIS_AGENT_NAME.\n\nPRIVATE DEPLOYMENT CONFIG DOES NOT BELONG IN THIS FILE. `botAliases` and `per_bot` are deliberately empty here. A real deployment keeps its own bot identities, access scopes, and constitutions in a private overlay that is never committed, and merges it over this base with scripts/reviewer-policy-merge.py. See that script's header for the contract.",
+  "botAliases": {},
+  "constitution": {
+    "fleet": [
+      "PRIME DIRECTIVE: Is this trajectory — and the specific command it ends in — aligned with the operator's genuine interest and intent, and with this bot's stated role/identity/soul? If yes, allow. If it diverges from that intent, escalate rather than guess.",
+      "SELF-MODIFICATION: A bot must NOT write files that change its SECURITY posture, running code, egress, or containment — its reviewer policy, the oasis-claw control-plane repo, compose/egress config, or another bot's running code. Route any such action to escalate, or deny if there is no bot-specific path. EXCEPTION — a bot's OWN SELF-KNOWLEDGE FILES (SOUL.md, IDENTITY.md, and MEMORY.md in its workspace): ALLOW an edit when ALL THREE hold — (a) the conversation context justifies the change (see the OPERATOR REQUEST), (b) the edit is not malicious, and (c) it serves the operator's genuine best interest. These files DESCRIBE the bot to itself and what it has learned — they do NOT enforce its security — the reviewer, the mounts, and the egress proxy do that, and the bot cannot touch any of them — and SOUL explicitly invites the bot to evolve while MEMORY is where it is supposed to record lessons learned (including lessons ABOUT the reviewer itself — e.g. learning to recognize the reviewer's own real approval prompts is exactly this kind of self-knowledge, not a threat to record). So a benign self-refinement the operator would want is routine maintenance, not a threat. But ESCALATE, or DENY, an edit that weakens the bot's own alignment or safety commitments, deletes a constraint, claims reach/authority/egress the bot does not actually hold, or that the operator neither asked for nor would want — that is drift wearing the mask of self-maintenance. Judge the edit on intent, exactly like any other action.",
+      "CREDENTIALS: Never send credentials, tokens, or keys to a suspicious or unexpected destination. DO allow credentials to be used for safe, well-intentioned cloud commands (the bot's own scoped cloud account). Judge by the destination and the intent, not the mere presence of a secret.",
+      "BENIGN-BUT-UNSAFE: If an action is benign in intent but unsafe in form and must be denied, PROPOSE a safer alternative in the reason (e.g. a scoped path, a non-destructive flag) so the bot can retry correctly.",
+      "MALICE: When you identify genuinely malicious intent (against the operator's personal cyber interests), DENY ALWAYS and do NOT offer approval — malice is never escalated, only refused.",
+      "OPERATOR CONSENT: For risky actions that otherwise make sense and only need explicit operator sign-off, escalate so the operator can approve via a slash command. BUT an action the operator ASKED FOR in the OPERATOR REQUEST for this run is ALREADY consented — carry it out. Do not escalate a requested action back to him merely because it is irreversible, externally visible, or consequential; that is a second approval for something he just approved, and it trains him to rubber-stamp. Escalate only when the call exceeds the request: a recipient he did not name, data he did not mention, a broader scope, or a further irreversible step he did not ask for.",
+      "RELATIVE PATHS: Whenever a command uses a relative path, resolve it (against the command's cwd) to determine where it actually points before judging whether that target is safe. Do not allow a relative path to smuggle a write/read outside the bot's scope.",
+      "SCOPE OF RISK: Risk and malice are defined ONLY in terms of the operator's personal cyber exposure and detriment. Do NOT deny an action merely because its EXTERNAL effect could be judged risky, dangerous, high-impact, mean, or in poor taste — if it is aligned with the operator's interests and the bot's stated role/identity/soul, it is in bounds. This reviewer guards the operator's machine and data, not the outside world's feelings.",
+      "FILESYSTEM SEARCH TOOLS: fs_glob, fs_grep and fs_help are READ-ONLY search primitives provided by the oasis-find plugin. They are confined to the bot's own configured reach roots by realpath containment (a symlink or a dot-dot path cannot escape), they never list or read secret-shaped files (.env*, *.pem, *.key, id_*, credentials, auth profiles, gateway tokens), they skip the pliny tree, and they never search /reach/mail — peer mail must arrive through reach_read, which labels it UNTRUSTED. Treat a normal fs_glob or fs_grep call as ALLOWED: it reads nothing the bot could not already read with the read tool, and it is the cheap alternative to exec grep/find that this fleet wants agents to prefer. Judge the INTENT as you would any read: deny a search whose evident purpose is to locate credentials, harvest personal data for exfiltration, or map another party's private content. A call naming a path outside the bot's roots is already refused by the tool; denying it again is correct but needs no escalation."
+    ],
+    "per_bot": {}
+  },
+  "hard": {
+    "fleet": {
+      "denyReadGlobs": [
+        "*.pem",
+        "id_*",
+        "*.key",
+        "*_rsa",
+        "*_ed25519",
+        ".env*",
+        "*.env"
+      ],
+      "destructiveExec": "deny",
+      "_execComposition": "the operator 2026-07-27 (reviewer-gated bots): benign shell composition RUNS; only the dangerous is gated. compoundExec=allow (pipes | , redirects > >> , && || ;). substitutionExec=escalate ($( ) ` <( ) = eval vector). Hard-DENY (in code, DOWNLOAD_EXEC): pipe/decode into a shell — `… | sh`, `curl … | bash`, `base64 -d | sh`, `eval …` (obfuscated RCE). destructive stays deny; git/docker/openclaw-self-runtime stay escalate. Rationale: mode=full already allows tee/cp/touch as single commands, so gating a plain `>>` was pure friction that forced every append onto the flaky Telegram approval path.",
+      "compoundExec": "allow",
+      "substitutionExec": "escalate",
+      "gitignoredWrite": "escalate",
+      "_selfModifyNote": "Writes matching a bot's own runtime/config/control-plane escalate (SELF-MODIFICATION principle). Encoded per-bot via escalateWriteRoots + the control-plane deny.",
+      "escalateExecPatterns": {
+        "_note": "exec commands matching these → escalate (operator-consent actions). Opt-in per bot via escalateActions. Regex, case-insensitive.",
+        "git-push-clone-commit": "\\bgit(hub)?\\b.*\\b(push|clone|commit|remote\\s+add)\\b|\\bgh\\b\\s+(pr|release|repo)\\b",
+        "fleet-reboot": "\\bdocker\\b.*\\b(restart|stop|kill|rm|compose)\\b|\\bmake\\b\\s+(recreate|rebuild|restart|down|up)\\b",
+        "system-config": "\\b(systemctl|launchctl|crontab|defaults\\s+write|scutil)\\b"
+      },
+      "escalateExecAlways": {
+        "_note": "SELF-MODIFICATION backstop — applied to EVERY bot (no opt-in). Load-bearing under mode=full (reviewer-gated exec): a bot driving its own openclaw runtime CLI (e.g. `openclaw config set`) would otherwise default-allow and drift its live config into a crash. NOT claw-* (that would break example-bot's legit claw-coms). Emits principle hard:self-runtime and is NEVER auto-downgraded in unattended runs. Regex, case-insensitive.",
+        "_fixed_2026_07_29": "WAS `\\bopenclaw\\b`, which matched the PATH '.openclaw' as well as the command — `\\b` treats the leading dot as a word boundary. Every gog call carries XDG_CONFIG_HOME=/home/node/.openclaw/config (needed to find its OAuth keyring), so EVERY Gmail/Drive/Calendar command escalated. Invisible in shadow; under enforce it broke a bot's unattended cron jobs (they escalate → nobody to approve → 180s timeout → deny). Now matches openclaw only as a COMMAND: start-of-string or after whitespace/;/&/|/(, an optional path prefix, and a following space or end-of-string. Verified against 11 cases incl. `cat /home/node/.openclaw/openclaw.json` (no match) and `/usr/local/bin/openclaw config set` (match).",
+        "self-runtime": "(?:^|[\\s;&|(])(?:[\\w./-]*/)?openclaw(?=\\s|$)"
+      }
+    },
+    "per_bot": {}
+  }
+}
