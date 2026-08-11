@@ -258,9 +258,9 @@ interface PolicyFile {
         // bot omits it, the fleet value applies unchanged, so adding this field
         // cannot alter any existing bot's posture.
         //
-        // Added for Kaizen on the REDACTED-ORG VDI, where the fleet "deny" is wrong
+        // Added for a bot on a corporate-managed host, where the fleet "deny" is wrong
         // for two reasons. First, that host's outer boundary is set by corporate
-        // IT and by the Kubernetes pod she runs in, not by us. Second, the fleet
+        // IT and by the Kubernetes pod it runs in, not by us. Second, the fleet
         // pattern `rm\s+-[a-z]*[rf][a-z]*\s+(--no-preserve-root|\/)\b` matches
         // `/` at the START of any absolute path, so it denies an ordinary
         // `rm -rf /work/<repo>/node_modules` — routine in the JavaScript and

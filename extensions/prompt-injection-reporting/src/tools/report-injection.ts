@@ -1,5 +1,5 @@
 /**
- * report_injection agent tool — an internal service self-reporting pattern.
+ * report_injection agent tool — a self-reporting pattern for abuse detection.
  *
  * Gives the model a first-class tool to self-report when it detects it's being
  * manipulated via prompt injection or social engineering. The model is instructed

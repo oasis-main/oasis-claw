@@ -18,6 +18,9 @@ client_secret*.json
 *-client-secret.json
 service-account*.json
 
+# VDI transfer package output (multi-GB image tarballs) — never commit
+pasa-vdi-package/
+
 # Claude Code local session metadata (settings, worktree state)
 .claude/
 
@@ -31,3 +34,15 @@ vendor/openclaw-source/
 __pycache__/
 *.pyc
 .vscode/
+
+# ── Deployment-specific config — NEVER commit to a public repo ───────────────
+# The reviewer policy in extensions/ is a GENERIC base. Real bot identities,
+# access scopes, and constitutions live in a private overlay merged over it by
+# scripts/reviewer-policy-merge.py. See that script's header.
+bots/.runtime/
+# Internal fleet planning notes — describe each bot's role, access, and data.
+.swarm/
+# Fleet mail routing — names every bot and which data each one holds.
+scripts/claw-mail-routes.json
+# Deployment-specific VDI transfer tooling.
+scripts/pasa-vdi-*.sh

@@ -206,7 +206,7 @@ describe("resolveHardPolicy — regex map hygiene", () => {
         hard: {
           per_bot: {
             bot: {
-              // A prose note stored as a MEMBER (the kaizen precedent). If this
+              // A prose note stored as a MEMBER (a real precedent). If this
               // compiled, the sentence itself would become a live deny rule.
               denyExtra: { _note: "never allow a withdraw", "real-rule": "\\bwithdraw\\b" },
             },

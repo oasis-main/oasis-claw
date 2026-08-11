@@ -1,7 +1,7 @@
 /**
  * History logger — writes structured JSONL of every agent session to disk.
  *
- * Inspired by an internal service REDACTED-FN — same dual-stream approach:
+ * Uses a dual-stream approach:
  *   - ~/.openclaw/logs/history/YYYY/MM/DD/<sessionId>.jsonl  (all events)
  *
  * Each line is a JSON event. Events:

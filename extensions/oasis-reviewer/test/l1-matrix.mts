@@ -28,7 +28,25 @@ const ROOT = process.env.OASIS_REVIEWER_SRC ?? "/app/extensions/oasis-reviewer";
 
 const { evaluateHard, loadPolicyFile, resolveHardPolicy } = await import(`${ROOT}/src/policy.ts`);
 
-const POLICY = loadPolicyFile(`${ROOT}/policy/reviewer-policy.json`);
+// This matrix asserts DEPLOYMENT posture: it checks each real bot's per-bot
+// rules, which are private and therefore not in the committed policy. The
+// tracked policy ships the fleet baseline with `per_bot` empty; a deployment
+// merges its private overlay over it (scripts/reviewer-policy-merge.py) and
+// points this at the result. Without that overlay there is nothing per-bot to
+// assert, so the matrix reports why it cannot run instead of failing — a fresh
+// clone has no fleet to test.
+const POLICY_PATH = process.env.OASIS_REVIEWER_POLICY ?? `${ROOT}/policy/reviewer-policy.json`;
+const POLICY = loadPolicyFile(POLICY_PATH);
+
+if (Object.keys(POLICY?.hard?.per_bot ?? {}).length === 0) {
+  console.log(
+    `Layer-1 matrix: SKIPPED — no per-bot policy in ${POLICY_PATH}.\n` +
+      "  This test needs a merged policy that includes per-bot rules. Generate one with:\n" +
+      "    scripts/reviewer-policy-merge.py <base> <private-overlay> <out>\n" +
+      "  then re-run with OASIS_REVIEWER_POLICY=<out>.",
+  );
+  process.exit(0);
+}
 
 type Case = {
   bot: string;

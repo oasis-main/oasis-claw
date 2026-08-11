@@ -1,7 +1,7 @@
 /**
  * Attack logger — writes security incidents to a separate log stream.
  *
- * Inspired by an internal service REDACTED-FN():
+ * Follows a common incident-logging pattern:
  *   - Separate log path from normal history (easy to grep for attacks)
  *   - Immediate Telegram alert with incident details
  *   - Structured JSON for SFT training data pipeline

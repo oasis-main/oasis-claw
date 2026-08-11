@@ -11,7 +11,14 @@ include scripts/container-engine.mk
 
 COMPOSE := $(COMPOSE_CMD) -f docker-compose.runtime.yml
 
-.PHONY: help up restart recreate rebuild down logs status token healthz shell smoke creds-list creds-refresh assets-list assets-set assets-show
+.PHONY: help up restart recreate rebuild down logs status token healthz shell smoke creds-list creds-refresh assets-list assets-set assets-show reviewer-policy
+
+# Where a deployment keeps its PRIVATE reviewer overlay and the merged result.
+# Both live under a gitignored path: the committed policy is a generic baseline
+# with `per_bot` empty, and real bot identities/scopes must never be committed.
+REVIEWER_POLICY_BASE    ?= extensions/oasis-reviewer/policy/reviewer-policy.json
+REVIEWER_POLICY_OVERLAY ?= bots/reviewer-policy.local.json
+REVIEWER_POLICY_OUT     ?= bots/.runtime/reviewer-policy.json
 
 # Every target that starts a container first checks that an engine exists. A
 # rule with prerequisites and no recipe only ADDS prerequisites, so each target
@@ -20,6 +27,17 @@ up restart recreate rebuild down logs status token healthz shell smoke: _require
 
 help:
 	@awk 'BEGIN{FS=":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+
+reviewer-policy: ## merge the private reviewer overlay over the committed generic base
+	@if [ ! -f "$(REVIEWER_POLICY_OVERLAY)" ]; then \
+	  echo "No private overlay at $(REVIEWER_POLICY_OVERLAY) — nothing to merge."; \
+	  echo "The committed policy is a generic baseline with per_bot empty. A real"; \
+	  echo "deployment supplies its own overlay there; see scripts/reviewer-policy-merge.py."; \
+	  exit 0; \
+	fi
+	@mkdir -p $(dir $(REVIEWER_POLICY_OUT))
+	@python3 scripts/reviewer-policy-merge.py \
+	  "$(REVIEWER_POLICY_BASE)" "$(REVIEWER_POLICY_OVERLAY)" "$(REVIEWER_POLICY_OUT)"
 
 up: ## start runtime (build only if image missing)
 	$(COMPOSE) up -d openclaw
