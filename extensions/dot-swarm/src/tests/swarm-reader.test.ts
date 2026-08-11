@@ -2,7 +2,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { readSwarmSnapshot, renderSnapshotAsPromptLines } from "../swarm-reader.js";
+import {
+  readSwarmSnapshot,
+  renderSnapshotAsPromptLines,
+  renderStatusPromptLines,
+  statSwarmFiles,
+} from "../swarm-reader.js";
 
 let tmpDir: string;
 let swarmDir: string;
@@ -295,6 +300,100 @@ describe("renderSnapshotAsPromptLines", () => {
     const lines = renderSnapshotAsPromptLines(swarmDir, snap);
     expect(Array.isArray(lines)).toBe(true);
     expect(lines.every((l) => typeof l === "string")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// statSwarmFiles — memory-prompt supplement's stat-only path (CLAW-083)
+// ---------------------------------------------------------------------------
+
+describe("statSwarmFiles", () => {
+  it("returns exists:false for missing files without throwing", () => {
+    const result = statSwarmFiles({ swarmDir, includeFiles: ["state.md", "queue.md"] });
+    expect(result).toHaveLength(2);
+    expect(result[0]).toMatchObject({ filename: "state.md", exists: false, bytes: 0, mtimeMs: 0 });
+  });
+
+  it("reports the true on-disk size without reading content", () => {
+    write("queue.md", "Q".repeat(195_069));
+    const [stat] = statSwarmFiles({ swarmDir, includeFiles: ["queue.md"] });
+    expect(stat.exists).toBe(true);
+    expect(stat.bytes).toBe(195_069);
+  });
+
+  it("does not throw if swarmDir does not exist", () => {
+    const result = statSwarmFiles({
+      swarmDir: path.join(tmpDir, "nonexistent"),
+      includeFiles: ["state.md"],
+    });
+    expect(result[0].exists).toBe(false);
+  });
+
+  it("reports a positive mtimeMs for an existing file", () => {
+    write("state.md", "hi");
+    const [stat] = statSwarmFiles({ swarmDir, includeFiles: ["state.md"] });
+    expect(stat.mtimeMs).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// renderStatusPromptLines — the actual per-turn supplement payload (CLAW-083)
+// ---------------------------------------------------------------------------
+
+describe("renderStatusPromptLines", () => {
+  const nowMs = 1_800_000_000_000;
+
+  it("includes the swarmDir in the section header", () => {
+    const lines = renderStatusPromptLines("/my/.swarm", [{ filename: "state.md", exists: false, bytes: 0, mtimeMs: 0 }], nowMs);
+    expect(lines[0]).toContain("/my/.swarm");
+    expect(lines[0]).toContain("Stigmergic");
+  });
+
+  it("reports size and staleness per file, never the content", () => {
+    const stats = [
+      { filename: "state.md", exists: true, bytes: 57_111, mtimeMs: nowMs - 5 * 60_000 },
+      { filename: "queue.md", exists: true, bytes: 195_069, mtimeMs: nowMs - 3 * 60 * 60_000 },
+    ];
+    const joined = renderStatusPromptLines(swarmDir, stats, nowMs).join("\n");
+    expect(joined).toContain("state.md: 57,111 bytes, updated 5m ago");
+    expect(joined).toContain("queue.md: 195,069 bytes, updated 3h ago");
+    expect(joined).toContain("swarm_read");
+    expect(joined).toContain("memory_search");
+  });
+
+  it("never contains file content, only a pointer", () => {
+    const stats = [{ filename: "state.md", exists: true, bytes: 5, mtimeMs: nowMs }];
+    const joined = renderStatusPromptLines(swarmDir, stats, nowMs).join("\n");
+    expect(joined).not.toContain("SECRET_MARKER_WOULD_APPEAR_IF_CONTENT_LEAKED");
+    expect(joined).toContain("pointer, not a copy");
+  });
+
+  it("skips missing files", () => {
+    const stats = [
+      { filename: "missing.md", exists: false, bytes: 0, mtimeMs: 0 },
+      { filename: "state.md", exists: true, bytes: 5, mtimeMs: nowMs },
+    ];
+    const joined = renderStatusPromptLines(swarmDir, stats, nowMs).join("\n");
+    expect(joined).not.toContain("missing.md");
+    expect(joined).toContain("state.md");
+  });
+
+  it("shows 'no .swarm/ files present' when all files are missing", () => {
+    const stats = [{ filename: "state.md", exists: false, bytes: 0, mtimeMs: 0 }];
+    const joined = renderStatusPromptLines(swarmDir, stats, nowMs).join("\n");
+    expect(joined).toContain("no .swarm/ files present");
+  });
+
+  it("formats sub-minute staleness as 'just now'", () => {
+    const stats = [{ filename: "state.md", exists: true, bytes: 5, mtimeMs: nowMs - 10_000 }];
+    const joined = renderStatusPromptLines(swarmDir, stats, nowMs).join("\n");
+    expect(joined).toContain("just now");
+  });
+
+  it("formats multi-day staleness in days", () => {
+    const stats = [{ filename: "state.md", exists: true, bytes: 5, mtimeMs: nowMs - 3 * 24 * 60 * 60_000 }];
+    const joined = renderStatusPromptLines(swarmDir, stats, nowMs).join("\n");
+    expect(joined).toContain("3d ago");
   });
 });
 

@@ -3,7 +3,7 @@ import path from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { z } from "zod";
 import { createSwarmCompactionProvider } from "./src/compaction-provider.js";
-import { readSwarmSnapshot, renderSnapshotAsPromptLines } from "./src/swarm-reader.js";
+import { renderStatusPromptLines, statSwarmFiles } from "./src/swarm-reader.js";
 import { createCompactTool } from "./src/tools/compact.js";
 import { createSwarmReadTool } from "./src/tools/swarm-read.js";
 
@@ -34,8 +34,9 @@ const plugin = {
   id: "dot-swarm",
   name: "Dot-Swarm",
   description:
-    "Shared .swarm/ stigmergy: injects coordination state (state.md + queue.md) " +
-    "into the agent's memory prompt as a non-exclusive supplement, provides the " +
+    "Shared .swarm/ stigmergy: injects a size+staleness STATUS line for state.md + queue.md " +
+    "(not their content) into the agent's memory prompt as a non-exclusive supplement, " +
+    "pointing at swarm_read / memory_search for the real content. Also provides the " +
     "swarm_read + compact tools, and registers the swarm-compact CompactionProvider " +
     "(handoff-driven context compaction backed by .swarm/state.md).",
 
@@ -55,9 +56,17 @@ const plugin = {
     // Memory prompt supplement — non-exclusive. Coexists with memory-core /
     // memory-lancedb / memory-wiki / active-memory. Each session prepares the
     // memory section by calling all registered supplements.
+    //
+    // STATUS ONLY, not content (CLAW-083, 2026-08-10): this used to inject up
+    // to maxBytes (24,576 B ≈ 6K tokens) of raw state.md+queue.md content on
+    // EVERY turn. Those files change often across a 7-bot fleet, so that
+    // payload was neither small nor prompt-cache-stable — real, recurring
+    // cost. It reports size + staleness and points at swarm_read (full pull,
+    // still budgeted by maxBytes below) and memory_search (already indexes
+    // .swarm/ — CLAW-082 phase 2) instead of re-injecting the content itself.
     api.registerMemoryPromptSupplement(({ availableTools: _availableTools }) => {
-      const snapshot = readSwarmSnapshot({ swarmDir, includeFiles, maxBytes });
-      return renderSnapshotAsPromptLines(swarmDir, snapshot);
+      const stats = statSwarmFiles({ swarmDir, includeFiles });
+      return renderStatusPromptLines(swarmDir, stats, Date.now());
     });
 
     if (wantsSwarmReadTool) {

@@ -110,9 +110,100 @@ export function readSwarmSnapshot(config: SwarmReaderConfig): SwarmFileSnapshot[
   });
 }
 
+export type SwarmFileStat = {
+  filename: string;
+  exists: boolean;
+  bytes: number;
+  mtimeMs: number;
+};
+
 /**
- * Render a snapshot as the array of prompt-section lines that
- * registerMemoryPromptSupplement expects.
+ * Stat the configured .swarm/ files WITHOUT reading their content.
+ *
+ * Used by the memory-prompt supplement (see renderStatusPromptLines), which
+ * fires on every turn. A stat is a few bytes of syscall result; reading and
+ * discarding up to `maxBytes` of markdown every turn (CLAW-083, 2026-08-10:
+ * a shared 24,576-byte budget, injected raw into a non-cache-stable prompt
+ * section that changes on every board edit, fleet-wide) is real, avoidable
+ * cost. Full content stays behind the on-demand swarm_read tool
+ * (readSwarmSnapshot), which an agent calls only when it actually needs it.
+ */
+export function statSwarmFiles(config: {
+  swarmDir: string;
+  includeFiles: string[];
+}): SwarmFileStat[] {
+  return config.includeFiles.map((filename) => {
+    const fullPath = path.join(config.swarmDir, filename);
+    try {
+      const stat = fs.statSync(fullPath);
+      return { filename, exists: true, bytes: stat.size, mtimeMs: stat.mtimeMs };
+    } catch {
+      // Missing or unreadable (permissions, races) — reported as absent,
+      // never thrown. The memory supplement must not be able to fail a
+      // session start.
+      return { filename, exists: false, bytes: 0, mtimeMs: 0 };
+    }
+  });
+}
+
+function formatStaleness(ageMs: number): string {
+  if (!Number.isFinite(ageMs) || ageMs < 0) {
+    return "unknown time ago";
+  }
+  const minutes = Math.floor(ageMs / 60_000);
+  if (minutes < 1) {
+    return "just now";
+  }
+  if (minutes < 60) {
+    return `${minutes}m ago`;
+  }
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return `${hours}h ago`;
+  }
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+/**
+ * Render a stat-only status line per file — the pointer, not the content.
+ * This is what registerMemoryPromptSupplement actually injects each turn;
+ * swarm_read (backed by readSwarmSnapshot below) is the pull path for the
+ * real content. Keeping the per-turn injection to a handful of short lines
+ * keeps it cheap and prompt-cache-friendly even though the underlying files
+ * (and therefore their size/mtime) change often across a multi-bot fleet.
+ */
+export function renderStatusPromptLines(
+  swarmDir: string,
+  stats: SwarmFileStat[],
+  nowMs: number,
+): string[] {
+  const lines: string[] = [];
+  lines.push(`### Stigmergic coordination state (.swarm/ at ${swarmDir})`);
+  lines.push("");
+
+  const present = stats.filter((stat) => stat.exists);
+  if (present.length === 0) {
+    lines.push("_(no .swarm/ files present at this path)_");
+    lines.push("");
+    return lines;
+  }
+
+  for (const stat of present) {
+    lines.push(`- ${stat.filename}: ${stat.bytes.toLocaleString()} bytes, updated ${formatStaleness(nowMs - stat.mtimeMs)}`);
+  }
+  lines.push("");
+  lines.push(
+    "This is a pointer, not a copy. Call swarm_read (filename=...) for the current board, or memory_search for a specific past item.",
+  );
+  lines.push("");
+  return lines;
+}
+
+/**
+ * Render a snapshot as the array of prompt-section lines that swarm_read
+ * returns on demand. NOT used by the memory-prompt supplement — see
+ * renderStatusPromptLines above for that.
  */
 export function renderSnapshotAsPromptLines(
   swarmDir: string,
