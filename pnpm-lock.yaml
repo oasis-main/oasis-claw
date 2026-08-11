@@ -54,6 +54,15 @@ importers:
         specifier: ^3.0.0
         version: 3.2.4(@types/node@25.6.2)(jiti@2.7.0)(tsx@4.21.0)(yaml@2.9.0)
 
+  extensions/genconfig:
+    devDependencies:
+      openclaw:
+        specifier: 2026.6.11
+        version: 2026.6.11
+      vitest:
+        specifier: ^3.0.0
+        version: 3.2.4(@types/node@25.6.2)(jiti@2.7.0)(tsx@4.21.0)(yaml@2.9.0)
+
   extensions/model-switcher:
     dependencies:
       zod:
@@ -63,6 +72,45 @@ importers:
       openclaw:
         specifier: 2026.6.11
         version: 2026.6.11
+      vitest:
+        specifier: ^3.0.0
+        version: 3.2.4(@types/node@25.6.2)(jiti@2.7.0)(tsx@4.21.0)(yaml@2.9.0)
+
+  extensions/oasis-find:
+    dependencies:
+      zod:
+        specifier: ^4.4.1
+        version: 4.4.3
+    devDependencies:
+      openclaw:
+        specifier: workspace:*
+        version: link:../../packages/openclaw-stub
+      vitest:
+        specifier: ^3.0.0
+        version: 3.2.4(@types/node@25.6.2)(jiti@2.7.0)(tsx@4.21.0)(yaml@2.9.0)
+
+  extensions/oasis-reach:
+    dependencies:
+      zod:
+        specifier: ^4.4.1
+        version: 4.4.3
+    devDependencies:
+      openclaw:
+        specifier: workspace:*
+        version: link:../../packages/openclaw-stub
+      vitest:
+        specifier: ^3.0.0
+        version: 3.2.4(@types/node@25.6.2)(jiti@2.7.0)(tsx@4.21.0)(yaml@2.9.0)
+
+  extensions/oasis-reviewer:
+    dependencies:
+      zod:
+        specifier: ^4.4.1
+        version: 4.4.3
+    devDependencies:
+      openclaw:
+        specifier: workspace:*
+        version: link:../../packages/openclaw-stub
       vitest:
         specifier: ^3.0.0
         version: 3.2.4(@types/node@25.6.2)(jiti@2.7.0)(tsx@4.21.0)(yaml@2.9.0)
