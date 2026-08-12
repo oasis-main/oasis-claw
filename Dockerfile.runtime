@@ -71,7 +71,16 @@ RUN case "${TARGETARCH:-amd64}" in \
 #
 # sharp ships prebuilt libvips binaries for linux-arm64 + linux-x64; no extra
 # apt packages needed on bookworm-slim.
-RUN npm install -g openclaw@${OPENCLAW_VERSION} tsx@4 sharp@0.34
+# amazon-bedrock-provider (2026-08-12): NOT bundled in core openclaw dist —
+# confirmed by absence from dist/extensions/ (anthropic/google/openai ARE
+# there; amazon-bedrock and moonshot are not — same external-package pattern
+# docs/providers/model-providers.md documents for moonshot: "Install
+# @openclaw/moonshot-provider before onboarding"). Without this, a
+# models.providers["amazon-bedrock"] config entry resolves and even attempts
+# the call, but every request fails with "No API provider registered for api:
+# bedrock-converse-stream" — a transport gap, not an auth/config problem.
+# Version pinned to the same 2026.7.1 train as OPENCLAW_VERSION.
+RUN npm install -g openclaw@${OPENCLAW_VERSION} tsx@4 sharp@0.34 @openclaw/amazon-bedrock-provider@2026.7.1
 
 # CLAW-083 interim patch: openclaw's plugin-loader cache restore replaces
 # instead of merges memory-prompt-supplement state, so a scoped load (e.g.

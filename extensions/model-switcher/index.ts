@@ -43,10 +43,14 @@ const TIER_CATALOG: Readonly<Record<string, TierRow>> = {
     // gemini-3.1-flash-lite is GA as of 2026-05; using it (not the older
     // -preview variant from the local catalog dump) keeps the light tier on
     // the same 3.1 generation as the heavy tier so the ladder reads as one
-    // family. Medium stays on 3-pro-preview until 3.1-pro hits GA.
+    // family. Medium moved off the 3-pro-preview stopgap (2026-08-12, Mike) to
+    // gemini-3.6-flash — confirmed live against the real Gemini API (not the
+    // local catalog, which didn't have it yet): newer than 3.5-flash and a
+    // proper Flash-family model, unlike 3-pro-preview which was always a
+    // mismatched placeholder for this slot pending 3.1-pro's GA (still preview).
     label: "Google (Gemini)",
     light: "google/gemini-3.1-flash-lite",
-    medium: "google/gemini-3-pro-preview",
+    medium: "google/gemini-3.6-flash",
     heavy: "google/gemini-3.1-pro-preview",
   },
 };
