@@ -189,7 +189,83 @@ const READ_ONLY_ARGV_TOOLS = new Set([
   "grep", "egrep", "fgrep", "rg", "ag",
   "cat", "head", "tail", "wc", "sort", "uniq", "cut",
   "jq", "xmllint", "stat", "file", "ls",
+  // Shell plumbing (CLAW-090). These carry no side effect of their own and are
+  // how agents actually wrap a read: `cd /reach/exp && git log …`, and the
+  // `|| echo "NO GIT"` / `; echo "EXIT:$?"` tails that models habitually append.
+  // Without them ONE trailing `echo` disqualified an otherwise inert pipeline,
+  // which is precisely how House's `cd … && git log … || echo` still escalated.
+  // On redirects (`echo x > f`): a redirect is not a new capability here — it is
+  // already reachable through safelisted `cat`, it does not split into its own
+  // stage, and this carve-out skips ONLY the three per-bot word regexes
+  // (banking/trade). DESTRUCTIVE, DOWNLOAD_EXEC and SUBSTITUTION are unaffected.
+  "cd", "echo", "printf", "pwd", "dirname", "basename", "true", "false",
 ]);
+
+// ── Read-only git (CLAW-090) ────────────────────────────────────────────────
+// `git` is deliberately NOT in READ_ONLY_ARGV_TOOLS: the binary is a
+// multiplexer, so the SUBCOMMAND decides. `git diff` is inert; `git push` is
+// not. Judging the leading token alone would exempt both.
+//
+// These subcommands have NO mutating form at all — there is no flag that turns
+// `git status` or `git rev-parse` into a write. Anything with a mutating mode
+// (checkout, reset, tag, stash, config, fetch, submodule, …) is absent on
+// purpose; the set only grows by adding a subcommand that is provably
+// incapable of changing the repo, the index, or a remote.
+const GIT_READ_ONLY_SUBCOMMANDS = new Set([
+  "status", "log", "show", "diff", "diff-tree", "diff-index", "grep",
+  "blame", "annotate", "rev-parse", "rev-list", "describe", "shortlog",
+  "whatchanged", "ls-files", "ls-tree", "cat-file", "name-rev",
+  "merge-base", "check-ignore", "check-attr", "show-ref", "for-each-ref",
+  "count-objects", "verify-commit", "verify-tag", "version",
+]);
+
+// `branch` and `remote` are the two subcommands Mike's bots actually use for
+// recon that DO have mutating forms — and not only behind a flag: a bare
+// `git branch <name>` creates one and `git remote add` adds one. So they are
+// inert only in a pure listing form, where every token after the subcommand is
+// one of these value-less display flags. Any positional argument disqualifies
+// the stage, which is what keeps `git branch feature-x` out.
+const GIT_LISTING_ONLY_FLAGS: Record<string, Set<string>> = {
+  branch: new Set(["--show-current", "--list", "-l", "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose"]),
+  remote: new Set(["-v", "--verbose"]),
+};
+
+// git global options that turn ANY subcommand into arbitrary execution and so
+// disqualify the stage outright, however read-only the subcommand looks:
+//   git -c core.pager='sh -c evil' log      → runs evil
+//   git -c alias.x='!evil' x                → runs evil
+//   --exec-path / --upload-pack / --receive-pack  → relocate the helper binary
+//   --output=<file>                         → `git diff --output` WRITES a file
+// Note the sibling protection: an env-var prefix (`GIT_EXTERNAL_DIFF=evil git
+// diff`) makes the stage's leading token `GIT_EXTERNAL_DIFF=evil`, not `git`,
+// so it fails the leading-token check and is never inert.
+const GIT_EXEC_VECTOR = /(^|\s)(-c|--config-env|--exec-path|--upload-pack|--receive-pack|--output)(=|\s|$)/;
+
+// git global options that legitimately precede a subcommand and are harmless.
+// The two-token forms consume their value; House's real commands use `-C`.
+const GIT_GLOBAL_WITH_VALUE = new Set(["-C", "--git-dir", "--work-tree", "--namespace"]);
+const GIT_GLOBAL_FLAGS = new Set(["--no-pager", "-P", "--paginate", "--bare", "--literal-pathspecs", "--no-replace-objects"]);
+
+function isInertGitStage(stage: string): boolean {
+  const tokens = stage.trim().split(/\s+/).filter((t) => t.length > 0);
+  if (tokens.length === 0) return false;
+  if ((tokens[0].split("/").pop() ?? "").toLowerCase() !== "git") return false;
+  if (GIT_EXEC_VECTOR.test(stage)) return false;
+  let i = 1;
+  while (i < tokens.length) {
+    const t = tokens[i];
+    if (GIT_GLOBAL_WITH_VALUE.has(t)) { i += 2; continue; }
+    if (GIT_GLOBAL_FLAGS.has(t)) { i += 1; continue; }
+    if (/^--(git-dir|work-tree|namespace)=/.test(t)) { i += 1; continue; }
+    break;
+  }
+  const sub = (tokens[i] ?? "").toLowerCase();
+  if (!sub) return false;
+  if (GIT_READ_ONLY_SUBCOMMANDS.has(sub)) return true;
+  const listingFlags = GIT_LISTING_ONLY_FLAGS[sub];
+  if (!listingFlags) return false;
+  return tokens.slice(i + 1).every((t) => listingFlags.has(t));
+}
 
 function splitUnquotedStages(cmd: string): string[] {
   const stages: string[] = [];
@@ -227,10 +303,23 @@ function leadingArgvToken(stage: string): string {
   return (m[1].split("/").pop() ?? m[1]).toLowerCase();
 }
 
-function isInertReadOnlyPipeline(cmd: string): boolean {
+// Exported for reviewer.ts: Layer 2 uses the SAME definition of "inert" to
+// decide that escalating a read is never the right tightening (CLAW-090).
+// Keeping one implementation means the two layers can never drift into
+// disagreeing about what a side-effect-free command is.
+export function isInertReadOnlyPipeline(cmd: string): boolean {
   const stages = splitUnquotedStages(cmd);
   if (stages.length === 0) return false;
-  return stages.every((s) => s.trim().length > 0 && READ_ONLY_ARGV_TOOLS.has(leadingArgvToken(s)));
+  return stages.every((s) => {
+    if (s.trim().length === 0) return false;
+    if (READ_ONLY_ARGV_TOOLS.has(leadingArgvToken(s))) return true;
+    return isInertGitStage(s);
+  });
+}
+
+/** The exec command for a tool call — same key order evaluateHard uses. */
+export function execCommandOf(params: Record<string, unknown> | undefined): string {
+  return firstString(params ?? {}, "command", "cmd", "script", "input", "code");
 }
 
 // ── Policy file loading + per-bot resolution ──────────────────────────────────

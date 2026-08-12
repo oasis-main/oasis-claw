@@ -8,6 +8,8 @@ import {
   constitutionFor,
   DEFAULT_HARD_POLICY,
   evaluateHard,
+  execCommandOf,
+  isInertReadOnlyPipeline,
   loadPolicyFile,
   NEVER_DOWNGRADE,
   resolveHardPolicy,
@@ -293,7 +295,35 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
           : r.decision
             ? tightenOnly(l1, r.decision)
             : null;
-        if (combined) {
+        // ── INERT-READ BACKSTOP (CLAW-090) ──
+        // Layer 2 may tighten, but ESCALATING A READ is never the right
+        // tightening. A read the judge believes is malicious should be DENIED
+        // (that path is untouched below); one it does not believe is malicious
+        // is just friction, because "may the bot run `git status`?" is not a
+        // question Mike can usefully answer.
+        //
+        // Measured cost of not having this (House, 2026-08-10): 29 Layer 2
+        // escalations in one session, ALL of them l2Tightened — Layer 1 had
+        // allowed every single one — and NONE of which mutated a repo or placed
+        // an order. 18 were read-only git (status/diff/log/grep/rev-parse), and
+        // the judge kept re-raising them because each retry is a fresh 180s
+        // prompt. The session ended in "Agent couldn't generate a response".
+        //
+        // Narrow by construction. It fires only when ALL of these hold:
+        //   1. Layer 1 itself allowed the call (never rescues an L1 escalate),
+        //   2. the family is exec,
+        //   3. EVERY pipeline stage is a provably side-effect-free argv tool or
+        //      a read-only git subcommand (isInertReadOnlyPipeline — the same
+        //      function Layer 1 uses, so the layers cannot drift),
+        //   4. the combined verdict is escalate, not deny.
+        // The prose fix to the constitution is the primary repair; this is the
+        // backstop for the judge re-reading it too broadly, which has now
+        // happened twice.
+        const inertRead = family === "exec" && isInertReadOnlyPipeline(execCommandOf(params));
+        const inertReadKept = !!combined && combined.verdict === "escalate" && l1.verdict === "allow" && inertRead;
+        if (inertReadKept) {
+          decision = l1;
+        } else if (combined) {
           decision = combined;
         } else if (alwaysConstitutional) {
           // No verdict (timeout / unreachable model / unparseable JSON) on a bot
@@ -315,7 +345,10 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
           l2Ms: r.ms,
           l2ParseFail: r.decision ? undefined : (r.raw || null),
           l2Error: r.error ?? null,
-          l2Tightened: !!combined && combined.verdict !== l1.verdict,
+          l2Tightened: !!combined && !inertReadKept && combined.verdict !== l1.verdict,
+          // Records every escalate-on-an-inert-read the backstop absorbed, so
+          // the constitution's own drift stays measurable after the prose fix.
+          l2InertReadKept: inertReadKept || undefined,
           l2FailClosed: !r.decision && alwaysConstitutional,
         };
       }
