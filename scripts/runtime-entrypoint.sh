@@ -318,6 +318,30 @@ if inbound_env_name:
         "id": inbound_env_name,
     }
     tg["dmPolicy"] = "allowlist"
+    # ── CLAW-091: Telegram media downloads need an EXPLICIT proxy ──────────
+    # Setting HTTP_PROXY/HTTPS_PROXY is NOT enough, and the difference is the
+    # whole bug. With only the env vars the plugin picks dispatcher mode
+    # "env-proxy"; `usesTrustedTelegramExplicitProxy` (extensions/telegram/src/
+    # bot/delivery.resolve-media.ts:188) returns true ONLY for mode
+    # "explicit-proxy", so it passes trustExplicitProxyDns:false and the media
+    # fetch is forced to resolve api.telegram.org with LOCAL pinned DNS first.
+    # On the internal:true sandbox net there is no resolver, so every photo
+    # fetch dies with EAI_AGAIN.
+    #
+    # That is not merely a dropped image. The poisoned update never completes,
+    # the persisted offset stays pinned before it, and EVERY later message
+    # queues behind it — House was hard-frozen this way on 2026-08-12 (update
+    # 323675635, a photo; the operator's next two messages sat pending with 0
+    # attempts). Text polling was unaffected the whole time, which is what made
+    # it look like a hang rather than a network fault.
+    #
+    # Naming the SAME proxy explicitly flips the mode, which flips
+    # trustExplicitProxyDns, which lets the proxy do the DNS. Derived from the
+    # environment so it cannot drift from the egress proxy the bot actually has.
+    _tg_proxy = (os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or "").strip()
+    if _tg_proxy:
+        tg["proxy"] = _tg_proxy
+        print(f"[entrypoint] telegram: explicit proxy {_tg_proxy} (enables media-fetch DNS via proxy)")
     if operator_user_id and operator_user_id.lstrip("-").isdigit():
         existing_allow = tg.get("allowFrom") or []
         if operator_user_id not in existing_allow:
