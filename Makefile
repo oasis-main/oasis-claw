@@ -152,7 +152,8 @@ wait-ready:
 WATCHDOG_DIR := $(HOME)/Library/Application Support/oasis-x
 WATCHDOG_PLIST := $(HOME)/Library/LaunchAgents/com.oasis-x.nimbus-watchdog.plist
 
-.PHONY: watchdog-install watchdog-status watchdog-uninstall egress-check egress-sync
+.PHONY: watchdog-install watchdog-status watchdog-uninstall egress-check egress-sync \
+        stuck-lanes-watchdog-install stuck-lanes-watchdog-status stuck-lanes-watchdog-uninstall
 
 watchdog-install: ## (re)deploy + load the nimbus telegram-channel watchdog — re-run after editing the script
 	@mkdir -p "$(WATCHDOG_DIR)"
@@ -172,6 +173,31 @@ watchdog-status: ## show the watchdog's last exit code (0 = healthy; 126 = TCC-b
 watchdog-uninstall: ## unload the watchdog
 	@launchctl bootout gui/$$(id -u)/com.oasis-x.nimbus-watchdog 2>/dev/null || true
 	@echo "watchdog unloaded"
+
+# ── claw-stuck-lanes watchdog (launchd) ────────────────────────────────────
+# Same TCC-driven deployment shape as nimbus-watchdog above (see that block's
+# comment). Detect-and-notify only — never restarts anything (CLAW-073).
+STUCK_LANES_PLIST := $(HOME)/Library/LaunchAgents/com.oasis-x.claw-stuck-lanes.plist
+
+stuck-lanes-watchdog-install: ## (re)deploy + load the stuck-Telegram-lane watchdog — re-run after editing the script
+	@mkdir -p "$(WATCHDOG_DIR)"
+	@cp scripts/claw-stuck-lanes "$(WATCHDOG_DIR)/claw-stuck-lanes"
+	@chmod +x "$(WATCHDOG_DIR)/claw-stuck-lanes"
+	@cp scripts/com.oasis-x.claw-stuck-lanes.plist "$(STUCK_LANES_PLIST)"
+	@plutil -lint "$(STUCK_LANES_PLIST)" >/dev/null
+	@launchctl bootout gui/$$(id -u)/com.oasis-x.claw-stuck-lanes 2>/dev/null || true
+	@launchctl bootstrap gui/$$(id -u) "$(STUCK_LANES_PLIST)"
+	@echo "stuck-lanes watchdog installed — verify with: make stuck-lanes-watchdog-status"
+
+stuck-lanes-watchdog-status: ## show the stuck-lanes watchdog's last exit code (0=clean, 1=stuck lane found, 126=TCC-blocked)
+	@launchctl print gui/$$(id -u)/com.oasis-x.claw-stuck-lanes 2>/dev/null \
+	  | grep -E "state =|last exit code" || echo "not loaded"
+	@tail -20 "$(HOME)/Library/Logs/claw-stuck-lanes.stdout.log" 2>/dev/null || true
+	@tail -3 "$(HOME)/Library/Logs/claw-stuck-lanes.stderr.log" 2>/dev/null || true
+
+stuck-lanes-watchdog-uninstall: ## unload the stuck-lanes watchdog
+	@launchctl bootout gui/$$(id -u)/com.oasis-x.claw-stuck-lanes 2>/dev/null || true
+	@echo "stuck-lanes watchdog unloaded"
 
 # ── egress partitioning health ───────────────────────────────────────────────
 egress-check: ## verify client.map still matches live bot IPs (CLAW-050 isolation)

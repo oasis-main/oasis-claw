@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  claw-stuck-lanes watchdog — detects a Telegram ingress lane silently blocked
+  behind a poisoned update (CLAW-093) and fires a macOS notification. See
+  scripts/claw-stuck-lanes for the full incident this exists to catch.
+
+  Source of truth for this plist AND the script is the repo; `make
+  stuck-lanes-watchdog-install` deploys both. Re-run it after editing either —
+  the deployed copies do not track the repo automatically.
+
+  ProgramArguments deliberately points OUTSIDE the repo, for the SAME reason
+  nimbus-watchdog's plist does (see scripts/com.oasis-x.nimbus-watchdog.plist):
+  macOS TCC blocks launchd agents from reading ~/Documents, so an agent pointed
+  at ~/Documents/Runes/... fails "Operation not permitted" (exit 126) on every
+  fire — SILENTLY, which for a watchdog is indistinguishable from healthy. The
+  script needs only `docker`, `python3`, `osascript`, and
+  ~/Library/Application Support/oasis-x — a deployed copy there is sufficient.
+  No Full Disk Access grant, and no container holding a root-equivalent docker
+  socket just to inspect a database that already lives on the host.
+
+  UNLIKE nimbus-watchdog, this NEVER restarts anything — see the script header
+  for why (CLAW-073: an auto-restarting watchdog raced openclaw's own recovery
+  and made things worse). This only detects and alerts; the fix is one command
+  the operator runs by hand, printed in the notification's shadow (the log).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.oasis-x.claw-stuck-lanes</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/Michaellee/Library/Application Support/oasis-x/claw-stuck-lanes</string>
+        <string>--notify-macos</string>
+    </array>
+
+    <!-- 300s: read-only sqlite queries via `docker exec` across 7 containers,
+         so the cost of running often is small. Detection speed matters more —
+         the incident this exists to catch sat unnoticed for hours. -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/Michaellee</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/Michaellee/Library/Logs/claw-stuck-lanes.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/Michaellee/Library/Logs/claw-stuck-lanes.stderr.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

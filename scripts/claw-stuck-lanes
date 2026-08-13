@@ -52,6 +52,8 @@ import argparse
 import json
 import subprocess
 import sys
+import time
+from pathlib import Path
 
 # openclaw's own dead-letter floor. A row at or above this has exhausted the
 # retry budget and is now held only by the 24-hour age gate — i.e. it is stuck,
@@ -59,6 +61,15 @@ import sys
 DEFAULT_ATTEMPT_THRESHOLD = 8
 DEAD_LETTER_MIN_AGE_H = 24
 DB = "/home/node/.openclaw/state/openclaw.sqlite"
+
+# --notify-macos state: which (bot, event_id) pairs have already fired a
+# notification, and when. Without this a 5-minute launchd interval would repeat
+# the SAME notification every 5 minutes for up to 24 hours — which trains the
+# operator to dismiss it unread, the identical failure mode CLAW-090 fixed in
+# the reviewer's own escalation prose. Re-notify periodically rather than once,
+# so a missed/dismissed alert is not silence for the rest of the day.
+NOTIFY_STATE_PATH = Path.home() / "Library" / "Application Support" / "oasis-x" / "claw-stuck-lanes.notified.json"
+RENOTIFY_INTERVAL_H = 2
 
 # Read-only URI so this can never be the thing that corrupts a live database.
 PROBE = r"""
@@ -137,6 +148,57 @@ def analyse(container: str, threshold: int) -> dict:
     }
 
 
+def load_notify_state() -> dict:
+    try:
+        return json.loads(NOTIFY_STATE_PATH.read_text())
+    except Exception:  # noqa: BLE001 - absent/corrupt state must never block alerting
+        return {}
+
+
+def save_notify_state(state: dict) -> None:
+    try:
+        NOTIFY_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        NOTIFY_STATE_PATH.write_text(json.dumps(state))
+    except Exception as exc:  # noqa: BLE001 - a state-write failure must not crash the monitor
+        print(f"[claw-stuck-lanes] warn: could not persist notify state: {exc}", file=sys.stderr)
+
+
+def notify_macos(reports: list[dict]) -> None:
+    """Best-effort. A notification failure must never make the monitor exit non-zero
+    for a reason other than the actual stuck lane — detection and alerting are
+    independent, so a broken osascript can't be mistaken for a clean fleet."""
+    now = time.time()
+    state = load_notify_state()
+    fired = False
+    for r in reports:
+        for s in r.get("stuck", []):
+            key = f"{r['bot']}:{s['event_id']}"
+            last = state.get(key, 0)
+            if now - last < RENOTIFY_INTERVAL_H * 3600:
+                continue
+            queued = sum(r.get("queued_behind", {}).values())
+            msg = (
+                f"{r['bot']}: update {s['event_id']} stuck at {s['attempts']} attempts"
+                f"{f', {queued} message(s) unanswered' if queued else ''}"
+            )
+            try:
+                subprocess.run(
+                    ["osascript", "-e",
+                     f'display notification {json.dumps(msg)} with title "oasis-claw: stuck Telegram lane" sound name "Basso"'],
+                    check=False, capture_output=True, timeout=10,
+                )
+                fired = True
+            except Exception as exc:  # noqa: BLE001
+                print(f"[claw-stuck-lanes] warn: notification failed: {exc}", file=sys.stderr)
+            state[key] = now
+    # Prune entries for events that are no longer reported stuck (cleared, or
+    # aged past dead-letter) so the state file cannot grow without bound.
+    still_stuck = {f"{r['bot']}:{s['event_id']}" for r in reports for s in r.get("stuck", [])}
+    state = {k: v for k, v in state.items() if k in still_stuck}
+    if fired or state != load_notify_state():
+        save_notify_state(state)
+
+
 def remediation(bot: str, event_id: str) -> str:
     volume = f"oasis_openclaw_home_{bot.removeprefix('oasis-claw-').replace('-', '_')}"
     return (
@@ -153,6 +215,9 @@ def main() -> int:
     ap.add_argument("--attempts", type=int, default=DEFAULT_ATTEMPT_THRESHOLD,
                     help=f"attempts at or above which a row counts as stuck (default {DEFAULT_ATTEMPT_THRESHOLD})")
     ap.add_argument("--json", action="store_true", help="emit JSON instead of text")
+    ap.add_argument("--notify-macos", action="store_true",
+                    help="fire a macOS notification for newly-stuck lanes (de-duped, re-alerts every "
+                         f"{RENOTIFY_INTERVAL_H}h while unresolved). For the launchd watchdog; a no-op in JSON mode.")
     args = ap.parse_args()
 
     targets = [args.bot] if args.bot else running_bots()
@@ -161,6 +226,9 @@ def main() -> int:
         return 2
 
     reports = [analyse(t, args.attempts) for t in targets]
+
+    if args.notify_macos:
+        notify_macos(reports)
 
     if args.json:
         print(json.dumps(reports, indent=2))
