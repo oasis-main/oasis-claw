@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""claw-stuck-lanes — find Telegram ingress lanes that have gone silent (CLAW-093).
+
+WHY THIS EXISTS
+---------------
+House went silent for hours on 2026-08-12 and nothing reported it. The container
+was healthy, the gateway was up, text polling was running, and the operator's
+messages were being received — they simply never ran. One update (a photo whose
+media fetch could not resolve DNS inside the internal:true sandbox) failed
+forever, and every later message queued behind it.
+
+That is not a crash, so no health check catches it. It presents as "the bot is
+ignoring me".
+
+The cost is bounded by design, but the bound is a full day. openclaw only
+dead-letters a poisoned update when BOTH conditions hold
+(extensions/telegram/src/spooled-update-retry-policy.ts:79-88):
+
+    attempt >= 8   AND   now - receivedAt >= 24 hours
+
+The 8 attempts are spent in about four minutes; the age gate then blocks the
+tombstone for the rest of the day while attempts keep climbing — which is why
+the logs read "attempt 13/8". That is deliberate ("poison updates must
+eventually become tombstones, but not during ordinary transient provider or
+state-store outages"), not a broken cap. The trade-off is real, and so is its
+cost: the lane key is per-chat, so ONE bad update silences that entire
+conversation for up to 24 hours.
+
+This script turns that silent day into a visible alert.
+
+WHAT IT DOES NOT DO
+-------------------
+It does not restart anything. The retired nimbus-watchdog (CLAW-073) auto-
+restarted on a similar signal and issued spurious `docker restart`s that raced
+openclaw's own recovery, roughly daily. Detection and remediation are separated
+here on purpose: this prints the exact command and lets a human run it.
+
+USAGE
+    scripts/claw-stuck-lanes                # all bots, human-readable
+    scripts/claw-stuck-lanes --json         # machine-readable
+    scripts/claw-stuck-lanes --bot house    # one bot
+    scripts/claw-stuck-lanes --attempts 4   # alert earlier than the dead-letter floor
+
+EXIT CODES
+    0  no stuck lane
+    1  at least one stuck lane (use this to drive an alert)
+    2  could not inspect at least one container
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+
+# openclaw's own dead-letter floor. A row at or above this has exhausted the
+# retry budget and is now held only by the 24-hour age gate — i.e. it is stuck,
+# not merely slow.
+DEFAULT_ATTEMPT_THRESHOLD = 8
+DEAD_LETTER_MIN_AGE_H = 24
+DB = "/home/node/.openclaw/state/openclaw.sqlite"
+
+# Read-only URI so this can never be the thing that corrupts a live database.
+PROBE = r"""
+import json, sqlite3, time
+try:
+    con = sqlite3.connect("file:%s?mode=ro", uri=True)
+    rows = con.execute(
+        "select event_id, lane_key, status, attempts, received_at, last_error "
+        "from channel_ingress_events where status='pending'"
+    ).fetchall()
+except Exception as exc:
+    print(json.dumps({"error": str(exc)}))
+else:
+    print(json.dumps({"now_ms": int(time.time() * 1000), "rows": rows}))
+""" % DB
+
+
+def running_bots() -> list[str]:
+    out = subprocess.run(
+        ["docker", "ps", "--filter", "name=oasis-claw-", "--format", "{{.Names}}"],
+        capture_output=True, text=True, check=False,
+    ).stdout
+    # oasis-claw-vet is a helper, not a bot, and has no gateway database.
+    return sorted(n for n in out.split() if n and not n.endswith("-vet"))
+
+
+def probe(container: str) -> dict:
+    res = subprocess.run(
+        ["docker", "exec", container, "python3", "-c", PROBE],
+        capture_output=True, text=True, check=False,
+    )
+    if res.returncode != 0:
+        return {"error": (res.stderr or "docker exec failed").strip()[:200]}
+    try:
+        return json.loads(res.stdout.strip().splitlines()[-1])
+    except Exception as exc:  # noqa: BLE001 - report, never raise, per-container
+        return {"error": f"unparseable probe output: {exc}"}
+
+
+def analyse(container: str, threshold: int) -> dict:
+    data = probe(container)
+    if "error" in data:
+        return {"bot": container, "error": data["error"]}
+
+    now = data["now_ms"]
+    rows = data["rows"]
+    stuck, blocked_lanes = [], {}
+    for event_id, lane_key, _status, attempts, received_at, last_error in rows:
+        attempts = attempts or 0
+        age_h = (now - (received_at or now)) / 3_600_000
+        if attempts >= threshold:
+            stuck.append({
+                "event_id": event_id,
+                "lane": lane_key,
+                "attempts": attempts,
+                "age_hours": round(age_h, 1),
+                # How long until openclaw drops it on its own. Negative means the
+                # age gate has passed and the next attempt should tombstone it.
+                "hours_until_dead_letter": round(max(0.0, DEAD_LETTER_MIN_AGE_H - age_h), 1),
+                "last_error": (last_error or "")[:160],
+            })
+            blocked_lanes.setdefault(lane_key, 0)
+
+    # Messages sitting untouched behind a poisoned one. This is the number that
+    # actually matters to the operator: it is how many of their messages the bot
+    # has silently not answered.
+    for _event_id, lane_key, _status, attempts, _received_at, _err in rows:
+        if lane_key in blocked_lanes and (attempts or 0) == 0:
+            blocked_lanes[lane_key] += 1
+
+    return {
+        "bot": container,
+        "pending_total": len(rows),
+        "stuck": stuck,
+        "queued_behind": {k: v for k, v in blocked_lanes.items() if v},
+    }
+
+
+def remediation(bot: str, event_id: str) -> str:
+    volume = f"oasis_openclaw_home_{bot.removeprefix('oasis-claw-').replace('-', '_')}"
+    return (
+        f"  docker stop {bot} && docker run --rm -v {volume}:/v alpine sh -c \""
+        f"apk add -q sqlite && sqlite3 /v/state/openclaw.sqlite \\\""
+        f"update channel_ingress_events set status='failed' where event_id='{event_id}';"
+        f"\\\"\" && docker start {bot}"
+    )
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Find silently-blocked Telegram ingress lanes.")
+    ap.add_argument("--bot", help="inspect one container (default: every running bot)")
+    ap.add_argument("--attempts", type=int, default=DEFAULT_ATTEMPT_THRESHOLD,
+                    help=f"attempts at or above which a row counts as stuck (default {DEFAULT_ATTEMPT_THRESHOLD})")
+    ap.add_argument("--json", action="store_true", help="emit JSON instead of text")
+    args = ap.parse_args()
+
+    targets = [args.bot] if args.bot else running_bots()
+    if not targets:
+        print("no running oasis-claw-* containers", file=sys.stderr)
+        return 2
+
+    reports = [analyse(t, args.attempts) for t in targets]
+
+    if args.json:
+        print(json.dumps(reports, indent=2))
+    else:
+        for r in reports:
+            if r.get("error"):
+                print(f"⚠️  {r['bot']}: could not inspect — {r['error']}")
+                continue
+            if not r["stuck"]:
+                print(f"✅ {r['bot']}: no stuck lane ({r['pending_total']} pending)")
+                continue
+            print(f"❌ {r['bot']}: {len(r['stuck'])} stuck update(s)")
+            for s in r["stuck"]:
+                print(f"     event {s['event_id']}  lane {s['lane']}")
+                print(f"       attempts={s['attempts']}  age={s['age_hours']}h  "
+                      f"auto-drops in {s['hours_until_dead_letter']}h")
+                print(f"       {s['last_error']}")
+            for lane, n in r["queued_behind"].items():
+                print(f"     ⛔ {n} message(s) queued behind it on {lane} — unanswered")
+            print("   to clear (drops the poisoned update, keeps the row):")
+            for s in r["stuck"]:
+                print(remediation(r["bot"], s["event_id"]))
+
+    if any(r.get("error") for r in reports):
+        return 2
+    return 1 if any(r.get("stuck") for r in reports) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

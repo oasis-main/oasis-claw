@@ -67,6 +67,9 @@ status: ## one-line health + plugin count
 token: ## print gateway auth token (do NOT paste anywhere)
 	@$(COMPOSE) exec -T openclaw cat /home/node/.openclaw/.gateway-token; echo
 
+stuck-lanes: ## find Telegram lanes silently blocked behind a poisoned update
+	@scripts/claw-stuck-lanes
+
 healthz: ## authenticated healthz probe
 	@TOKEN=$$($(COMPOSE) exec -T openclaw cat /home/node/.openclaw/.gateway-token); \
 	curl -sS -H "Authorization: Bearer $$TOKEN" http://127.0.0.1:18789/healthz; echo
