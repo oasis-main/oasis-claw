@@ -7,6 +7,7 @@ import {
   DEFAULT_SEARCH_LIMITS,
   type SearchConfig,
 } from "./src/search.js";
+import { createDeepSearchTool } from "./src/tools/deep-search.js";
 import { createFsGlobTool } from "./src/tools/fs-glob.js";
 import { createFsGrepTool } from "./src/tools/fs-grep.js";
 import { createFsHelpTool } from "./src/tools/fs-help.js";
@@ -77,6 +78,11 @@ const plugin = {
     api.registerTool(createFsGlobTool({ search }), { name: "fs_glob" });
     api.registerTool(createFsGrepTool({ search }), { name: "fs_grep" });
     api.registerTool(createFsHelpTool({ roots }), { name: "fs_help" });
+    // deep_search (CLAW-092): lexical recall + cross-encoder rerank. Registered
+    // as a TOOL on purpose — additive, so it sits beside memory_search rather
+    // than displacing it. The alternative hook, registerMemoryRuntime, is a
+    // single-occupancy slot memory-core already holds.
+    api.registerTool(createDeepSearchTool({ search }), { name: "deep_search" });
 
     api.logger.info("oasis-find plugin loaded", { roots, denyDirs: search.denyDirs.length });
   },

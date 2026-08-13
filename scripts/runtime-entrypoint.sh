@@ -849,7 +849,10 @@ for t in SECURITY_TOOLS:
 
 # oasis-find (CLAW-082 phase 3). Read-only, root-confined, refuses secret-shaped
 # files, and never sees /reach/mail. Gated on the same roots the plugin needs.
-FIND_TOOLS = ("fs_glob", "fs_grep", "fs_help")
+# deep_search (CLAW-092) joins the same gate: it is the same plugin, the same
+# roots, and the same read-only confinement — it only adds a cross-encoder
+# rerank over the passages fs_grep would already have returned.
+FIND_TOOLS = ("fs_glob", "fs_grep", "fs_help", "deep_search")
 if find_roots:
     for t in FIND_TOOLS:
         if t not in also:
