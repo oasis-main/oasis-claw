@@ -25,6 +25,19 @@ type MultimodalEmbedResponse = {
   dim: number;
 };
 
+export type RerankResult = {
+  /** Index into the documents array that was SENT, not into the response. */
+  index: number;
+  /** 0..1 relevance (the cross-encoder applies Sigmoid). See rerank(). */
+  relevance_score: number;
+  document?: string | null;
+};
+
+type RerankResponse = {
+  model: string;
+  results: RerankResult[];
+};
+
 export class OasisSemanticsClient {
   private readonly baseUrl: string;
   private readonly headers: Record<string, string>;
@@ -54,6 +67,42 @@ export class OasisSemanticsClient {
     const res = await this.post("/v1/embed/multimodal", body);
     const data = (await res.json()) as MultimodalEmbedResponse;
     return data.embeddings;
+  }
+
+  /**
+   * Reorder `documents` by relevance to `query`, best first.
+   *
+   * SECOND stage of retrieval, never the first. The embedding tiers decide
+   * which candidates exist; this decides their order. A document the retrieval
+   * stage did not return cannot be recovered here — so a reranker raises
+   * PRECISION on a corpus, and can never extend one.
+   *
+   * Scores are 0..1 (the cross-encoder applies Sigmoid). Measured on the
+   * bge-base tier: 0.9998 for an obviously-correct pair, 0.0 for an unrelated
+   * one, so a threshold is usable — but calibrate it per corpus rather than
+   * assuming 0.5, and prefer the ORDER over the number when comparing across
+   * different queries.
+   *
+   * Feed it prose. The model is trained on natural-language question/passage
+   * pairs and scores bare code signatures near zero even when it ranks them
+   * correctly, so send docstrings and summaries rather than raw signatures.
+   */
+  async rerank(
+    query: string,
+    documents: string[],
+    opts: { model?: string; topN?: number; returnDocuments?: boolean } = {},
+  ): Promise<RerankResult[]> {
+    if (documents.length === 0) return [];
+    const body = JSON.stringify({
+      query,
+      documents,
+      ...(opts.model ? { model: opts.model } : {}),
+      ...(opts.topN ? { top_n: opts.topN } : {}),
+      ...(opts.returnDocuments ? { return_documents: true } : {}),
+    });
+    const res = await this.post("/v1/rerank", body);
+    const data = (await res.json()) as RerankResponse;
+    return data.results;
   }
 
   async healthz(): Promise<boolean> {
