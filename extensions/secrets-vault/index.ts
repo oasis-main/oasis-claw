@@ -48,8 +48,11 @@ const plugin = {
     api.registerTool(createDepositSecretTool({ secretsStore, telegram: telegramCfg }));
 
     // Belt-and-suspenders redaction hook — runs before any history write to
-    // ensure no plaintext secret slips into JSONL transcripts.
-    registerSecretsRedact(api, { secretsStore });
+    // ensure no plaintext secret slips into JSONL transcripts. Same telegram
+    // identity as deposit_secret's confirmation above, reused here so Mike
+    // gets an alert when the hook's shape-based check (CLAW-097) actually
+    // catches something, not just a log line nobody reads unprompted.
+    registerSecretsRedact(api, { secretsStore, telegram: telegramCfg });
 
     api.logger.info("secrets-vault plugin loaded", {
       secretsDir,
