@@ -33,6 +33,7 @@ import multiprocessing
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 import urllib.error
@@ -109,6 +110,119 @@ SEMANTIC_INDEX_ALLOWED_EXTENSIONS = {
     ".sh", ".sql", ".tf",
     ".ts", ".tsx", ".js", ".jsx",
 }
+
+# ── Secret-content scan (CLAW-096) — DEFENSE IN DEPTH, not the primary control.
+#
+# The primary control is filter_gitignored() below: a corpus's own hierarchical
+# .gitignore chain is the strongest available signal for "the author already
+# decided this must never be distributed" (nested files, negation patterns,
+# and independent nested-repo boundaries all included -- see that function).
+#
+# This scan exists because .gitignore coverage is not guaranteed complete: a
+# secret can land in a file the author never thought to exclude (a new
+# my_secrets.py-style module before .gitignore is updated, a stray literal in
+# an otherwise-ordinary .py file). Treat this as a real, not hypothetical,
+# risk for any bot whose corpus can reach a file the author didn't
+# anticipate — gitignore filtering alone only catches a secret file that is
+# actually named in a .gitignore; this scan is the layer that still catches
+# the next one even if nobody updates a .gitignore first.
+#
+# A match SKIPS THE WHOLE FILE (never a partial redaction -- a secret can
+# straddle a chunk boundary, and a regex miss on one line of a "mostly safe"
+# file is not an acceptable failure mode for a persistent index). The matched
+# RULE NAME is logged, never the matched text itself (same rule as _log's
+# module-level policy: basenames and reasons only).
+SECRET_PATTERNS: list[tuple[str, re.Pattern]] = [
+    ("aws_access_key_id", re.compile(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("private_key_block", re.compile(r"-----BEGIN (RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----")),
+    ("github_token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b")),
+    ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
+    # Broad, deliberately over-inclusive net: an identifier ENDING in one of
+    # these suffixes, assigned a quoted literal of 12+ chars. Catches
+    # tradier_token, gemini_api_key, kalshi_key_id, bedrock_aws_secret_access_key,
+    # OASIS_WEATHER_API_KEY, etc. False positives (a non-secret config value
+    # that happens to end in _key) fail SAFE here -- an over-excluded file
+    # costs relevance, not exposure -- and are visible in the build log by rule
+    # name for tuning.
+    (
+        "generic_secret_assignment",
+        re.compile(
+            r"(?i)\b[A-Za-z_][A-Za-z0-9_]*(_key|_token|_secret|key_id|_password|_passwd|_credential)"
+            r"\s*[:=]\s*[\"'][^\"'\s]{12,}[\"']"
+        ),
+    ),
+]
+
+
+def find_secret_pattern(text: str) -> str | None:
+    for name, pattern in SECRET_PATTERNS:
+        if pattern.search(text):
+            return name
+    return None
+
+
+# ── Hierarchical .gitignore filtering (CLAW-096) — PRIMARY control ───────────
+# Delegates entirely to `git check-ignore`, run against the git repo enclosing
+# the corpus root, rather than reimplementing gitignore's precedence rules
+# (nested .gitignore files, later-pattern-wins, `!negation`, directory-only
+# `trailing/`). git already gets this right; a hand-rolled matcher is a novel
+# source of exactly the kind of bug this feature exists to prevent.
+def find_git_toplevel(path: str) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", path, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def compute_gitignored_set(git_toplevel: str, real_paths: list[str]) -> set[str]:
+    """Returns the subset of real_paths `git check-ignore` reports as ignored.
+    Batches via --stdin -z (NUL-separated both directions -- safe for any
+    filename) to avoid one subprocess per file. Raises on a git failure
+    (rc not in {0, 1}) rather than silently treating a broken git invocation
+    as "nothing is ignored" -- a fail-open here would defeat the entire
+    control."""
+    if not real_paths:
+        return set()
+    ignored: set[str] = set()
+    batch_size = 1000
+    for i in range(0, len(real_paths), batch_size):
+        batch = real_paths[i : i + batch_size]
+        stdin_data = "\0".join(batch) + "\0"
+        proc = subprocess.run(
+            ["git", "-C", git_toplevel, "check-ignore", "--stdin", "-z"],
+            input=stdin_data, capture_output=True, text=True, timeout=60,
+        )
+        if proc.returncode not in (0, 1):
+            raise RuntimeError(
+                f"git check-ignore failed rc={proc.returncode} stderr={proc.stderr[:300]!r} "
+                "-- refusing to build without a working gitignore signal"
+            )
+        if proc.stdout:
+            ignored.update(p for p in proc.stdout.split("\0") if p)
+    return ignored
+
+
+def filter_gitignored(corpus_root: str, files: list[ScannedFile]) -> tuple[list[ScannedFile], int]:
+    """Drops any file git reports as ignored by corpus_root's own hierarchical
+    .gitignore chain. If corpus_root is not inside a git work tree, filtering
+    is DISABLED and loudly logged -- never a silent no-op, since silence here
+    would look identical to "nothing was ignored"."""
+    toplevel = find_git_toplevel(corpus_root)
+    if toplevel is None:
+        _log("warn", f"corpus root {os.path.basename(corpus_root)!r} is not inside a git work tree -- gitignore filtering DISABLED for this build")
+        return files, 0
+    ignored = compute_gitignored_set(toplevel, [f.real_path for f in files])
+    if not ignored:
+        return files, 0
+    kept = [f for f in files if f.real_path not in ignored]
+    return kept, len(files) - len(kept)
+
 
 BUILD_ID_BYTES = 36  # a UUID4 string, ASCII-encoded, fixed width
 
@@ -281,12 +395,42 @@ def open_cache_db() -> sqlite3.Connection:
              source_mtime_ns  INTEGER NOT NULL,
              line_start       INTEGER NOT NULL,
              line_end         INTEGER NOT NULL,
+             corpus_id        TEXT NOT NULL,
              PRIMARY KEY (content_sha256, source_host_path)
            )"""
     )
     con.execute("CREATE INDEX IF NOT EXISTS idx_chunk_sources_hash ON chunk_sources(content_sha256)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_chunk_sources_corpus ON chunk_sources(corpus_id)")
     con.commit()
     return con
+
+
+def purge_stale_chunk_sources(con: sqlite3.Connection, corpus_id: str) -> int:
+    """DELETE every chunk_sources row previously recorded for corpus_id,
+    before the current walk repopulates it fresh.
+
+    chunk_sources answers "which files CURRENTLY contain this content" -- it
+    is not a permanent history. Without this purge, a file that stops
+    appearing in the walk (deleted, newly matched by .gitignore, newly
+    matched by a secret pattern, or a deny-list update) stays in every future
+    per-bot output forever, because distribute_for_bot() reads this table's
+    full contents unconditionally.
+
+    Discovered LIVE (CLAW-096): adding filter_gitignored() and
+    find_secret_pattern() alone is not enough. Those filters correctly stop a
+    newly-excluded file from being RE-inserted on the next build, but nothing
+    deletes the rows an earlier build already inserted, so
+    distribute_for_bot() keeps reading and redistributing them regardless.
+    This is a REGRESSION-tested finding, not a hypothetical: see
+    assert_purge_stale_chunk_sources_removes_previously_recorded_rows in
+    scripts/tests/test_build_semantic_index.py.
+
+    The content-addressed `chunks` table (hash -> vector/text) is left
+    untouched -- it carries no path information and is a pure embedding-cost
+    cache, safe to keep forever."""
+    cur = con.execute("DELETE FROM chunk_sources WHERE corpus_id = ?", (corpus_id,))
+    con.commit()
+    return cur.rowcount
 
 
 def embed_batch(texts: list[str]) -> tuple[list[list[float]], str, int]:
@@ -312,10 +456,17 @@ def l2_normalize(vec: list[float]) -> list[float]:
 import hashlib  # noqa: E402
 
 
-def embed_and_cache_corpus(con: sqlite3.Connection, files: list[ScannedFile]) -> tuple[str, int]:
+def embed_and_cache_corpus(con: sqlite3.Connection, files: list[ScannedFile], corpus_id: str) -> tuple[str, int]:
     """Walk `files`, chunk each, record every (content_hash, path) occurrence
     in chunk_sources unconditionally, and embed a chunk's content only if no
-    (content_hash, model) row exists yet in `chunks`. Returns (model, dim)."""
+    (content_hash, model) row exists yet in `chunks`. Returns (model, dim).
+
+    Purges corpus_id's prior chunk_sources rows FIRST -- see
+    purge_stale_chunk_sources' own docstring for why this is required for
+    correctness, not just hygiene."""
+    n_purged = purge_stale_chunk_sources(con, corpus_id)
+    if n_purged:
+        _log("info", f"purged {n_purged} stale chunk_sources row(s) for corpus={corpus_id!r} before repopulating")
     model = EMBED_MODEL
     dim = 0
     pending_texts: list[str] = []
@@ -350,16 +501,20 @@ def embed_and_cache_corpus(con: sqlite3.Connection, files: list[ScannedFile]) ->
             os.close(fd)
         if looks_binary(buf):
             continue
-        scanned += 1
         text = buf.decode("utf-8", errors="ignore")
+        secret_rule = find_secret_pattern(text)
+        if secret_rule is not None:
+            _log("warn", f"skip secret_pattern={secret_rule} basename={os.path.basename(f.real_path)!r}")
+            continue
+        scanned += 1
         lines = text.split("\n")
         for chunk in chunk_text(lines):
             h = hashlib.sha256(chunk.text.encode("utf-8")).hexdigest()
             con.execute(
                 "INSERT OR IGNORE INTO chunk_sources "
-                "(content_sha256, source_host_path, source_mtime_ns, line_start, line_end) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (h, f.real_path, f.mtime_ns, chunk.line_start, chunk.line_end),
+                "(content_sha256, source_host_path, source_mtime_ns, line_start, line_end, corpus_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (h, f.real_path, f.mtime_ns, chunk.line_start, chunk.line_end, corpus_id),
             )
             existing = con.execute(
                 "SELECT 1 FROM chunks WHERE content_sha256 = ? AND model = ? LIMIT 1", (h, EMBED_MODEL)
@@ -398,7 +553,9 @@ def distribute_for_bot(args: tuple[str, str, str]) -> tuple[str, int]:
     rows = con.execute(
         "SELECT cs.content_sha256, cs.source_host_path, cs.source_mtime_ns, "
         "cs.line_start, cs.line_end, c.model, c.dim, c.vector, c.text "
-        "FROM chunk_sources cs JOIN chunks c ON c.content_sha256 = cs.content_sha256"
+        "FROM chunk_sources cs JOIN chunks c ON c.content_sha256 = cs.content_sha256 "
+        "WHERE cs.corpus_id = ?",
+        (corpus_id,),
     ).fetchall()
 
     entries = []
@@ -515,9 +672,12 @@ def main() -> int:
     glob_patterns, deny_dirs = load_deny_lists()
     started = time.time()
     files = walk_corpus(corpus_root, glob_patterns, deny_dirs)
+    files, n_gitignored = filter_gitignored(corpus_root, files)
+    if n_gitignored:
+        _log("info", f"gitignore filter dropped {n_gitignored} file(s)")
     con = open_cache_db()
     try:
-        embed_and_cache_corpus(con, files)
+        embed_and_cache_corpus(con, files, corpus_id)
     finally:
         con.close()
 

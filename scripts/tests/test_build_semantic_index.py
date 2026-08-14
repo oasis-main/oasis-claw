@@ -18,6 +18,8 @@ import importlib.machinery
 import importlib.util
 import os
 import shutil
+import sqlite3
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -162,6 +164,127 @@ def assert_walk_corpus_applies_the_semantic_index_extension_allowlist() -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def assert_secret_pattern_catches_aws_access_key_id() -> None:
+    assert bsi.find_secret_pattern('aws_key = "AKIAIOSFODNN7EXAMPLE"') == "aws_access_key_id"
+
+
+def assert_secret_pattern_catches_generic_assignment_like_real_my_secrets_file() -> None:
+    """A representative secrets-file layout — regression test for
+    generic_secret_assignment detection (see SECRET_PATTERNS' own comment)."""
+    text = (
+        'tradier_token = "NOTAREALTOKENEXAMPLEPLACEHOLDER0000"\n'
+        'gemini_api_key = "AQ.NOTREALEXAMPLEPLACEHOLDER_d3vjNOTAKEY"\n'
+        'bedrock_aws_secret_access_key = "wJalrXUtnFEMI/K7MDENGEXAMPLEbPxRfiCYFAKE"\n'
+    )
+    assert bsi.find_secret_pattern(text) == "generic_secret_assignment"
+
+
+def assert_secret_pattern_does_not_flag_ordinary_code() -> None:
+    text = (
+        "def get_quote(symbol: str) -> dict:\n"
+        '    return {"symbol": symbol, "price": 100.0}\n'
+        'API_BASE = "https://api.weather.oasis-x.io"\n'
+    )
+    assert bsi.find_secret_pattern(text) is None
+
+
+def assert_secret_pattern_does_not_false_positive_on_path_suffix_lookalike() -> None:
+    """kalshi_private_key_path is a PATH to a key file, not a key literal —
+    the identifier does not end in one of the tracked suffixes immediately
+    before the assignment, so this must not match."""
+    text = 'kalshi_private_key_path = "exp_pmt.txt"'
+    assert bsi.find_secret_pattern(text) is None
+
+
+def assert_filter_gitignored_respects_nested_gitignore_and_negation() -> None:
+    tmp = tempfile.mkdtemp(prefix="claw096-gitignore-test-")
+    try:
+        subprocess.run(["git", "init", "-q", tmp], check=True)
+        with open(f"{tmp}/.gitignore", "w") as f:
+            f.write("my_secrets.py\nnested/*.tfvars\n!nested/keep.tfvars\n")
+        os.makedirs(f"{tmp}/nested", exist_ok=True)
+        with open(f"{tmp}/my_secrets.py", "w") as f:
+            f.write("secret = 1")
+        with open(f"{tmp}/real_module.py", "w") as f:
+            f.write("real = 1")
+        with open(f"{tmp}/nested/real.tfvars", "w") as f:
+            f.write("x = 1")
+        with open(f"{tmp}/nested/keep.tfvars", "w") as f:
+            f.write("x = 1")
+        candidates = [
+            bsi.ScannedFile(real_path=os.path.realpath(p), mtime_ns=0)
+            for p in [
+                f"{tmp}/my_secrets.py",
+                f"{tmp}/real_module.py",
+                f"{tmp}/nested/real.tfvars",
+                f"{tmp}/nested/keep.tfvars",
+            ]
+        ]
+        kept, n_dropped = bsi.filter_gitignored(tmp, candidates)
+        kept_names = {os.path.basename(f.real_path) for f in kept}
+        assert kept_names == {"real_module.py", "keep.tfvars"}, f"got {kept_names}"
+        assert n_dropped == 2
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def assert_filter_gitignored_falls_back_when_not_a_git_repo() -> None:
+    """Not embedded in a git work tree at all -> filtering must be a no-op
+    (files pass through), never a silent "nothing is ignored" that looks
+    identical to a working, permissive result — that distinction is why
+    filter_gitignored also returns a drop count callers must log."""
+    tmp = tempfile.mkdtemp(prefix="claw096-nogit-test-")
+    try:
+        with open(f"{tmp}/module.py", "w") as f:
+            f.write("x = 1")
+        candidates = [bsi.ScannedFile(real_path=os.path.realpath(f"{tmp}/module.py"), mtime_ns=0)]
+        kept, n_dropped = bsi.filter_gitignored(tmp, candidates)
+        assert len(kept) == 1
+        assert n_dropped == 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def assert_purge_stale_chunk_sources_removes_previously_recorded_rows() -> None:
+    """Regression test for the CLAW-096 finding: filter_gitignored() and
+    find_secret_pattern() alone stop a NEW build from re-inserting an
+    excluded file, but distribute_for_bot() reads chunk_sources' full,
+    accumulated contents unconditionally -- so a row from a PRIOR build, for
+    a file the current walk no longer includes, must be actively deleted or
+    it is redistributed to every bot forever, unchanged."""
+    con = sqlite3.connect(":memory:")
+    con.execute(
+        """CREATE TABLE chunk_sources (
+             content_sha256   TEXT NOT NULL,
+             source_host_path TEXT NOT NULL,
+             source_mtime_ns  INTEGER NOT NULL,
+             line_start       INTEGER NOT NULL,
+             line_end         INTEGER NOT NULL,
+             corpus_id        TEXT NOT NULL,
+             PRIMARY KEY (content_sha256, source_host_path)
+           )"""
+    )
+    con.execute(
+        "INSERT INTO chunk_sources VALUES ('h1', '/exp/my_secrets.py', 0, 1, 1, 'exp')"
+    )
+    con.execute(
+        "INSERT INTO chunk_sources VALUES ('h2', '/exp/real_module.py', 0, 1, 1, 'exp')"
+    )
+    con.execute(
+        "INSERT INTO chunk_sources VALUES ('h3', '/oasis-x/other.py', 0, 1, 1, 'oasis-x')"
+    )
+    con.commit()
+    n_removed = bsi.purge_stale_chunk_sources(con, "exp")
+    assert n_removed == 2, f"expected 2 rows removed for corpus='exp', got {n_removed}"
+    remaining = {
+        row[0] for row in con.execute("SELECT source_host_path FROM chunk_sources").fetchall()
+    }
+    assert remaining == {"/oasis-x/other.py"}, (
+        f"purge must be scoped to the given corpus_id only -- a future second "
+        f"corpus's rows must survive a purge of 'exp', got {remaining}"
+    )
+
+
 def main() -> int:
     checks = [
         assert_chunk_text_covers_all_lines_no_gaps,
@@ -174,6 +297,13 @@ def main() -> int:
         assert_real_deny_lists_file_loads_and_matches_known_entries,
         assert_walk_corpus_excludes_vendored_venv_by_directory_name,
         assert_walk_corpus_applies_the_semantic_index_extension_allowlist,
+        assert_secret_pattern_catches_aws_access_key_id,
+        assert_secret_pattern_catches_generic_assignment_like_real_my_secrets_file,
+        assert_secret_pattern_does_not_flag_ordinary_code,
+        assert_secret_pattern_does_not_false_positive_on_path_suffix_lookalike,
+        assert_filter_gitignored_respects_nested_gitignore_and_negation,
+        assert_filter_gitignored_falls_back_when_not_a_git_repo,
+        assert_purge_stale_chunk_sources_removes_previously_recorded_rows,
     ]
     failed = 0
     for check in checks:
