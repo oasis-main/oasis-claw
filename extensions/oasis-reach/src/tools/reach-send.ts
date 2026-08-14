@@ -1,4 +1,4 @@
-import { MAIL_KINDS, MAX_BODY_CHARS, MAX_RECIPIENTS, MAX_SUBJECT_CHARS, newMessageId, validateOutbound, type MailKind, type OutboundEnvelope } from "../envelope.js";
+import { MAIL_KINDS, MAIL_PROTOCOL_VERSION, MAX_BODY_CHARS, MAX_RECIPIENTS, MAX_SUBJECT_CHARS, newMessageId, validateOutbound, type MailKind, type OutboundEnvelope } from "../envelope.js";
 import { writeOutbound, type MailboxConfig } from "../mailbox.js";
 
 function strArray(v: unknown): string[] {
@@ -48,6 +48,7 @@ export function createReachSendTool(config: ReachSendConfig) {
       args: { to?: string[]; subject?: string; body?: string; kind?: MailKind; refs?: string[]; work_items?: string[]; work_repos?: string[]; thread_id?: string } = {},
     ) {
       const env: OutboundEnvelope = {
+        v: MAIL_PROTOCOL_VERSION,
         id: newMessageId(),
         to: Array.isArray(args.to) ? args.to : [],
         kind: (args.kind && MAIL_KINDS.includes(args.kind) ? args.kind : "dm") as MailKind,

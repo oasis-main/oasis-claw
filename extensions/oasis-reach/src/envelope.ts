@@ -14,6 +14,36 @@ import { randomBytes } from "node:crypto";
 export type MailKind = "dm" | "project" | "broadcast";
 export const MAIL_KINDS: readonly MailKind[] = ["dm", "project", "broadcast"];
 
+// ── Protocol version (CLAW-088 §2.2) ──────────────────────────────────────────
+// The wire format carries its own version so it can change compatibly and so a
+// receiver can tell what it was sent. Added 2026-08-12, BEFORE any third party
+// implements against the format — adding it after that point is a breaking
+// change by definition.
+//
+// ABSENT MEANS 1. Envelopes written before this field existed are still sitting
+// in live outboxes and in every archive shard under <bot>/archive/*.jsonl[.gz].
+// A validator must therefore treat a missing `v` as version 1, not as invalid,
+// or the relay would refuse mail already in flight the moment it restarts.
+//
+// A version ABOVE what this build supports is REFUSED, not ignored: an envelope
+// from a newer protocol may carry fields with meanings this build does not know,
+// and guessing is worse than failing closed. This matches the relay's
+// default-deny posture everywhere else.
+export const MAIL_PROTOCOL_VERSION = 1;
+export const MIN_SUPPORTED_PROTOCOL_VERSION = 1;
+export const MAX_SUPPORTED_PROTOCOL_VERSION = 1;
+
+/** Version of an envelope, applying the absent-means-1 rule above. */
+export function envelopeVersion(e: unknown): number {
+  const v = (e as Record<string, unknown> | null)?.v;
+  return v === undefined ? 1 : (v as number);
+}
+
+/** True when a protocol version is an integer this build can safely process. */
+export function isSupportedProtocolVersion(v: unknown): boolean {
+  return Number.isInteger(v) && (v as number) >= MIN_SUPPORTED_PROTOCOL_VERSION && (v as number) <= MAX_SUPPORTED_PROTOCOL_VERSION;
+}
+
 // Caps — enforced by BOTH the send tool (fail fast, good error) and the relay
 // (the real gate — a bot cannot talk the relay down). Keep the two in sync.
 export const MAX_SUBJECT_CHARS = 200;
@@ -46,6 +76,9 @@ export function isRepoRef(s: unknown): s is string {
 
 /** What a bot authors and writes to its outbox. No `from` — the relay stamps it. */
 export interface OutboundEnvelope {
+  /** Protocol version. This build always writes MAIL_PROTOCOL_VERSION. Absent on
+   *  pre-2026-08-12 envelopes, which are read as version 1. */
+  v: number;
   id: string;
   to: string[];
   kind: MailKind;
@@ -88,6 +121,11 @@ export function validateOutbound(e: unknown): ValidationResult {
   const errors: string[] = [];
   const o = (e ?? {}) as Record<string, unknown>;
 
+  // Absent `v` means version 1 (see MAIL_PROTOCOL_VERSION). Present must be a
+  // supported integer — a future version fails closed rather than being guessed.
+  if (o.v !== undefined && !isSupportedProtocolVersion(o.v)) {
+    errors.push(`v: unsupported protocol version ${String(o.v)} (this build supports ${MIN_SUPPORTED_PROTOCOL_VERSION}-${MAX_SUPPORTED_PROTOCOL_VERSION})`);
+  }
   if (typeof o.id !== "string" || !/^m_[0-9a-f]{6,}$/.test(o.id)) errors.push("id: missing or malformed");
   if (!Array.isArray(o.to) || o.to.length === 0) errors.push("to: must be a non-empty array of bot keys");
   else {

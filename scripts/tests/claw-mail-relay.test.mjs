@@ -17,6 +17,13 @@ writeFileSync(
     routes: [
       { from: "house", to: "kolmogorov" },
       { from: "vanhelsing", to: "kolmogorov" },
+      // Two senders reserved for the protocol-version tests at the end of this
+      // file. They are kept separate from house/vanhelsing because the rate
+      // limiter (perSenderPerMinute: 2) is per-sender and persists across the
+      // whole file — reusing an existing sender would silently defer a send and
+      // turn a version assertion into a rate-limit failure.
+      { from: "butterbolt", to: "kolmogorov" },
+      { from: "yesman", to: "kolmogorov" },
     ],
     maxBodyChars: 100,
     rateLimit: { perSenderPerMinute: 2 },
@@ -83,5 +90,40 @@ describe("claw-mail-relay routing", () => {
     // 2 delivered, 1 still sitting in the outbox (deferred, not dropped).
     const remaining = readdirSync(join(ROOT, "vanhelsing", "outbox")).filter((f) => f.endsWith(".json") && !f.startsWith("."));
     expect(remaining).toHaveLength(1);
+  });
+});
+
+// ── Protocol version (CLAW-088 §2.2) ──────────────────────────────────────────
+// `put()` above always writes an `id` and `ts` and spreads the caller's fields,
+// so an envelope with no `v` here is exactly the pre-2026-08-12 wire format that
+// is still sitting in live outboxes and archive shards.
+describe("claw-mail-relay protocol version", () => {
+  it("accepts an envelope with NO version field (absent means 1, back-compat)", () => {
+    put("butterbolt", "m_f06001", { to: ["kolmogorov"], kind: "dm", subject: "s", body: "no v" });
+    processOnce();
+    expect(inboxFiles("kolmogorov")).toContain("butterbolt__m_f06001.json");
+  });
+
+  it("accepts v=1 and carries the version through to the delivered copy", () => {
+    put("yesman", "m_f06002", { v: 1, to: ["kolmogorov"], kind: "dm", subject: "s", body: "v1" });
+    processOnce();
+    const env = JSON.parse(readFileSync(join(ROOT, "kolmogorov", "inbox", "yesman__m_f06002.json"), "utf8"));
+    expect(env.v).toBe(1);
+    expect(env.from).toBe("yesman");
+  });
+
+  it("refuses a FUTURE protocol version rather than guessing at it", () => {
+    put("butterbolt", "m_f06003", { v: 2, to: ["kolmogorov"], kind: "dm", subject: "s", body: "from the future" });
+    processOnce();
+    expect(inboxFiles("kolmogorov")).not.toContain("butterbolt__m_f06003.json");
+    expect(existsSync(join(ROOT, "butterbolt", "refused", "m_f06003.json"))).toBe(true);
+  });
+
+  it("refuses a non-integer version", () => {
+    put("yesman", "m_f06004", { v: "1", to: ["kolmogorov"], kind: "dm", subject: "s", body: "string version" });
+    put("yesman", "m_f06005", { v: 1.5, to: ["kolmogorov"], kind: "dm", subject: "s", body: "float version" });
+    processOnce();
+    expect(existsSync(join(ROOT, "yesman", "refused", "m_f06004.json"))).toBe(true);
+    expect(existsSync(join(ROOT, "yesman", "refused", "m_f06005.json"))).toBe(true);
   });
 });

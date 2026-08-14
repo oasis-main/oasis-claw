@@ -3,7 +3,16 @@ import { gzipSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { newMessageId, validateOutbound, type MailKind } from "../envelope.js";
+import {
+  MAIL_PROTOCOL_VERSION,
+  MAX_SUPPORTED_PROTOCOL_VERSION,
+  MIN_SUPPORTED_PROTOCOL_VERSION,
+  envelopeVersion,
+  isSupportedProtocolVersion,
+  newMessageId,
+  validateOutbound,
+  type MailKind,
+} from "../envelope.js";
 import { listInbox, markAllRead, readCorpus, readMessage, threadMessages, unreadCount, writeOutbound, type MailboxConfig } from "../mailbox.js";
 
 function tempMailbox(): MailboxConfig {
@@ -55,6 +64,46 @@ describe("envelope validation", () => {
     expect(validateOutbound({ id: newMessageId(), to: ["x"], kind: "gossip", subject: "", body: "", refs: [], thread_id: "", ts: "t" }).ok).toBe(false);
     expect(validateOutbound({ id: newMessageId(), to: ["x"], kind: "dm", subject: "", body: "z".repeat(20000), refs: [], thread_id: "", ts: "t" }).ok).toBe(false);
     expect(validateOutbound({ id: newMessageId(), to: ["Not A Key"], kind: "dm", subject: "", body: "", refs: [], thread_id: "", ts: "t" }).ok).toBe(false);
+  });
+});
+
+// ── Protocol version (CLAW-088 §2.2) ──────────────────────────────────────────
+describe("envelope protocol version", () => {
+  const base = { to: ["kolmogorov"], kind: "dm" as MailKind, subject: "s", body: "b", refs: [], thread_id: "", ts: new Date().toISOString() };
+
+  it("treats an ABSENT version as 1, so pre-versioning envelopes stay valid", () => {
+    // Envelopes written before 2026-08-12 have no `v` and are still in live
+    // outboxes and in every archive shard. Rejecting them would refuse mail
+    // already in flight the moment the relay restarts.
+    const env = { id: newMessageId(), ...base };
+    expect("v" in env).toBe(false);
+    expect(envelopeVersion(env)).toBe(1);
+    expect(validateOutbound(env).ok).toBe(true);
+  });
+
+  it("accepts the version this build writes", () => {
+    const env = { v: MAIL_PROTOCOL_VERSION, id: newMessageId(), ...base };
+    expect(envelopeVersion(env)).toBe(MAIL_PROTOCOL_VERSION);
+    expect(validateOutbound(env).ok).toBe(true);
+  });
+
+  it("refuses a FUTURE version rather than guessing at unknown fields", () => {
+    const result = validateOutbound({ v: MAX_SUPPORTED_PROTOCOL_VERSION + 1, id: newMessageId(), ...base });
+    expect(result.ok).toBe(false);
+    expect(result.errors.join(" ")).toContain("unsupported protocol version");
+  });
+
+  it("refuses a non-integer version", () => {
+    for (const v of ["1", 1.5, null, {}, []]) {
+      expect(validateOutbound({ v, id: newMessageId(), ...base }).ok).toBe(false);
+    }
+  });
+
+  it("isSupportedProtocolVersion accepts only integers in the supported range", () => {
+    expect(isSupportedProtocolVersion(MAIL_PROTOCOL_VERSION)).toBe(true);
+    expect(isSupportedProtocolVersion(MIN_SUPPORTED_PROTOCOL_VERSION - 1)).toBe(false);
+    expect(isSupportedProtocolVersion(MAX_SUPPORTED_PROTOCOL_VERSION + 1)).toBe(false);
+    expect(isSupportedProtocolVersion("1")).toBe(false);
   });
 });
 
@@ -111,7 +160,7 @@ describe("mailbox round-trip", () => {
 describe("outbox write is atomic (no partial files visible to the relay)", () => {
   it("writes a .json final file and leaves no .tmp", () => {
     const cfg = tempMailbox();
-    const env = { id: newMessageId(), to: ["kolmogorov"], kind: "dm" as MailKind, subject: "s", body: "b", refs: [], work: { items: [], repos: [] }, thread_id: "", ts: new Date().toISOString() };
+    const env = { v: MAIL_PROTOCOL_VERSION, id: newMessageId(), to: ["kolmogorov"], kind: "dm" as MailKind, subject: "s", body: "b", refs: [], work: { items: [], repos: [] }, thread_id: "", ts: new Date().toISOString() };
     writeOutbound(cfg, env);
     const files = readdirSync(join(cfg.mailDir, "outbox"));
     expect(files).toContain(`${env.id}.json`);
