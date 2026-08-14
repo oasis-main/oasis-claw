@@ -1,0 +1,33 @@
+{
+  "denyGlobs": [
+    "*.pem",
+    "id_*",
+    "*.key",
+    "*_rsa",
+    "*_ed25519",
+    ".env*",
+    "*.env",
+    "credentials",
+    "*.p12",
+    "*.pfx",
+    "*.keystore",
+    "auth-profiles.json",
+    ".gateway-token"
+  ],
+  "denyDirs": [
+    "pliny",
+    ".git",
+    "node_modules",
+    ".venv",
+    "venv",
+    "exp_venv",
+    "__pycache__",
+    "dist",
+    "build",
+    ".next",
+    ".cache",
+    "External Reference Repos",
+    ".claw-mail",
+    "secrets"
+  ]
+}

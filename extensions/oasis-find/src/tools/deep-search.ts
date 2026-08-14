@@ -1,5 +1,6 @@
 import fs from "node:fs";
-import { globToRegExp, resolveInsideRoots, walkFiles, looksBinary, type SearchConfig } from "../search.js";
+import { globToRegExp, resolveInsideRoots, walkFiles, looksBinary, safeReadFileSync, type SearchConfig } from "../search.js";
+import { getCurrentIndex, topK, type LoadedIndex } from "../semantic-index.js";
 
 /**
  * deep_search — ask a QUESTION of the filesystem and get the passages that
@@ -43,11 +44,21 @@ import { globToRegExp, resolveInsideRoots, walkFiles, looksBinary, type SearchCo
 
 const SEMANTICS_URL = (process.env.OASIS_SEMANTICS_URL ?? "http://oasis-semantics:8732").replace(/\/+$/, "");
 const RERANK_TIMEOUT_MS = 30_000;
+const EMBED_TIMEOUT_MS = 30_000;
+
+// CLAW-094: the single corpus scripts/build-semantic-index.py currently
+// builds. Hardcoded rather than read from the manifest, because a bot's
+// deep_search tool has exactly one mounted semantic-index directory today —
+// promote this to a parameter if a second corpus (e.g. oasis-x) ever ships.
+export const SEMANTIC_INDEX_CORPUS = "exp";
 
 // Capped so one call cannot stall a turn. The cross-encoder is ~0.13s for 5
 // passages warm, and scales with the pool, so this bounds it to a couple of
 // seconds. Recall is still much wider than the returned limit.
 const MAX_CHUNKS_TO_RANK = 60;
+// Bounds the freshness top-up's live file re-reads (design section 5) to the
+// same order of magnitude as lexical recall's own per-call file-read cost.
+const MAX_STALE_TOPUPS = MAX_CHUNKS_TO_RANK;
 const CONTEXT_LINES = 4;
 // bge-base truncates the CONCATENATED query+passage at 512 tokens, so an
 // over-long passage silently loses its tail. ~1200 chars keeps a passage
@@ -92,7 +103,14 @@ export function recallPattern(terms: string[]): RegExp | null {
   return new RegExp(escaped.join("|"), "i");
 }
 
-export type Passage = { path: string; line: number; text: string; hits: number };
+export type Passage = {
+  path: string;
+  line: number;
+  text: string;
+  hits: number;
+  source: "lexical" | "semantic";
+  staleReindexUsed?: boolean;
+};
 
 /**
  * Widen matched line numbers into passages, merging neighbours. Two hits four
@@ -113,7 +131,7 @@ export function buildPassages(lines: string[], hitLines: number[], filePath: str
     const end = Math.min(lines.length, group[group.length - 1] + CONTEXT_LINES);
     let text = lines.slice(start, end).join("\n").trim();
     if (text.length > MAX_CHUNK_CHARS) text = `${text.slice(0, MAX_CHUNK_CHARS)}…`;
-    return { path: filePath, line: group[0], text, hits: group.length };
+    return { path: filePath, line: group[0], text, hits: group.length, source: "lexical" as const };
   });
 }
 
@@ -141,8 +159,163 @@ async function rerank(
   }
 }
 
+/**
+ * Embed the query text via the shared oasis-semantics sidecar. This is the
+ * ONLY thing sent over the network for stage 1.5's recall step — the caller's
+ * own question, nothing else. See design section 6's "confirmation that no
+ * network call can carry or leak another bot's content" — the sidecar has no
+ * authentication and no per-caller state, and it never receives a file path,
+ * a directory listing, or any per-bot identity; it only ever scores whatever
+ * text this call includes in its own request body.
+ */
+async function embedQuery(question: string, model: string): Promise<Float32Array | null> {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), EMBED_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${SEMANTICS_URL}/api/embed`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model, input: question }),
+      signal: ac.signal,
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { embeddings?: number[][] };
+    const raw = data.embeddings?.[0];
+    if (!raw || raw.length === 0) return null;
+    return l2Normalize(raw);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function l2Normalize(vec: number[]): Float32Array {
+  let sumSq = 0;
+  for (const x of vec) sumSq += x * x;
+  const norm = Math.sqrt(sumSq);
+  const out = new Float32Array(vec.length);
+  if (norm === 0) return out;
+  for (let i = 0; i < vec.length; i++) out[i] = vec[i] / norm;
+  return out;
+}
+
+/**
+ * Stage 1.5 — semantic recall (design section 6). Reads the bot's OWN
+ * bind-mounted index file locally (getCurrentIndex/topK — no network for
+ * this part), embeds the question over the network, and returns candidate
+ * passages already translated to the bot's own container path convention
+ * (baked in at build time — see semantic-index.ts / build-semantic-index.py).
+ *
+ * Freshness: for each candidate, compares its stored source_mtime_ns against
+ * a live fs.statSync of the SAME path already inside this bot's own mounted
+ * reach — no new authorization decision, since the bot could already read
+ * that path directly. If the file changed, the stored TEXT is stale but the
+ * LOCATION is still correct, so this re-reads the live file and rebuilds the
+ * passage from the same line range rather than dropping it. Bounded to
+ * MAX_STALE_TOPUPS extra small reads per call, the same order of magnitude
+ * lexical recall already costs.
+ */
+async function semanticRecall(
+  index: LoadedIndex,
+  question: string,
+  searchConfig: SearchConfig,
+): Promise<Passage[]> {
+  const queryVector = await embedQuery(question, index.model);
+  if (queryVector === null) return [];
+
+  const candidates = topK(index, queryVector, MAX_CHUNKS_TO_RANK);
+  const passages: Passage[] = [];
+  let toppedUp = 0;
+  for (const c of candidates) {
+    // Defensive re-check (design section 6). What this DOES protect: a query-
+    // time bug in candidate selection returning something outside this bot's
+    // CURRENTLY-live roots (e.g. a role.yaml narrowing that has not yet
+    // reached a rebuild). What it does NOT protect: a build-time mistake that
+    // already wrote unauthorized content into this bot's OWN meta.jsonl file
+    // — that file was delivered wholesale by the bind mount, and anything
+    // with ordinary read access inside this container can already read it
+    // directly, independent of this tool's own code path. The build's own
+    // required self-test (nested-shield exclusion) and the scheduled drift
+    // check are what bound THAT risk; this check is not a substitute for them.
+    if (!resolveInsideRoots(c.meta.path, searchConfig.roots)) continue;
+
+    let text = c.meta.text;
+    let stale = false;
+    if (toppedUp < MAX_STALE_TOPUPS) {
+      try {
+        const st = fs.statSync(c.meta.path);
+        const liveMtimeNs = Math.round(st.mtimeMs * 1_000_000);
+        if (liveMtimeNs > c.meta.source_mtime_ns) {
+          const buf = safeReadFileSync(c.meta.path);
+          if (buf === null) continue; // race/removed since the stat -> skip, never trust
+          const lines = buf.toString("utf8").split("\n");
+          const start = Math.max(0, c.meta.line_start - 1);
+          const end = Math.min(lines.length, c.meta.line_end);
+          text = lines.slice(start, end).join("\n");
+          stale = true;
+          toppedUp += 1;
+        }
+      } catch {
+        continue; // file no longer exists -> drop the chunk silently (design section 5)
+      }
+    }
+
+    passages.push({
+      path: c.meta.path,
+      line: c.meta.line_start,
+      text,
+      hits: 0,
+      source: "semantic",
+      staleReindexUsed: stale || undefined,
+    });
+  }
+  return passages;
+}
+
+/**
+ * Merge lexical and semantic passages, deduplicated by (path, line) — the
+ * same passage found by both stages is kept once, as lexical (arbitrary but
+ * deterministic; the two stages rarely disagree on the text for an identical
+ * path+line). Truncation to `cap` is INTERLEAVED, not a plain slice: a plain
+ * slice after lexical-then-semantic concatenation would let a lexical pool
+ * that alone fills `cap` crowd out every semantic candidate before the
+ * reranker ever sees one — defeating the reason semantic recall exists.
+ */
+export function mergeAndDedupe(lexical: Passage[], semantic: Passage[], cap: number): Passage[] {
+  const seen = new Set<string>();
+  const dedupedLexical: Passage[] = [];
+  const dedupedSemantic: Passage[] = [];
+  for (const p of lexical) {
+    const key = `${p.path}::${p.line}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    dedupedLexical.push(p);
+  }
+  for (const p of semantic) {
+    const key = `${p.path}::${p.line}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    dedupedSemantic.push(p);
+  }
+  const merged: Passage[] = [];
+  let i = 0;
+  let j = 0;
+  while (merged.length < cap && (i < dedupedLexical.length || j < dedupedSemantic.length)) {
+    if (i < dedupedLexical.length) merged.push(dedupedLexical[i++]);
+    if (merged.length >= cap) break;
+    if (j < dedupedSemantic.length) merged.push(dedupedSemantic[j++]);
+  }
+  return merged;
+}
+
 export interface DeepSearchConfig {
   search: SearchConfig;
+  /** Absolute container-path directory a bind mount delivered this bot's own
+   * pre-built semantic index into (design section 3's /reach/semantic-index).
+   * Undefined disables stage 1.5 entirely — deep_search then runs exactly as
+   * it did before CLAW-094, lexical-recall-and-rerank only. */
+  semanticIndexDir?: string;
 }
 
 export function createDeepSearchTool(config: DeepSearchConfig) {
@@ -153,6 +326,10 @@ export function createDeepSearchTool(config: DeepSearchConfig) {
       "USE THIS WHEN YOU DO NOT KNOW THE NAME OF THE THING — 'what already closes an option position', " +
       "'where is the deploy path defined', 'do we handle rate limits anywhere'. It finds capabilities you " +
       "cannot guess the identifier for, which is exactly what fs_grep cannot do. " +
+      "Where available, this combines LEXICAL recall (exact word matches) with true SEMANTIC recall (vector " +
+      "similarity over a pre-built index of your own reach) before reranking — semantic recall can surface a " +
+      "passage that shares NO vocabulary with your question, which lexical recall alone would miss entirely. " +
+      "Each returned passage is tagged source:'lexical'|'semantic' so you can tell which found it. " +
       "Prefer fs_grep when you DO know the exact string (a ticket id, a function name, an error message) — " +
       "it is faster and exact. Prefer memory_search for your own notes and prior conversations; note that " +
       "memory_search only covers indexed markdown, while this searches every file you can reach, including code. " +
@@ -192,12 +369,12 @@ export function createDeepSearchTool(config: DeepSearchConfig) {
       }
       const terms = queryTerms(question);
       const pattern = recallPattern(terms);
-      if (!pattern) {
-        return json({
-          error: "no searchable terms in that question — every word was a stopword",
-          hint: "include a distinctive noun or verb, e.g. a subsystem or action name",
-        });
-      }
+      // NOTE (CLAW-094): a `!pattern` question (entirely stopwords, e.g. "how
+      // do we do it") used to hard-error here, which — before semantic recall
+      // existed — meant NO recall was possible at all. It still means lexical
+      // recall cannot run (there is no term to grep for), but semantic
+      // recall needs no terms, only the raw question text, so it is NOT
+      // skipped below merely because `pattern` is null.
       if (args.subpath && !resolveInsideRoots(args.subpath, config.search.roots)) {
         return json({
           error: `subpath is outside your reach or does not exist: ${args.subpath}`,
@@ -207,63 +384,88 @@ export function createDeepSearchTool(config: DeepSearchConfig) {
       const limit = Math.max(1, Math.min(Number(args.limit) || 8, 20));
       const includeRe = args.include ? globToRegExp(args.include) : null;
 
-      const walk = walkFiles(config.search, {
-        subpath: args.subpath,
-        accept: (_abs, basename) => (includeRe ? includeRe.test(basename) : true),
-      });
-
-      // Recall pass. Read each file ONCE and collect hit line numbers, rather
-      // than reusing grepFiles — passages need the surrounding lines, which a
-      // flat match list has already thrown away.
-      const passages: Passage[] = [];
+      // ── Stage 1: lexical recall (existing, unchanged in mechanism) ──────
+      let lexicalPassages: Passage[] = [];
+      let filesScanned = 0;
       let filesWithMatches = 0;
       let truncated = false;
-      for (const file of walk.files) {
-        if (passages.length >= MAX_CHUNKS_TO_RANK) {
-          truncated = true;
-          break;
+      if (pattern) {
+        const walk = walkFiles(config.search, {
+          subpath: args.subpath,
+          accept: (_abs, basename) => (includeRe ? includeRe.test(basename) : true),
+        });
+        filesScanned = walk.scanned;
+        // Read each file ONCE and collect hit line numbers, rather than
+        // reusing grepFiles — passages need the surrounding lines, which a
+        // flat match list has already thrown away.
+        for (const file of walk.files) {
+          if (lexicalPassages.length >= MAX_CHUNKS_TO_RANK) {
+            truncated = true;
+            break;
+          }
+          if (file.bytes > config.search.maxFileBytes) continue;
+          // safeReadFileSync (CLAW-094): O_NOFOLLOW + fstat/lstat inode check —
+          // walkFiles' scan-time symlink check alone leaves a TOCTOU window a
+          // write-capable bot could race. See search.ts's doc comment.
+          const buf = safeReadFileSync(file.path);
+          if (buf === null) continue;
+          if (looksBinary(buf)) continue;
+          const lines = buf.toString("utf8").split("\n");
+          const hits: number[] = [];
+          for (let i = 0; i < lines.length; i += 1) {
+            pattern.lastIndex = 0;
+            if (pattern.test(lines[i])) hits.push(i + 1);
+            if (hits.length >= config.search.maxMatchesPerFile) break;
+          }
+          if (hits.length === 0) continue;
+          filesWithMatches += 1;
+          lexicalPassages.push(...buildPassages(lines, hits, file.path));
         }
-        if (file.bytes > config.search.maxFileBytes) continue;
-        let buf: Buffer;
-        try {
-          buf = fs.readFileSync(file.path);
-        } catch {
-          continue;
-        }
-        if (looksBinary(buf)) continue;
-        const lines = buf.toString("utf8").split("\n");
-        const hits: number[] = [];
-        for (let i = 0; i < lines.length; i += 1) {
-          pattern.lastIndex = 0;
-          if (pattern.test(lines[i])) hits.push(i + 1);
-          if (hits.length >= config.search.maxMatchesPerFile) break;
-        }
-        if (hits.length === 0) continue;
-        filesWithMatches += 1;
-        passages.push(...buildPassages(lines, hits, file.path));
       }
 
-      if (passages.length === 0) {
+      // ── Stage 1.5: semantic recall (new, CLAW-094) ───────────────────────
+      let semanticPassages: Passage[] = [];
+      let semanticIndexAgeHours: number | undefined;
+      if (config.semanticIndexDir) {
+        const index = getCurrentIndex(config.semanticIndexDir, SEMANTIC_INDEX_CORPUS);
+        if (index) {
+          semanticIndexAgeHours = (Date.now() - new Date(index.builtAt).getTime()) / 3_600_000;
+          let raw = await semanticRecall(index, question, config.search);
+          if (args.subpath) raw = raw.filter((p) => p.path.startsWith(args.subpath as string));
+          if (includeRe) raw = raw.filter((p) => includeRe.test(p.path.split("/").pop() ?? ""));
+          semanticPassages = raw;
+        }
+      }
+
+      const pool = mergeAndDedupe(lexicalPassages, semanticPassages, MAX_CHUNKS_TO_RANK);
+
+      if (pool.length === 0) {
         return json({
           question,
           terms,
-          files_scanned: walk.scanned,
+          files_scanned: filesScanned,
+          semantic_index_age_hours: semanticIndexAgeHours === undefined ? undefined : Number(semanticIndexAgeHours.toFixed(1)),
           passages: [],
-          hint: "no file contained any of those terms — try different wording, or fs_glob to confirm the files are in reach",
+          hint: pattern
+            ? "no file contained any of those terms and semantic recall found nothing close enough — try different wording, or fs_glob to confirm the files are in reach"
+            : "every word in that question was a stopword, and semantic recall found nothing — include a distinctive noun or verb, e.g. a subsystem or action name",
         });
       }
 
-      const pool = passages.slice(0, MAX_CHUNKS_TO_RANK);
       const { order, error } = await rerank(question, pool);
 
       let ranked: { passage: Passage; score: number | null }[];
       let ranking: string;
       if (order.length > 0) {
         ranked = order.map((r) => ({ passage: pool[r.index], score: r.score })).filter((r) => r.passage);
-        ranking = "cross-encoder (oasis-semantics bge-base)";
+        ranking = semanticPassages.length > 0
+          ? "cross-encoder (oasis-semantics bge-base) over lexical + semantic candidates"
+          : "cross-encoder (oasis-semantics bge-base)";
       } else {
         // Lexical fallback — more distinct hits first. Worse than the model,
         // and far better than returning nothing because a sidecar is down.
+        // Semantic candidates carry hits:0, so they sort after any lexical
+        // hit but are still returned rather than dropped.
         ranked = [...pool].sort((a, b) => b.hits - a.hits).map((p) => ({ passage: p, score: null }));
         ranking = `lexical fallback (rerank unavailable: ${error ?? "unknown"})`;
       }
@@ -272,10 +474,11 @@ export function createDeepSearchTool(config: DeepSearchConfig) {
         question,
         terms,
         ranking,
-        files_scanned: walk.scanned,
+        files_scanned: filesScanned,
         files_with_matches: filesWithMatches,
         passages_considered: pool.length,
         truncated_recall: truncated || undefined,
+        semantic_index_age_hours: semanticIndexAgeHours === undefined ? undefined : Number(semanticIndexAgeHours.toFixed(1)),
         // Absolute scores are low for code even when the order is right; the
         // model is trained on prose. Read the ORDER, not the number.
         passages: ranked.slice(0, limit).map((r) => ({
@@ -283,6 +486,8 @@ export function createDeepSearchTool(config: DeepSearchConfig) {
           line: r.passage.line,
           score: r.score === null ? null : Number(r.score.toFixed(4)),
           text: r.passage.text,
+          source: r.passage.source,
+          stale_reindex_used: r.passage.staleReindexUsed || undefined,
         })),
       });
     },

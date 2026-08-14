@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import denyLists from "./deny-lists.json" with { type: "json" };
 
 /**
  * Filesystem search core for oasis-find (CLAW-082 phase 3).
@@ -28,22 +29,16 @@ export type SearchConfig = {
   maxScannedFiles: number;
 };
 
-/** Mirrors reviewer-policy.json hard.fleet.denyReadGlobs, plus dotfile creds. */
-export const DEFAULT_DENY_GLOBS = [
-  "*.pem",
-  "id_*",
-  "*.key",
-  "*_rsa",
-  "*_ed25519",
-  ".env*",
-  "*.env",
-  "credentials",
-  "*.p12",
-  "*.pfx",
-  "*.keystore",
-  "auth-profiles.json",
-  ".gateway-token",
-];
+/**
+ * Mirrors reviewer-policy.json hard.fleet.denyReadGlobs, plus dotfile creds.
+ * SINGLE SOURCE (CLAW-094): lives in ./deny-lists.json, not here, because the
+ * containment research for the semantic-index project found this list had
+ * already drifted from reviewer-policy.json's own copy (13 entries vs 7) with
+ * no shared source. scripts/build-semantic-index.py reads the same JSON file,
+ * so "same list" is now a structural fact for the new index too, not a third
+ * independent copy repeating the same drift a second time.
+ */
+export const DEFAULT_DENY_GLOBS = denyLists.denyGlobs;
 
 /**
  * Directories skipped outright. `pliny` is NOT hygiene — reviewer-policy.json
@@ -51,22 +46,15 @@ export const DEFAULT_DENY_GLOBS = [
  * forbids reading around in it; a content grep is precisely "reading around".
  * The rest are noise that would drown a result set: the oasis-hardware tree
  * alone holds 21,836 markdown files under "External Reference Repos".
+ * `exp_venv` (CLAW-094): a real gap this list had — `.venv`/`venv` did not
+ * catch it, so the trading repo's own vendored virtualenv was reachable
+ * through fs_grep/fs_glob/deep_search. Discovered building the semantic
+ * index: of 22,360 `.py` files walk_corpus found under /reach/exp, 21,041
+ * (94%) were vendored pyarrow/etc. library source under
+ * exp_venv/lib/python3.12/site-packages/, not this project's own code.
+ * SINGLE SOURCE (CLAW-094): see DEFAULT_DENY_GLOBS above.
  */
-export const DEFAULT_DENY_DIRS = [
-  "pliny",
-  ".git",
-  "node_modules",
-  ".venv",
-  "venv",
-  "__pycache__",
-  "dist",
-  "build",
-  ".next",
-  ".cache",
-  "External Reference Repos",
-  ".claw-mail",
-  "secrets",
-];
+export const DEFAULT_DENY_DIRS = denyLists.denyDirs;
 
 export const DEFAULT_SEARCH_LIMITS = {
   maxResults: 100,
@@ -209,6 +197,51 @@ export function looksBinary(buf: Buffer): boolean {
   return false;
 }
 
+/**
+ * TOCTOU-safe file read (CLAW-094 finding 3, round 2). `walkFiles` above checks
+ * `entry.isFile()` at SCAN time — a dirent-type check that does not follow
+ * symlinks — but this function used to reopen the path fresh with a plain
+ * `fs.readFileSync`, which DOES follow a symlink, with no verification that
+ * the thing it just opened is still the same file the scan approved. Between
+ * those two points a bot with write access to its own reach could delete the
+ * approved file and put a symlink in its place, pointing outside that bot's
+ * own reach — the more-privileged process reading it (relevant for the
+ * semantic-index builder, which runs host-side with broader access than any
+ * single bot) would then read and return content the caller was never
+ * authorized to see, under an innocent, already-approved filename.
+ *
+ * `O_NOFOLLOW` rejects the open outright (ELOOP) if the path is a symlink at
+ * open time — never a fallback to a following open. The `fstat(fd)` vs.
+ * `lstat(path)` comparison additionally catches a same-type swap (a regular
+ * file replaced by a DIFFERENT regular file between the check and the open),
+ * which `O_NOFOLLOW` alone would not catch, by requiring the opened
+ * descriptor's device and inode to match what the pre-open `lstat` saw.
+ */
+export function safeReadFileSync(filePath: string): Buffer | null {
+  let pre: fs.Stats;
+  try {
+    pre = fs.lstatSync(filePath);
+  } catch {
+    return null;
+  }
+  let fd: number;
+  try {
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ELOOP") return null; // became a symlink -> skip, never follow
+    return null;
+  }
+  try {
+    const post = fs.fstatSync(fd);
+    if (post.dev !== pre.dev || post.ino !== pre.ino) return null; // swapped between check and open -> skip, never trust
+    return fs.readFileSync(fd);
+  } catch {
+    return null;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 export type GrepMatch = { path: string; line: number; text: string };
 
 export function grepFiles(
@@ -226,12 +259,8 @@ export function grepFiles(
       break;
     }
     if (file.bytes > config.maxFileBytes) continue;
-    let buf: Buffer;
-    try {
-      buf = fs.readFileSync(file.path);
-    } catch {
-      continue;
-    }
+    const buf = safeReadFileSync(file.path);
+    if (buf === null) continue;
     if (looksBinary(buf)) continue;
     const lines = buf.toString("utf8").split("\n");
     let perFile = 0;

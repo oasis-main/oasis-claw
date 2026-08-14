@@ -137,6 +137,16 @@ services:
       OASIS_SEMANTICS_DEFAULT_MM_MODEL: clip-lite
       OASIS_SEMANTICS_SKIP_WARMUP: "1"
       HF_HOME: /srv/weights/huggingface
+    # CLAW-094: scripts/build-semantic-index.py runs on the HOST (the same
+    # trusted context compile-role.py already requires, since it reads every
+    # bot's role.yaml and the raw corpus off the host filesystem) and calls
+    # this sidecar's /api/embed directly. "oasis-semantics:8732" is a
+    # Docker-internal DNS name — it does not resolve from the host's own
+    # network namespace. Loopback-only, matching every other published port in
+    # this file (18789, 18790-18796) — never 0.0.0.0, this stays unreachable
+    # from outside the host.
+    ports:
+      - "127.0.0.1:8732:8732"
     volumes:
       - oasis_semantics_weights:/srv/weights
     networks:

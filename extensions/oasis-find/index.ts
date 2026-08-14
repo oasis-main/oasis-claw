@@ -7,7 +7,7 @@ import {
   DEFAULT_SEARCH_LIMITS,
   type SearchConfig,
 } from "./src/search.js";
-import { createDeepSearchTool } from "./src/tools/deep-search.js";
+import { createDeepSearchTool, SEMANTIC_INDEX_CORPUS } from "./src/tools/deep-search.js";
 import { createFsGlobTool } from "./src/tools/fs-glob.js";
 import { createFsGrepTool } from "./src/tools/fs-grep.js";
 import { createFsHelpTool } from "./src/tools/fs-help.js";
@@ -75,16 +75,45 @@ const plugin = {
       maxScannedFiles: cfg.maxScannedFiles ?? DEFAULT_SEARCH_LIMITS.maxScannedFiles,
     };
 
+    // OASIS_SEMANTIC_INDEX_DIR (CLAW-094): the container path a bind mount
+    // delivers THIS bot's own pre-built semantic index into — set only for
+    // bots with a real, authorized index file (see bots/house/role.yaml,
+    // bots/yesman/role.yaml). Validated ONCE here, same pattern as
+    // OASIS_FIND_ROOTS above: a directory that does not exist, or a manifest
+    // that does not parse, must not leave the tool registered-but-broken —
+    // it disables the semantic-recall STAGE only; deep_search itself still
+    // registers and runs lexical-only, exactly as it did before this existed.
+    const semanticIndexDirEnv = (process.env.OASIS_SEMANTIC_INDEX_DIR ?? "").trim();
+    let semanticIndexDir: string | undefined;
+    if (semanticIndexDirEnv) {
+      try {
+        if (fs.statSync(semanticIndexDirEnv).isDirectory()) {
+          const manifestPath = `${semanticIndexDirEnv}/${SEMANTIC_INDEX_CORPUS}.manifest.json`;
+          JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+          semanticIndexDir = semanticIndexDirEnv;
+        }
+      } catch {
+        // directory missing, manifest missing, or manifest does not parse ->
+        // semanticIndexDir stays undefined, deep_search runs lexical-only.
+      }
+    }
+
     api.registerTool(createFsGlobTool({ search }), { name: "fs_glob" });
     api.registerTool(createFsGrepTool({ search }), { name: "fs_grep" });
     api.registerTool(createFsHelpTool({ roots }), { name: "fs_help" });
-    // deep_search (CLAW-092): lexical recall + cross-encoder rerank. Registered
-    // as a TOOL on purpose — additive, so it sits beside memory_search rather
-    // than displacing it. The alternative hook, registerMemoryRuntime, is a
-    // single-occupancy slot memory-core already holds.
-    api.registerTool(createDeepSearchTool({ search }), { name: "deep_search" });
+    // deep_search (CLAW-092, +CLAW-094 semantic recall): lexical recall (+
+    // semantic recall when semanticIndexDir validates) + cross-encoder
+    // rerank. Registered as a TOOL on purpose — additive, so it sits beside
+    // memory_search rather than displacing it. The alternative hook,
+    // registerMemoryRuntime, is a single-occupancy slot memory-core already
+    // holds.
+    api.registerTool(createDeepSearchTool({ search, semanticIndexDir }), { name: "deep_search" });
 
-    api.logger.info("oasis-find plugin loaded", { roots, denyDirs: search.denyDirs.length });
+    api.logger.info("oasis-find plugin loaded", {
+      roots,
+      denyDirs: search.denyDirs.length,
+      semanticIndex: semanticIndexDir ? "enabled" : semanticIndexDirEnv ? "configured but invalid" : "not configured",
+    });
   },
 };
 

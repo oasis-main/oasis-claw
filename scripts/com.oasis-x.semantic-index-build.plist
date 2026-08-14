@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  semantic-index-build — nightly rebuild of the per-bot semantic search index
+  (CLAW-094). See scripts/build-semantic-index.py for the full mechanism.
+
+  ██ THIS JOB DELIBERATELY BREAKS THE "RELOCATE OUTSIDE ~/Documents" ██
+  ██ CONVENTION EVERY OTHER PLIST HERE FOLLOWS — READ BEFORE EDITING  ██
+  Every other launchd job in this repo (nimbus-watchdog, claw-mail-waker,
+  claw-stuck-lanes) relocates its SCRIPT outside ~/Documents, because macOS
+  TCC blocks launchd from directly exec-ing a script that lives inside
+  ~/Documents (exit 126, "Operation not permitted"). That fix does not apply
+  here: this script's entire JOB is reading role.yaml files and the real
+  corpus tree inside ~/Documents/Runes via its own file I/O — relocating a
+  COPY of just this one file would leave it unable to find
+  scripts/lib/semantic_index_authz.py, extensions/oasis-find/src/
+  deny-lists.json, scripts/compile-role.py, or bots/*/role.yaml, all resolved
+  relative to its own real location. Maintaining a second, synced copy of that
+  whole tree outside the repo is the exact drift risk this project spent three
+  design rounds eliminating elsewhere (CLAW-094's single-source deny-lists.json
+  fix) — not something to reintroduce here for a launchd technicality.
+
+  So ProgramArguments points DIRECTLY at the real repo path, with python3
+  (not a shell script) as the executable — confirmed live (2026-08-13) that
+  THIS shape clears the launchd-exec gate (it is python3 being exec'd, and
+  python3 does not live under Documents; the .py path is merely an argument
+  python3 opens itself). What remains is a SEPARATE gate: python3's own file
+  I/O into ~/Documents also needs a TCC grant, confirmed blocked without one
+  (`PermissionError: Operation not permitted` reading a real role.yaml from a
+  python3 process launched this same way). FIX (Mike must do this — modifying
+  system security settings is out of scope for an agent to do on your
+  behalf): System Settings → Privacy & Security → Full Disk Access → "+" →
+  navigate to /Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12
+  (confirm this still matches `python3 -c "import sys; print(sys.executable)"`
+  before granting — a Python upgrade can change this path).
+
+  Until that grant exists, this job loads and fires on schedule but FAILS
+  SILENTLY every run, logging a PermissionError to build-semantic-index.log —
+  check that log after installing, before assuming this works. Until then,
+  run scripts/build-semantic-index.py BY HAND from an ordinary terminal
+  (which already has Documents access) — that is how the first production
+  index was actually built.
+
+  `make semantic-index-build-install` deploys ONLY this plist (there is no
+  script copy to keep in sync — the repo file is the one and only source).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.oasis-x.semantic-index-build</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12</string>
+        <string>/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/scripts/build-semantic-index.py</string>
+        <string>--corpus</string>
+        <string>exp</string>
+    </array>
+
+    <!-- Fixed daily local time, not a rolling interval — StartInterval would
+         make "next index at XX:XX" (the operator's own phrasing for this
+         feature) meaningless. 03:00 is a placeholder; confirm with Mike. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/Michaellee</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/Michaellee/Library/Logs/semantic-index-build.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/Michaellee/Library/Logs/semantic-index-build.stderr.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

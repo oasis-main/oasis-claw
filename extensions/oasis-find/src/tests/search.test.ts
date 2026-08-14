@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_DENY_DIRS,
   DEFAULT_DENY_GLOBS,
@@ -11,6 +11,7 @@ import {
   isDenied,
   looksBinary,
   resolveInsideRoots,
+  safeReadFileSync,
   walkFiles,
   type SearchConfig,
 } from "../search.js";
@@ -233,6 +234,59 @@ describe("grepFiles", () => {
     const { matches, truncated } = grepFiles(cfg({ maxResults: 4 }), files, /needle/);
     expect(matches).toHaveLength(4);
     expect(truncated).toBe(true);
+  });
+});
+
+// CLAW-094 finding 3 (round 2, HIGH severity): walkFiles' scan-time
+// entry.isFile() check does not follow symlinks, but the OLD grepFiles
+// reopened each accepted path with a plain fs.readFileSync, which DOES follow
+// a symlink, with no reverification against the scan-time check. A
+// write-capable bot could race a delete-and-symlink swap in that window.
+// safeReadFileSync closes it: O_NOFOLLOW rejects an open on a live symlink
+// outright (ELOOP), and comparing fstat(fd) against a pre-open lstat(path)
+// additionally catches a same-type swap (a DIFFERENT regular file dropped at
+// the identical path), which O_NOFOLLOW alone would not catch.
+describe("safeReadFileSync — TOCTOU-safe open", () => {
+  it("reads an ordinary file normally", () => {
+    const p = write("plain.md", "hello world");
+    expect(safeReadFileSync(p)?.toString("utf8")).toBe("hello world");
+  });
+
+  it("refuses a symlink outright — never follows it", () => {
+    const real = write("secret.md", "top secret");
+    const linkPath = path.join(root, "link.md");
+    fs.symlinkSync(real, linkPath);
+    expect(safeReadFileSync(linkPath)).toBeNull();
+  });
+
+  it("catches a same-type swap raced BETWEEN its own lstat and its own open", () => {
+    // The race safeReadFileSync defends against happens strictly between its
+    // OWN two internal syscalls — a real concurrent race is inherently
+    // non-deterministic to unit test, so this pins the exact window instead:
+    // spy on lstatSync (the first thing safeReadFileSync does) and swap the
+    // file's content — via unlink+rename, so the inode genuinely changes —
+    // before returning, simulating an attacker who wins the race every time.
+    const target = write("swap-target.md", "original content");
+    write("swap-source.md", "attacker content");
+    const source = path.join(root, "swap-source.md");
+    const originalLstat = fs.lstatSync;
+    const spy = vi.spyOn(fs, "lstatSync").mockImplementationOnce((p, ...rest) => {
+      const result = originalLstat(p, ...(rest as []));
+      fs.rmSync(target);
+      fs.renameSync(source, target); // target's inode is now source's inode
+      return result; // safeReadFileSync's `pre` reflects the OLD (pre-swap) file
+    });
+    try {
+      // safeReadFileSync's own open() now returns the swapped file's fd, whose
+      // fstat() must NOT match the `pre` lstat result captured before the swap.
+      expect(safeReadFileSync(target)).toBeNull();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("returns null for a nonexistent path instead of throwing", () => {
+    expect(safeReadFileSync(path.join(root, "does-not-exist.md"))).toBeNull();
   });
 });
 

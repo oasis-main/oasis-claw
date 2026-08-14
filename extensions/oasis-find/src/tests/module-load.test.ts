@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { createDeepSearchTool } from "../tools/deep-search.js";
 import { createFsGlobTool } from "../tools/fs-glob.js";
 import { createFsGrepTool } from "../tools/fs-grep.js";
 import { createFsHelpTool } from "../tools/fs-help.js";
@@ -38,6 +39,7 @@ describe("module load + manifest contract", () => {
       createFsGlobTool({ search }),
       createFsGrepTool({ search }),
       createFsHelpTool({ roots: search.roots }),
+      createDeepSearchTool({ search }),
     ];
     for (const tool of tools) {
       expect(typeof tool.name).toBe("string");
@@ -55,6 +57,7 @@ describe("module load + manifest contract", () => {
       createFsGlobTool({ search }).name,
       createFsGrepTool({ search }).name,
       createFsHelpTool({ roots: search.roots }).name,
+      createDeepSearchTool({ search }).name,
     ].sort();
     expect([...manifest.contracts.tools].sort()).toEqual(registered);
   });

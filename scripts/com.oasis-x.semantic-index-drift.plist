@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  semantic-index-drift — hourly check for a bot whose role.yaml has narrowed
+  since its semantic index was last built (CLAW-094). See
+  scripts/check-semantic-index-drift.py for the full mechanism. This is the
+  enforcement half of the bound the design places on the rejected first
+  design's second HIGH-severity finding (an unbounded stale-but-too-permissive
+  window) — without this job running, that bound reverts to "whenever someone
+  happens to run the check by hand."
+
+  ██ SAME DELIBERATE DEVIATION AS scripts/com.oasis-x.semantic-index-build.plist ██
+  This script also reads role.yaml files inside ~/Documents/Runes to compute
+  each bot's CURRENT authorized roots, so it points directly at its real repo
+  path for the same reason and needs the same Full Disk Access grant. See
+  that plist's header for the full explanation and the exact grant needed.
+
+  Until granted, `bots/Makefile`'s `recreate` target still runs the drift
+  check as a blocking pre-step — that path works today, unaffected, because
+  `make` is always invoked from an ordinary terminal, which already has
+  Documents access; only THIS scheduled, unattended path is blocked.
+
+  `make semantic-index-drift-install` deploys ONLY this plist (there is no
+  script copy to keep in sync — the repo file is the one and only source).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.oasis-x.semantic-index-drift</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12</string>
+        <string>/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/scripts/check-semantic-index-drift.py</string>
+        <string>--check</string>
+        <string>--all-bots</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/Michaellee</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/Michaellee/Library/Logs/semantic-index-drift.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/Michaellee/Library/Logs/semantic-index-drift.stderr.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

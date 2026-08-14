@@ -199,6 +199,62 @@ stuck-lanes-watchdog-uninstall: ## unload the stuck-lanes watchdog
 	@launchctl bootout gui/$$(id -u)/com.oasis-x.claw-stuck-lanes 2>/dev/null || true
 	@echo "stuck-lanes watchdog unloaded"
 
+# ── semantic-index build + drift (launchd) ──────────────────────────────────
+# UNLIKE nimbus-watchdog/claw-stuck-lanes above, these plists point DIRECTLY at
+# the real repo path — no script is copied to Application Support. That
+# relocation fixes launchd's own exec-from-Documents gate, but these two
+# scripts' entire JOB is reading role.yaml files and the corpus tree inside
+# ~/Documents/Runes, so a copy would leave scripts/lib/semantic_index_authz.py
+# and friends unresolvable. See scripts/com.oasis-x.semantic-index-build.plist
+# for the full explanation and the REQUIRED, MANUAL Full Disk Access grant —
+# install targets below succeed unconditionally (the plist loads fine); that
+# does NOT mean the job itself can read Documents yet. Check the *-status
+# target's log tail after installing, every time, before trusting it runs.
+SEMANTIC_BUILD_PLIST := $(HOME)/Library/LaunchAgents/com.oasis-x.semantic-index-build.plist
+SEMANTIC_DRIFT_PLIST := $(HOME)/Library/LaunchAgents/com.oasis-x.semantic-index-drift.plist
+
+.PHONY: semantic-index-build-install semantic-index-build-status semantic-index-build-uninstall \
+        semantic-index-drift-install semantic-index-drift-status semantic-index-drift-uninstall \
+        semantic-reindex
+
+semantic-index-build-install: ## load the nightly semantic-index rebuild — needs Full Disk Access first, see the plist header
+	@cp scripts/com.oasis-x.semantic-index-build.plist "$(SEMANTIC_BUILD_PLIST)"
+	@plutil -lint "$(SEMANTIC_BUILD_PLIST)" >/dev/null
+	@launchctl bootout gui/$$(id -u)/com.oasis-x.semantic-index-build 2>/dev/null || true
+	@launchctl bootstrap gui/$$(id -u) "$(SEMANTIC_BUILD_PLIST)"
+	@echo "loaded — this does NOT confirm it can read ~/Documents yet."
+	@echo "verify with: make semantic-index-build-status (after its next scheduled fire, or run scripts/build-semantic-index.py by hand right now)"
+
+semantic-index-build-status: ## last exit code + log tail (a PermissionError here means Full Disk Access was not granted)
+	@launchctl print gui/$$(id -u)/com.oasis-x.semantic-index-build 2>/dev/null \
+	  | grep -E "state =|last exit code" || echo "not loaded"
+	@tail -10 "$(HOME)/Library/Logs/semantic-index-build.stdout.log" 2>/dev/null || true
+	@tail -10 "$(HOME)/Library/Logs/semantic-index-build.stderr.log" 2>/dev/null || true
+
+semantic-index-build-uninstall: ## unload the nightly semantic-index rebuild
+	@launchctl bootout gui/$$(id -u)/com.oasis-x.semantic-index-build 2>/dev/null || true
+	@echo "semantic-index build job unloaded"
+
+semantic-index-drift-install: ## load the hourly semantic-index drift check — same Full Disk Access prerequisite
+	@cp scripts/com.oasis-x.semantic-index-drift.plist "$(SEMANTIC_DRIFT_PLIST)"
+	@plutil -lint "$(SEMANTIC_DRIFT_PLIST)" >/dev/null
+	@launchctl bootout gui/$$(id -u)/com.oasis-x.semantic-index-drift 2>/dev/null || true
+	@launchctl bootstrap gui/$$(id -u) "$(SEMANTIC_DRIFT_PLIST)"
+	@echo "loaded — verify with: make semantic-index-drift-status"
+
+semantic-index-drift-status: ## last exit code + log tail
+	@launchctl print gui/$$(id -u)/com.oasis-x.semantic-index-drift 2>/dev/null \
+	  | grep -E "state =|last exit code" || echo "not loaded"
+	@tail -10 "$(HOME)/Library/Logs/semantic-index-drift.stdout.log" 2>/dev/null || true
+	@tail -10 "$(HOME)/Library/Logs/semantic-index-drift.stderr.log" 2>/dev/null || true
+
+semantic-index-drift-uninstall: ## unload the hourly semantic-index drift check
+	@launchctl bootout gui/$$(id -u)/com.oasis-x.semantic-index-drift 2>/dev/null || true
+	@echo "semantic-index drift job unloaded"
+
+semantic-reindex: ## run the semantic-index builder by hand right now (works today, no Full Disk Access needed — you already have Documents access in this terminal)
+	python3 scripts/build-semantic-index.py --corpus exp
+
 # ── egress partitioning health ───────────────────────────────────────────────
 egress-check: ## verify client.map still matches live bot IPs (CLAW-050 isolation)
 	@python3 ./scripts/claw-egress-sync --check
