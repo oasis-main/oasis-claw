@@ -12,6 +12,13 @@ const configSchema = z.object({
   includeFiles: z.array(z.string()).optional(),
   maxBytes: z.number().optional(),
   registerSwarmReadTool: z.boolean().optional(),
+  // Required to read (or write a taggable) handoff note back on a swarmDir
+  // shared read-write with another bot — e.g. House and Yes Man currently
+  // share the same host .swarm/ directory. See compaction-provider.ts's
+  // readLatestHandoff doc comment. Unset = compaction always falls back to
+  // the session digest, matching this plugin's behavior before this field
+  // existed.
+  botKey: z.string().optional(),
 });
 
 export type DotSwarmConfig = z.infer<typeof configSchema>;
@@ -52,6 +59,7 @@ const plugin = {
     const includeFiles = cfg.includeFiles ?? DEFAULT_INCLUDE;
     const maxBytes = cfg.maxBytes ?? DEFAULT_MAX_BYTES;
     const wantsSwarmReadTool = cfg.registerSwarmReadTool ?? true;
+    const botKey = cfg.botKey;
 
     // Memory prompt supplement — non-exclusive. Coexists with memory-core /
     // memory-lancedb / memory-wiki / active-memory. Each session prepares the
@@ -77,18 +85,20 @@ const plugin = {
     }
 
     // compact tool — the agent writes a HANDOFF section into .swarm/state.md.
-    api.registerTool(createCompactTool({ swarmDir }), { name: "compact" });
+    api.registerTool(createCompactTool({ swarmDir, botKey }), { name: "compact" });
 
     // swarm-compact CompactionProvider — serves the latest HANDOFF back to the
     // runtime at context-ceiling compaction. Inert unless the agent config sets
     // agents.defaults.compaction.provider = "swarm-compact" (the runtime
-    // entrypoint pins exactly that).
-    api.registerCompactionProvider(createSwarmCompactionProvider({ swarmDir }));
+    // entrypoint pins exactly that). Also inert (falls back to the session
+    // digest) unless botKey is set — see readLatestHandoff's doc comment.
+    api.registerCompactionProvider(createSwarmCompactionProvider({ swarmDir, botKey }));
 
     api.logger.info("dot-swarm plugin loaded", {
       swarmDir,
       includeFiles,
       maxBytes,
+      botKey: botKey ?? null,
       swarmReadToolRegistered: wantsSwarmReadTool,
       tools: wantsSwarmReadTool ? ["swarm_read", "compact"] : ["compact"],
       compactionProvider: "swarm-compact (reads state.md)",

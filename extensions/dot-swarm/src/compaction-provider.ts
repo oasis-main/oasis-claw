@@ -44,11 +44,35 @@ export interface CompactionProvider {
 // State.md parser — extract latest HANDOFF section
 // ---------------------------------------------------------------------------
 
+// Matches the real handoff headers found in a shared state.md — both the
+// compact tool's own format ("## Handoff Note — <tag>", written below in
+// tools/compact.ts) and plain, hand-written ones with no em dash and no tag
+// ("## Handoff Note", "## Handoff Note (archived)"). The old em-dash-only
+// match never fired against hand-written headers, so every read silently
+// fell through to digestMessages() with no error. Found during the
+// 2026-08-13 House-bot incident review — not the cause of that incident,
+// a separate, pre-existing defect.
+const HANDOFF_HEADER_RE = /^##\s+Handoff Note\b(.*)$/m;
+
 /**
  * Parse .swarm/state.md and return the body of the most recent HANDOFF section.
  * Returns null if no HANDOFF section is found.
+ *
+ * `opts.botKey`, when given, restricts matches to sections tagged for that
+ * bot (a tag written as "<botKey>: <rest>" by the compact tool). This
+ * directory is shared, read-write, between more than one bot for at least
+ * one deployment (House and Yes Man both mount the same host state.md —
+ * see bots/docker-compose.house-reach.yml and
+ * bots/docker-compose.yesman-reach.yml). Without botKey, this function
+ * ALWAYS returns null — it deliberately does not serve back a handoff note
+ * of unknown origin on a directory that may be shared. A caller must opt in
+ * to scoped reading by configuring botKey; until then, the caller's own
+ * fallback (its own conversation digest) applies, matching pre-fix
+ * behavior for every bot exactly, since none configure botKey yet.
  */
-export function readLatestHandoff(stateMdPath: string): string | null {
+export function readLatestHandoff(stateMdPath: string, opts: { botKey?: string } = {}): string | null {
+  if (!opts.botKey) return null;
+
   let raw: string;
   try {
     raw = fs.readFileSync(stateMdPath, "utf8");
@@ -56,10 +80,15 @@ export function readLatestHandoff(stateMdPath: string): string | null {
     return null;
   }
 
-  // Find all HANDOFF section headers
-  // Pattern: "## Handoff Note — <tag>\n\n*Compacted at ...*\n\n<body>"
   const sections = raw.split(/\n---\n/);
-  const handoffSections = sections.filter((s) => s.includes("## Handoff Note —"));
+  const handoffSections = sections.filter((s) => {
+    const m = s.match(HANDOFF_HEADER_RE);
+    if (!m) return false;
+    // Strip the "— " (em dash) separator the compact tool writes between
+    // "Handoff Note" and the tag, if present, before checking the tag itself.
+    const tag = m[1].trim().replace(/^—\s*/, "");
+    return tag.startsWith(`${opts.botKey}:`);
+  });
 
   if (handoffSections.length === 0) return null;
 
@@ -122,6 +151,13 @@ function extractTextFromMessage(content: unknown): string {
 
 export type SwarmCompactionProviderConfig = {
   swarmDir: string;
+  /**
+   * Restricts handoff reads to notes tagged for this bot. Required on any
+   * swarmDir shared read-write between more than one bot (see the
+   * readLatestHandoff doc comment above) — leave unset for a private
+   * swarmDir, or if bot-scoped tagging hasn't been turned on yet.
+   */
+  botKey?: string;
 };
 
 export function createSwarmCompactionProvider(
@@ -135,7 +171,7 @@ export function createSwarmCompactionProvider(
 
     async summarize(params: CompactionParams): Promise<string> {
       // 1. Try to read the agent's own handoff note
-      const handoff = readLatestHandoff(stateMdPath);
+      const handoff = readLatestHandoff(stateMdPath, { botKey: config.botKey });
       if (handoff) {
         return [
           "## Compaction Summary (from agent handoff note)",

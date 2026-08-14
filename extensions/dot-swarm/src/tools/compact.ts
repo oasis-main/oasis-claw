@@ -3,6 +3,13 @@ import path from "node:path";
 
 export type CompactToolConfig = {
   swarmDir: string;
+  /**
+   * When set, every written handoff is tagged "<botKey>: <rest>" so
+   * compaction-provider.ts's readLatestHandoff can find this bot's own
+   * notes on a swarmDir shared with another bot, without ever matching the
+   * other bot's notes. See the doc comment on readLatestHandoff.
+   */
+  botKey?: string;
 };
 
 /**
@@ -43,7 +50,8 @@ export function createCompactTool(config: CompactToolConfig) {
     },
     async execute(_toolCallId: string, args: { handoffNote: string; sessionTag?: string }) {
       const ts = new Date().toISOString();
-      const tag = args.sessionTag ?? `compact-${ts}`;
+      const rawTag = args.sessionTag ?? `compact-${ts}`;
+      const tag = config.botKey ? `${config.botKey}: ${rawTag}` : rawTag;
       const snapshot = renderHandoffSection(tag, ts, args.handoffNote);
 
       const statePath = path.join(config.swarmDir, "state.md");
