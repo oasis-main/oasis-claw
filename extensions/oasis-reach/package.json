@@ -2,6 +2,7 @@
   "name": "@oasis-claw/oasis-reach",
   "version": "0.1.0",
   "description": "openclaw plugin: inter-bot mail (CLAW-076) — reach_send/reach_inbox/reach_read + unread-count memory supplement, backed by a per-bot outbox/inbox and a host-side relay",
+  "license": "MIT",
   "type": "module",
   "devDependencies": {
     "openclaw": "workspace:*",
