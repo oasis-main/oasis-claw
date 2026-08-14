@@ -48,7 +48,7 @@ function resolveAttackLogPath(logDir: string, incidentId: string): string {
 
 function formatTelegramAlert(record: IncidentRecord): string {
   const lines = [
-    `🚨 *Hyperclaw Security Alert*`,
+    `🚨 *oasis-claw Security Alert (self-reported by the model — not independently verified)*`,
     ``,
     `*Type:* \`${record.incidentType}\``,
     `*Incident ID:* \`${record.incidentId}\``,
@@ -59,7 +59,7 @@ function formatTelegramAlert(record: IncidentRecord): string {
     record.detail.slice(0, 400),
   ];
   if (record.suspiciousContent) {
-    lines.push(``, `*Suspicious content (first 300 chars):*`);
+    lines.push(``, `*Suspicious content (first 300 chars, as reported by the model, unverified):*`);
     lines.push(`\`\`\`\n${record.suspiciousContent.slice(0, 300)}\n\`\`\``);
   }
   return lines.join("\n");
@@ -89,7 +89,7 @@ export function registerAttackLogger(
         fs.mkdirSync(path.dirname(filePath), { recursive: true });
         fs.writeFileSync(filePath, JSON.stringify(record, null, 2) + "\n", { mode: 0o600 });
       } catch (err) {
-        console.error("[hyperclaw-security] Failed to write attack log:", err);
+        console.error("[oasis-claw-security] Failed to write attack log:", err);
       }
 
       // Send Telegram alert (non-blocking, best-effort)
@@ -100,7 +100,7 @@ export function registerAttackLogger(
           text: formatTelegramAlert(record),
           parseMode: "Markdown",
         }).catch((err) => {
-          console.error("[hyperclaw-security] Failed to send Telegram alert:", err);
+          console.error("[oasis-claw-security] Failed to send Telegram alert:", err);
         });
       }
     },

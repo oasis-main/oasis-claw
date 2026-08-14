@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
@@ -17,7 +18,16 @@ import {
   type HardPolicy,
   type Verdict,
 } from "./policy.js";
-import { judgeConstitution, type Layer2Decision, type LlmComplete } from "./layer2.js";
+import {
+  judgeConstitution,
+  judgeInjectionReport,
+  type InjectionReviewDecision,
+  type InjectionReviewInput,
+  type InjectionReviewVerdict,
+  type Layer2Decision,
+  type LlmComplete,
+} from "./layer2.js";
+import { sendTelegramMessage } from "./telegram.js";
 
 // Layer 2 concurrency cap — bound the number of in-flight model judgments so a
 // burst of ambiguous calls can't spawn dozens of top-tier completions at once.
@@ -84,6 +94,34 @@ function rememberRequest(runId: string, prompt: string): void {
     if (oldest !== undefined) requestByRun.delete(oldest);
   }
   requestByRun.set(runId, prompt.slice(0, REQUEST_MAX_CHARS));
+}
+
+// ── Repeated-reply loop guard (CLAW-13x, 2026-08-13 House incident) ──────────
+// House spun for ~14 minutes sending near-identical replies with no automatic
+// stop: a hung Layer 2 check (see l2Ms in the audit log) tripped the session
+// write-lock's 5-minute force-release, and the retry re-entered with the same
+// stale context on every attempt. Nothing anywhere detected "the assistant
+// just sent the same reply again" and stopped it.
+// Same off|shadow|enforce convention as Layer 2 above, and same default: OFF.
+// shadow logs a `phase:"loop_guard"` row without acting; enforce also returns
+// {action:"finalize"} from before_agent_finalize to end the turn instead of
+// letting it repeat again. History is in-memory only (per-process, per
+// sessionId), bounded the same way requestByRun is bounded below — a spin is
+// a live-process phenomenon, nothing here needs to survive a restart.
+// Mode/threshold are read fresh inside registerReviewer (below), same as
+// Layer 2's env vars — NOT module-level consts, so a re-register (e.g. in
+// tests) picks up the current env rather than whatever was set at first
+// import.
+const LOOP_GUARD_HISTORY_MAX = 64;
+const loopGuardHistory = new Map<string, { hash: string; streak: number }>();
+
+/** Normalizes assistant text before hashing, so a small rewording still counts as a repeat. */
+function normalizeForLoopGuard(text: string): string {
+  return text.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function hashForLoopGuard(text: string): string {
+  return createHash("sha256").update(normalizeForLoopGuard(text)).digest("hex").slice(0, 16);
 }
 
 // Layer 2 may only ever TIGHTEN Layer 1 — the constitution is a second lock, not a
@@ -156,6 +194,31 @@ function safeJson(value: unknown, max = 2000): string {
   }
 }
 
+// ── report_injection independent-review alert framing (2026-08-14) ──
+// The agent's OWN report_injection alert (attack-logger.ts formatTelegramAlert)
+// already reads "self-reported by the model — not independently verified" and is
+// UNCHANGED by this feature — it keeps firing unconditionally. This is a SEPARATE,
+// second message, sent only when injectionReviewMode is "enforce" and the judge
+// returned a verdict, so Mike can tell at a glance whether the reviewer agrees.
+const INJECTION_REVIEW_LABEL: Record<InjectionReviewVerdict, string> = {
+  confirmed: "🔴 CONFIRMED — the reviewer independently agrees this looks like a real injection/social-engineering attempt.",
+  unconfirmed: "🟢 NOT CONFIRMED — the reviewer believes this is a false positive (e.g. benign content, or something Mike actually asked for).",
+  uncertain: "🟡 UNCERTAIN — the reviewer could not determine this either way.",
+};
+
+function formatInjectionReviewAlert(botKey: string, incidentType: string, decision: InjectionReviewDecision): string {
+  return [
+    `🔎 *oasis-reviewer independent verdict on a report_injection call*`,
+    ``,
+    `*Bot:* \`${botKey}\``,
+    `*Self-reported incident type:* \`${incidentType}\``,
+    `*Reviewer verdict:* ${INJECTION_REVIEW_LABEL[decision.verdict]}`,
+    `*Reviewer reason:* ${decision.reason || "(none given)"}`,
+    ``,
+    `This is the reviewer's OWN independent read, separate from the bot's self-report alert above.`,
+  ].join("\n");
+}
+
 export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions): void {
   const { auditDir, mode, policyFile } = opts;
   try {
@@ -192,13 +255,38 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
   // shadow-era 20s: a judge that has not answered in 12s is treated as unavailable
   // (fail-closed for constitutionalReviewRequired bots, L1-fallback otherwise).
   const l2TimeoutMs = Number(process.env.OASIS_REVIEWER_L2_TIMEOUT_MS ?? "12000") || 12_000;
+  // Raising thinking above "minimal" without raising maxTokens to match
+  // reproduces the 2026-08-03 silent fail-closed-deny incident documented in
+  // layer2.ts (extended thinking ate the whole budget, left nothing for the
+  // verdict). Both must move together, so both default off the same absence.
+  const l2Thinking = process.env.OASIS_REVIEWER_L2_THINKING || undefined; // default: layer2.ts's "minimal"
+  const l2MaxTokens = process.env.OASIS_REVIEWER_L2_MAX_TOKENS
+    ? Number(process.env.OASIS_REVIEWER_L2_MAX_TOKENS) || undefined
+    : undefined; // default: layer2.ts's 2048
+  // ── report_injection independent review (2026-08-14, House + Kolmogorov) ──
+  // Own off|shadow|enforce switch, deliberately SEPARATE from OASIS_REVIEWER_L2 —
+  // same reason the loop guard above got its own switch rather than riding L2's: Mike
+  // can turn this on for a bot without also flipping that bot's ordinary tool-call
+  // tightening. It never blocks report_injection (see the before_tool_call handler
+  // below) — "enforce" here means "also send the reviewer's own Telegram alert", not
+  // "gate the call". Default off, so no bot's behavior changes until Mike sets this
+  // per-bot.
+  const injectionReviewMode = (process.env.OASIS_REVIEWER_INJECTION_REVIEW ?? "off").toLowerCase();
+  // Same shared per-bot env vars extensions/prompt-injection-reporting/index.ts reads
+  // for its own Telegram alert, reused unchanged here so the reviewer's follow-up
+  // alert lands in the SAME chat as the agent's self-report alert.
+  const telegramBotToken = process.env.OASIS_TELEGRAM_BOT_TOKEN;
+  const telegramChatId = process.env.OASIS_TELEGRAM_CHAT_ID;
   const runtime = (api as unknown as { runtime?: { llm?: { complete?: LlmComplete } } }).runtime;
+  // Available when EITHER switch wants it — injection review must not be starved of a
+  // model just because OASIS_REVIEWER_L2 (ordinary tool-call tightening) is off for
+  // this bot; the two features are independent by design (see above).
   const l2Complete: LlmComplete | undefined =
-    l2Mode !== "off" && typeof runtime?.llm?.complete === "function"
+    (l2Mode !== "off" || injectionReviewMode !== "off") && typeof runtime?.llm?.complete === "function"
       ? (runtime.llm.complete.bind(runtime.llm) as LlmComplete)
       : undefined;
-  if (l2Mode !== "off" && !l2Complete) {
-    api.logger.info("oasis-reviewer: Layer 2 requested but runtime.llm.complete unavailable — L2 stays OFF");
+  if ((l2Mode !== "off" || injectionReviewMode !== "off") && !l2Complete) {
+    api.logger.info("oasis-reviewer: Layer 2 / injection review requested but runtime.llm.complete unavailable — staying OFF");
   }
 
   // Capture the operator's ask for this run so the judge can evaluate intent, not
@@ -256,6 +344,13 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
       const l2Worthwhile = l2All || alwaysConstitutional || family === "exec" || isWriteLike || family === "web";
       const l2Eligible = needsConstitution && l2Worthwhile && !!l2Complete && l2Mode !== "off";
 
+      // report_injection's independent review (see the dispatch block near the end of
+      // this hook, and formatInjectionReviewAlert above). Computed here, ahead of the
+      // main audit write below, purely so that row can record whether a follow-up
+      // phase:"injection_review" row should be expected — it does not affect `decision`
+      // and is not part of Layer 1/Layer 2 at all.
+      const injectionReviewEligible = toolName === "report_injection" && injectionReviewMode !== "off" && !!l2Complete;
+
       let l2Row: Record<string, unknown> | null = null;
 
       // ── Layer 2 ENFORCE: await the judgment and let it tighten ──
@@ -270,7 +365,7 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         const r = await judgeConstitution(
           l2Complete as LlmComplete,
           { botKey, toolName, family, subject, params: paramsJson, constitution, operatorRequest },
-          { model: l2Model, timeoutMs: l2TimeoutMs },
+          { model: l2Model, timeoutMs: l2TimeoutMs, thinkingLevel: l2Thinking, maxTokens: l2MaxTokens },
         );
         // ── Operator-consent downgrade (CLAW-079) — deliberately narrow ──
         // Layer 2 is tighten-only by design, so a manipulated judge can never talk
@@ -404,6 +499,10 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         l2Judged: l2Eligible,
         hadOperatorRequest: !!operatorRequest,
         layer2Pending: l2Eligible && l2Mode === "shadow",
+        // See the injection-review dispatch block below: when true, a separate
+        // phase:"injection_review" row for this same toolCallId follows once the
+        // model judgment lands (async, never blocks this row or the tool call).
+        injectionReviewPending: injectionReviewEligible,
         enforced: mode === "enforce" && decision.verdict !== "allow",
       });
 
@@ -422,7 +521,7 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
           // No agentId: passing it is treated as a target-agent OVERRIDE and
           // rejected ("Plugin LLM completion cannot override the target agent").
           // Omitting it uses the ambient agent's own model/credentials.
-          { model: l2Model, timeoutMs: l2TimeoutMs },
+          { model: l2Model, timeoutMs: l2TimeoutMs, thinkingLevel: l2Thinking, maxTokens: l2MaxTokens },
         )
           .then((r) => {
             write({
@@ -449,6 +548,81 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
           .finally(() => {
             l2InFlight--;
           });
+      }
+
+      // ── report_injection independent review (2026-08-14, House + Kolmogorov) ──
+      // report_injection is the agent's OWN self-report tool — deliberately low-bar
+      // ("always report — false positives are welcome",
+      // prompt-injection-reporting/src/tools/report-injection.ts). Its log + Telegram
+      // alert must keep firing unconditionally (Mike wants the false-positive data,
+      // not silent failures — see attack-logger.ts, entirely untouched by this block).
+      // So this block NEVER reads or writes `decision` and NEVER awaits before
+      // returning from the hook — it cannot block, delay, or alter the report_injection
+      // call in any way, in either shadow or enforce mode. What it adds: the
+      // reviewer's OWN independent read on whether the flagged content really looks
+      // like an injection, using the SAME operatorRequest evidence that already
+      // correctly cleared Kolmogorov's deep_search follow-up call three minutes after
+      // its report_injection false positive (2026-08-14 incident).
+      if (injectionReviewEligible) {
+        const ra = (params ?? {}) as { incident_type?: string; detail?: string; suspicious_content?: string };
+        const reviewInput: InjectionReviewInput = {
+          botKey,
+          incidentType: String(ra.incident_type ?? "other"),
+          // Same caps report-injection.ts itself applies before writing the attack
+          // log — bounds judge cost/latency and keeps this consistent with what the
+          // agent's own report actually persists.
+          detail: String(ra.detail ?? "").slice(0, 2000),
+          suspiciousContent: String(ra.suspicious_content ?? "").slice(0, 1000),
+          operatorRequest,
+        };
+        const toolCallIdForReview = event.toolCallId ?? null;
+        void judgeInjectionReport(l2Complete as LlmComplete, reviewInput, {
+          model: l2Model,
+          timeoutMs: l2TimeoutMs,
+          thinkingLevel: l2Thinking,
+          maxTokens: l2MaxTokens,
+        }).then(async (r) => {
+          write({
+            ts: new Date().toISOString(),
+            phase: "injection_review",
+            injectionReviewMode,
+            bot: botKey,
+            sessionId,
+            sessionKey: sessionKey || null,
+            toolCallId: toolCallIdForReview,
+            incidentType: reviewInput.incidentType,
+            hadOperatorRequest: !!operatorRequest,
+            reviewerVerdict: r.decision?.verdict ?? null,
+            // Quick-grep boolean: does the reviewer's independent read agree with the
+            // agent's own self-report (which is implicitly "yes, suspicious" by
+            // virtue of having called report_injection at all)?
+            reviewerAgreesWithSelfReport:
+              r.decision?.verdict === "confirmed" ? true : r.decision?.verdict === "unconfirmed" ? false : null,
+            reviewerReason: r.decision?.reason ?? null,
+            reviewerParseFail: r.decision ? undefined : (r.raw || null),
+            reviewerError: r.error ?? null,
+            ms: r.ms,
+            // This feature never gates report_injection, so `enforced` (used
+            // elsewhere in this file to mean "the reviewer's verdict changed what
+            // happened") does not apply here. "enforce" for this feature means "also
+            // send the reviewer's own Telegram alert" — recorded below.
+            alerted: injectionReviewMode === "enforce" && !!r.decision,
+          });
+          if (injectionReviewMode === "enforce" && r.decision && telegramBotToken && telegramChatId) {
+            try {
+              await sendTelegramMessage({
+                botToken: telegramBotToken,
+                chatId: telegramChatId,
+                text: formatInjectionReviewAlert(botKey, reviewInput.incidentType, r.decision),
+                parseMode: "Markdown",
+              });
+            } catch (err) {
+              api.logger.info("oasis-reviewer: injection-review Telegram alert failed", {
+                error: String((err as Error)?.message ?? err),
+              });
+            }
+          }
+        });
       }
     } catch (err) {
       write({ ts: new Date().toISOString(), phase: "before_tool_call", mode, bot: botKey, toolName, error: String((err as Error)?.message ?? err), enforced: mode === "enforce" });
@@ -485,6 +659,67 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
     return;
   });
 
+  // ── Loop guard hook ──
+  // Independent of before_tool_call above: fires once per turn, right before
+  // the agent's reply would be sent/finalized. Never throws past its own
+  // try/catch — a bug here must degrade to "did nothing", the same fail-safe
+  // posture as before_tool_call's shadow mode, not fail-closed like enforce's
+  // deny-on-error (there is no useful "deny" for a reply that already exists).
+  const loopGuardMode = (process.env.OASIS_REVIEWER_LOOP_GUARD ?? "off").toLowerCase();
+  const loopGuardThreshold = Number(process.env.OASIS_REVIEWER_LOOP_GUARD_THRESHOLD ?? "3") || 3;
+  if (loopGuardMode !== "off") {
+    api.on("before_agent_finalize", (event: Record<string, unknown>, ctx: Record<string, unknown>) => {
+      try {
+        const sessionId = String(event?.sessionId ?? ctx?.sessionId ?? "unknown");
+        const text = String(event?.lastAssistantMessage ?? "");
+        if (!text.trim()) return;
+
+        const hash = hashForLoopGuard(text);
+        const prior = loopGuardHistory.get(sessionId);
+        const streak = prior && prior.hash === hash ? prior.streak + 1 : 1;
+
+        if (!loopGuardHistory.has(sessionId) && loopGuardHistory.size >= LOOP_GUARD_HISTORY_MAX) {
+          const oldest = loopGuardHistory.keys().next().value;
+          if (oldest !== undefined) loopGuardHistory.delete(oldest);
+        }
+        loopGuardHistory.set(sessionId, { hash, streak });
+
+        if (streak < loopGuardThreshold) return;
+
+        write({
+          ts: new Date().toISOString(),
+          phase: "loop_guard",
+          loopGuardMode,
+          bot: botKey,
+          sessionId,
+          streak,
+          threshold: loopGuardThreshold,
+          textPreview: text.slice(0, 200),
+          enforced: loopGuardMode === "enforce",
+        });
+
+        if (loopGuardMode !== "enforce") return; // shadow: log only, never act
+
+        // Reset so we don't force-finalize every subsequent turn too — only the
+        // turn that crosses the threshold gets stopped.
+        loopGuardHistory.delete(sessionId);
+        return {
+          action: "finalize" as const,
+          reason: `oasis-reviewer loop guard: the same reply repeated ${streak} times in a row for this session — forcing this turn to end instead of continuing the loop.`,
+        };
+      } catch (err) {
+        write({
+          ts: new Date().toISOString(),
+          phase: "loop_guard",
+          loopGuardMode,
+          bot: botKey,
+          error: String((err as Error)?.message ?? err),
+        });
+        return; // never block finalize on a bug in this guard itself
+      }
+    });
+  }
+
   api.logger.info(`oasis-reviewer: Layer 1 active (mode=${mode}, bot=${botKey})`, {
     auditFile,
     policyLoaded: !!policy,
@@ -494,5 +729,10 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
     layer2: l2Complete
       ? `${l2Mode} (model=${l2Model ?? "agent-default"}, timeout=${l2TimeoutMs}ms, scope=${l2All ? "all-calls" : alwaysConstitutional ? "all-calls(constitutional-bot)" : "exec+write+web"})`
       : "off",
+    loopGuard: loopGuardMode === "off" ? "off" : `${loopGuardMode} (threshold=${loopGuardThreshold})`,
+    injectionReview:
+      injectionReviewMode === "off"
+        ? "off"
+        : `${injectionReviewMode} (telegram=${telegramBotToken && telegramChatId ? "configured" : "not-configured"})`,
   });
 }
