@@ -10,7 +10,8 @@ import {
   DEFAULT_HARD_POLICY,
   evaluateHard,
   execCommandOf,
-  isInertReadOnlyPipeline,
+  isInertReadOnlyPipelineForL2Backstop,
+  isInertReadOnlyToolCall,
   loadPolicyFile,
   NEVER_DOWNGRADE,
   resolveHardPolicy,
@@ -406,15 +407,36 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         //
         // Narrow by construction. It fires only when ALL of these hold:
         //   1. Layer 1 itself allowed the call (never rescues an L1 escalate),
-        //   2. the family is exec,
-        //   3. EVERY pipeline stage is a provably side-effect-free argv tool or
-        //      a read-only git subcommand (isInertReadOnlyPipeline — the same
-        //      function Layer 1 uses, so the layers cannot drift),
-        //   4. the combined verdict is escalate, not deny.
+        //   2. EITHER the family is exec and EVERY pipeline stage is a provably
+        //      side-effect-free argv tool, a read-only git subcommand, or a
+        //      read-only docker/aws multiplexer subcommand
+        //      (isInertReadOnlyPipelineForL2Backstop), OR the call is one of
+        //      the native read-only tools (read/fs_grep/fs_glob/fs_help/ls/
+        //      memory_search — isInertReadOnlyToolCall),
+        //   3. the combined verdict is escalate, not deny.
         // The prose fix to the constitution is the primary repair; this is the
         // backstop for the judge re-reading it too broadly, which has now
-        // happened twice.
-        const inertRead = family === "exec" && isInertReadOnlyPipeline(execCommandOf(params));
+        // happened twice on exec/git calls and is a structurally identical
+        // risk on a plain `read`/`fs_grep`/etc. call for any bot flagged to
+        // require Layer 2 review on every call — a wrongly-escalated read had
+        // no backstop until this widening, 2026-08-16.
+        //
+        // WIDENED 2026-08-16 to close two gaps found while investigating the
+        // git incident above: (a) the exec-side check only recognized git as a
+        // multiplexer, so `docker ps`/`docker logs`/`docker inspect` and
+        // `aws … describe-*`/`list-*` — enumerated read-only subcommands the
+        // constitution's own ESCALATION HYGIENE principle already says to
+        // judge "by SUBCOMMAND, never by the presence of the program's name" —
+        // had no mechanical backstop, only that prose; (b) the check was
+        // exec-only, so a native (non-shell) read tool call could never be
+        // rescued at all, on any bot, regardless of family. See policy.ts's
+        // isInertDockerStage/isInertAwsStage/isInertReadOnlyToolCall for the
+        // exact enumerated sets and the reasoning for what was deliberately
+        // left OUT (aws `get-*`, `gh`, docker `rm`/`stop`/`kill`, etc. — all
+        // still fully escalatable).
+        const inertRead =
+          (family === "exec" && isInertReadOnlyPipelineForL2Backstop(execCommandOf(params))) ||
+          isInertReadOnlyToolCall(toolName);
         const inertReadKept = !!combined && combined.verdict === "escalate" && l1.verdict === "allow" && inertRead;
         if (inertReadKept) {
           decision = l1;

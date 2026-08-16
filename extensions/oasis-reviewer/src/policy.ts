@@ -267,6 +267,93 @@ function isInertGitStage(stage: string): boolean {
   return tokens.slice(i + 1).every((t) => listingFlags.has(t));
 }
 
+// ── Read-only docker/aws multiplexers — L2-BACKSTOP ONLY (2026-08-16) ──────────
+// Same multiplexer shape as git above: the BINARY name alone says nothing about
+// mutation, the SUBCOMMAND does. `docker ps` is inert; `docker rm` is not.
+// `aws ec2 describe-instances` is inert; `aws ec2 terminate-instances` is not.
+//
+// Deliberately NOT folded into READ_ONLY_ARGV_TOOLS / isInertReadOnlyPipeline
+// above: that function is ALSO consulted inside evaluateHard (see the
+// `inertReadOnly` skip of denyExecRegex/consentRequiredExecRegex/
+// escalateExecRegex a few hundred lines down) to decide when a per-bot
+// AUTHORED rule gets bypassed. Widening it here would risk silently defeating
+// a bot-specific denyExtra/consentRequiredExtra/escalateExtra rule this change
+// was never asked to touch. These two helpers feed ONLY
+// isInertReadOnlyPipelineForL2Backstop below, which reviewer.ts's INERT-READ
+// BACKSTOP uses — and that backstop only ever fires when Layer 1 has ALREADY
+// returned "allow" for its own, unmodified reasons, so a per-bot rule that
+// currently denies or escalates a docker/aws call keeps doing so untouched:
+// this can only ever suppress a REDUNDANT Layer 2 escalation layered on top of
+// an allow Layer 1 already gave.
+//
+// docker: exactly the three subcommands Mike asked to hard-allow — ps, logs,
+// inspect. Enumerated, not pattern-matched, so the set only grows by a
+// deliberate addition, same posture as GIT_READ_ONLY_SUBCOMMANDS above.
+// FLAGGED ASSUMPTION: `docker logs` / `docker inspect` can surface secrets a
+// container was started with (env vars baked in via `-e`, mounted config) —
+// a DIFFERENT risk than "this mutates something," and Layer 1 has no
+// docker-specific equivalent of denyReadGlobs today. Confirm this residual is
+// acceptable before shipping, or narrow the set further if not.
+const DOCKER_READ_ONLY_SUBCOMMANDS = new Set(["ps", "logs", "inspect"]);
+
+function isInertDockerStage(stage: string): boolean {
+  const tokens = stage.trim().split(/\s+/).filter((t) => t.length > 0);
+  if (tokens.length < 2) return false;
+  if ((tokens[0].split("/").pop() ?? "").toLowerCase() !== "docker") return false;
+  // A global flag ahead of the subcommand (`docker -H tcp://evil ps`) can
+  // redirect the whole call to a different daemon — disqualify outright, same
+  // reasoning as GIT_EXEC_VECTOR above.
+  if (tokens[1].startsWith("-")) return false;
+  return DOCKER_READ_ONLY_SUBCOMMANDS.has(tokens[1].toLowerCase());
+}
+
+// aws: ONLY the `describe-*` and `list-*` operation-name shapes — a DELIBERATE
+// NARROWING from Mike's literal "describe/list/get" phrasing. `aws ssm
+// get-parameter --with-decryption` and `aws secretsmanager get-secret-value`
+// are both spelled "get" and both return LIVE CREDENTIALS in plaintext; no
+// `describe-*` or `list-*` operation on any AWS service returns decrypted
+// secret material, only resource metadata. Hard-allowing "get" as a class
+// would recreate, for AWS credentials, exactly the override-a-real-escalation
+// failure mode this fix exists to close — so "get" stays fully subject to
+// ordinary Layer 2 judgment, unchanged.
+const AWS_READ_ONLY_OPERATION = /^(describe|list)-[a-z0-9][a-z0-9-]*$/;
+
+function isInertAwsStage(stage: string): boolean {
+  const tokens = stage.trim().split(/\s+/).filter((t) => t.length > 0);
+  if (tokens.length < 3) return false;
+  if ((tokens[0].split("/").pop() ?? "").toLowerCase() !== "aws") return false;
+  // A global flag ahead of the service token (`aws --endpoint-url https://evil
+  // s3api list-buckets`) can redirect the call — disqualify.
+  if (tokens[1].startsWith("-")) return false;
+  return AWS_READ_ONLY_OPERATION.test(tokens[2].toLowerCase());
+}
+
+// ── Read-only NATIVE (non-exec) tool calls — L2-BACKSTOP ONLY (2026-08-16) ─────
+// The exec-pipeline checks above only cover commands routed through a shell. A
+// bot's `read` / `fs_grep` / `fs_glob` / `fs_help` / `ls` / `memory_search`
+// calls are native tool invocations with no shell command string to parse — so
+// they get their own, simpler test: the TOOL NAME is drawn from a small,
+// exact-match set that is structurally incapable of a write (no argument shape
+// turns `read` into a write; content-mutating tools have their own,
+// differently-named tools — write/edit/patch/etc.). This does not weaken any
+// existing Layer 1 gate: `read` / `fs_grep` already run through evaluateHard's
+// denyReadGlobs check below (READ_TOOLS matches both), so an L1-allow for one
+// of these names already means the secret-file floor (*.pem/id_*/*.key/
+// *_rsa/*_ed25519/.env*) was checked and passed BEFORE this predicate is ever
+// consulted.
+//
+// FLAGGED ASSUMPTION FOR TESTING: these six names are taken verbatim from
+// Mike's own enumeration. Confirm they match the exact `toolName` strings
+// openclaw's before_tool_call hook actually delivers (case, underscores, any
+// namespacing prefix) before shipping — every audit row already records
+// `toolName`, so `grep -h '"toolName"' reviewer-audit.jsonl` on a live bot is
+// enough to confirm or correct this set.
+const READ_ONLY_TOOL_NAMES = new Set(["read", "fs_grep", "fs_glob", "fs_help", "ls", "memory_search"]);
+
+export function isInertReadOnlyToolCall(toolName: string): boolean {
+  return READ_ONLY_TOOL_NAMES.has(toolName);
+}
+
 function splitUnquotedStages(cmd: string): string[] {
   const stages: string[] = [];
   let cur = "";
@@ -314,6 +401,25 @@ export function isInertReadOnlyPipeline(cmd: string): boolean {
     if (s.trim().length === 0) return false;
     if (READ_ONLY_ARGV_TOOLS.has(leadingArgvToken(s))) return true;
     return isInertGitStage(s);
+  });
+}
+
+// L2-BACKSTOP-ONLY variant of isInertReadOnlyPipeline above, widened to also
+// recognize the read-only docker/aws multiplexer subcommands (see the block
+// comment above isInertDockerStage for why this is kept SEPARATE from the
+// function evaluateHard/Layer 1 uses, rather than widening that one). Exported
+// for reviewer.ts's INERT-READ BACKSTOP only — evaluateHard (Layer 1) never
+// calls this; it keeps using the original, narrower isInertReadOnlyPipeline
+// above unchanged.
+export function isInertReadOnlyPipelineForL2Backstop(cmd: string): boolean {
+  const stages = splitUnquotedStages(cmd);
+  if (stages.length === 0) return false;
+  return stages.every((s) => {
+    if (s.trim().length === 0) return false;
+    if (READ_ONLY_ARGV_TOOLS.has(leadingArgvToken(s))) return true;
+    if (isInertGitStage(s)) return true;
+    if (isInertDockerStage(s)) return true;
+    return isInertAwsStage(s);
   });
 }
 

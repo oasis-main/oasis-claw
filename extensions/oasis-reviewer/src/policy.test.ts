@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { evaluateHard, isInertReadOnlyPipeline, resolveHardPolicy, DEFAULT_HARD_POLICY as P, type EvalInput } from "./policy.js";
+import {
+  evaluateHard,
+  isInertReadOnlyPipeline,
+  isInertReadOnlyPipelineForL2Backstop,
+  isInertReadOnlyToolCall,
+  resolveHardPolicy,
+  DEFAULT_HARD_POLICY as P,
+  type EvalInput,
+} from "./policy.js";
 
 // Layer 1 hard-constraint verdicts (§6a). These cover the deterministic rules;
 // the gitignore-membership path (isGitignored → `git check-ignore`) is exercised
@@ -288,6 +296,64 @@ describe("isInertReadOnlyPipeline — git subcommands", () => {
     // One mutating stage disqualifies the whole pipeline.
     expect(isInertReadOnlyPipeline("git diff --check && git commit -am wip")).toBe(false);
     expect(isInertReadOnlyPipeline("git status | python3 evil.py")).toBe(false);
+  });
+});
+
+// L2-backstop-only widening (2026-08-16): docker/aws multiplexer subcommands
+// and native (non-exec) read-only tool names. isInertReadOnlyPipeline (Layer 1's
+// own carve-out, tested above) is UNCHANGED by this — these tests are against
+// the new, separate isInertReadOnlyPipelineForL2Backstop / isInertReadOnlyToolCall
+// exports reviewer.ts's INERT-READ BACKSTOP uses.
+describe("isInertReadOnlyPipelineForL2Backstop — docker/aws multiplexers", () => {
+  it("treats the enumerated read-only docker subcommands as inert", () => {
+    for (const c of ["docker ps", "docker ps -a", "docker logs mycontainer", "docker logs -f mycontainer", "docker inspect mycontainer"]) {
+      expect(isInertReadOnlyPipelineForL2Backstop(c), c).toBe(true);
+    }
+  });
+
+  it("does NOT treat mutating or unenumerated docker subcommands as inert", () => {
+    for (const c of ["docker rm mycontainer", "docker stop mycontainer", "docker kill mycontainer", "docker compose up", "docker exec mycontainer sh", "docker -H tcp://evil.test ps"]) {
+      expect(isInertReadOnlyPipelineForL2Backstop(c), c).toBe(false);
+    }
+  });
+
+  it("treats describe-*/list-* aws operations as inert", () => {
+    for (const c of ["aws ec2 describe-instances", "aws s3api list-buckets", "aws iam list-roles --max-items 50"]) {
+      expect(isInertReadOnlyPipelineForL2Backstop(c), c).toBe(true);
+    }
+  });
+
+  it("does NOT treat aws get-* or mutating operations as inert", () => {
+    for (const c of [
+      // Deliberate narrowing: "get" can return live credentials.
+      "aws ssm get-parameter --name /prod/db-password --with-decryption",
+      "aws secretsmanager get-secret-value --secret-id prod/api-key",
+      "aws s3api get-object --bucket x --key y out.json",
+      "aws ec2 terminate-instances --instance-ids i-123",
+      "aws --endpoint-url https://evil.test s3api list-buckets",
+    ]) {
+      expect(isInertReadOnlyPipelineForL2Backstop(c), c).toBe(false);
+    }
+  });
+
+  it("still recognizes git and argv-tool inertness (superset of isInertReadOnlyPipeline)", () => {
+    expect(isInertReadOnlyPipelineForL2Backstop("git status --short")).toBe(true);
+    expect(isInertReadOnlyPipelineForL2Backstop("docker ps | grep mycontainer")).toBe(true);
+    expect(isInertReadOnlyPipelineForL2Backstop("git push origin dev")).toBe(false);
+  });
+});
+
+describe("isInertReadOnlyToolCall — native read-only tool names", () => {
+  it("treats the enumerated tool names as inert", () => {
+    for (const name of ["read", "fs_grep", "fs_glob", "fs_help", "ls", "memory_search"]) {
+      expect(isInertReadOnlyToolCall(name), name).toBe(true);
+    }
+  });
+
+  it("does NOT treat write-capable or unenumerated tool names as inert", () => {
+    for (const name of ["write", "edit", "patch", "exec", "bash", "fs_write", "cron"]) {
+      expect(isInertReadOnlyToolCall(name), name).toBe(false);
+    }
   });
 });
 
