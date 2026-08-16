@@ -39,6 +39,25 @@ reviewer-policy: ## merge the private reviewer overlay over the committed generi
 	@python3 scripts/reviewer-policy-merge.py \
 	  "$(REVIEWER_POLICY_BASE)" "$(REVIEWER_POLICY_OVERLAY)" "$(REVIEWER_POLICY_OUT)"
 
+# ── DUAL-HOMED SIDECAR TRAP (found 2026-08-15, after a full-fleet restart) ──
+# up/recreate/rebuild below only know about docker-compose.runtime.yml. That
+# file attaches oasis-semantics + oasis-voice to oasis_runtime ONLY. But
+# sandbox/docker-compose.sandbox-runtime.yml re-declares those SAME two
+# services with BOTH oasis_runtime and oasis_sandboxed — the sandboxed bots
+# (house, kolmogorov, yesman, butterbolt, vanhelsing) resolve them only
+# through that second network. If either of these targets ends up recreating
+# oasis-semantics or oasis-voice (rebuild's --build --force-recreate touches
+# every service compose considers stale, not just openclaw) while any
+# sandboxed bot is running, Compose silently drops the container back onto
+# oasis_runtime ONLY — no error, no warning. Every sandboxed bot then loses
+# DNS to it (`getent hosts oasis-semantics` returns nothing) and its memory
+# sync spins on "embeddings retryable error" / "EAI_AGAIN" indefinitely,
+# without ever surfacing as a foreground failure.
+# If you hit this: `cd bots && make sidecars-up` (dual-homing-aware — uses
+# the sandbox overlay) to restore it properly, or as an immediate live patch,
+# `docker network connect oasis-claw_oasis_sandboxed oasis-semantics` (and
+# same for oasis-voice) — but that patch does not survive the next recreate,
+# only sidecars-up's compose files fix the actual cause.
 up: ## start runtime (build only if image missing)
 	$(COMPOSE) up -d openclaw
 
@@ -50,7 +69,7 @@ recreate: ## recreate container — picks up .env changes (creds rotation)
 	$(COMPOSE) up -d --force-recreate openclaw
 	@$(MAKE) -s wait-ready
 
-rebuild: ## rebuild image + recreate — picks up Dockerfile / entrypoint changes
+rebuild: ## rebuild image + recreate — picks up Dockerfile / entrypoint changes; see the dual-homed sidecar warning above if sandboxed bots are running
 	$(COMPOSE) up -d --build --force-recreate openclaw
 	@$(MAKE) -s wait-ready
 
