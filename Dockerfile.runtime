@@ -96,6 +96,20 @@ RUN npm install -g openclaw@${OPENCLAW_VERSION} tsx@4 sharp@0.34 @openclaw/amazo
 COPY scripts/patch-openclaw-cache-state.mjs /tmp/patch-openclaw-cache-state.mjs
 RUN node /tmp/patch-openclaw-cache-state.mjs && rm /tmp/patch-openclaw-cache-state.mjs
 
+# CLAW-099 interim patch: openclaw's process-wide unhandled-rejection handler
+# calls process.exit(1) on any rejection that doesn't match its transient-
+# network allow-list, and that allow-list doesn't recognize the gateway
+# client's own thrown error messages ("gateway not connected", "gateway
+# request timeout for ...", "gateway closed (...)") -- so a routine dropped
+# or timed-out gateway connection can crash the whole TUI process instead of
+# degrading gracefully. Also widens the TUI's onGap handler to re-arm the
+# streaming watchdog on a sequence gap alone, not only a full reconnect, so a
+# partial response is less likely to freeze without ever reconciling. See
+# scripts/patch-openclaw-network-resilience.mjs for the full writeup, the
+# fail-loud-on-mismatch guard, and the removal plan.
+COPY scripts/patch-openclaw-network-resilience.mjs /tmp/patch-openclaw-network-resilience.mjs
+RUN node /tmp/patch-openclaw-network-resilience.mjs && rm /tmp/patch-openclaw-network-resilience.mjs
+
 # Playwright + Chromium for the vendored `browser` plugin (extensions/browser/).
 # Three layered pins; bump independently per AUDIT_LOG.md and extensions/browser/UPSTREAM:
 #   PLAYWRIGHT_VERSION  — JS library
