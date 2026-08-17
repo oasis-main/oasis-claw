@@ -110,6 +110,16 @@ RUN node /tmp/patch-openclaw-cache-state.mjs && rm /tmp/patch-openclaw-cache-sta
 COPY scripts/patch-openclaw-network-resilience.mjs /tmp/patch-openclaw-network-resilience.mjs
 RUN node /tmp/patch-openclaw-network-resilience.mjs && rm /tmp/patch-openclaw-network-resilience.mjs
 
+# Generic, opt-in TUI theming: adds OASIS_TUI_BANNER_TITLE and
+# OASIS_TUI_ACCENT_COLOR environment-variable overrides for the CLI banner
+# title and every hardcoded accent/toolTitle color site, falling back to
+# today's exact stock values when unset -- a no-op for any bot that doesn't
+# set them. Not a bug fix; see scripts/patch-openclaw-theme.mjs for the full
+# writeup and patch-site list. The actual per-bot title/color choice belongs
+# in that bot's own .env, never here.
+COPY scripts/patch-openclaw-theme.mjs /tmp/patch-openclaw-theme.mjs
+RUN node /tmp/patch-openclaw-theme.mjs && rm /tmp/patch-openclaw-theme.mjs
+
 # Playwright + Chromium for the vendored `browser` plugin (extensions/browser/).
 # Three layered pins; bump independently per AUDIT_LOG.md and extensions/browser/UPSTREAM:
 #   PLAYWRIGHT_VERSION  — JS library
