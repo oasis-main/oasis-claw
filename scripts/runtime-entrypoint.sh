@@ -1728,8 +1728,34 @@ elif [ -n "${GH_TOKEN:-}" ]; then
   git config --global user.email "${OASIS_GIT_USER_EMAIL:-bots@oasis-x.io}"
   git config --global credential."https://github.com".helper oasis-gh
   echo "[entrypoint] git+gh wired for GitHub PAT (user='${OASIS_GIT_USER_NAME:-oasis-claw bot}', push allowlist='${OASIS_GIT_REPOS:-<none set>}')"
+elif gh auth status >/dev/null 2>&1; then
+  # Personal gh CLI sign-in (Mike, 2026-08-18, House): `gh auth login` run
+  # interactively inside the container (there is no non-interactive path for
+  # this mode -- device-flow OAuth needs a human at a browser). gh's own
+  # token store already lands under XDG_CONFIG_HOME
+  # (/home/node/.openclaw/config, set two lines above CONFIG_DIR's own export
+  # and already inside the persistent oasis_openclaw_home_house volume, which
+  # survives --force-recreate unlike the container's writable layer) — so the
+  # sign-in itself needs no new mount. What was missing: this script never
+  # checked whether gh ALREADY has a session, so a bot with no GH_APP_ID/
+  # GH_TOKEN fell straight to the "no push" branch below even after a
+  # successful interactive sign-in, leaving git itself unwired. `gh auth
+  # login` sometimes offers to wire git for you (a y/n prompt mid-flow) but
+  # that's easy to answer "n" to by accident or skip via --with-token, so this
+  # branch makes the wiring unconditional and idempotent on every boot rather
+  # than depending on that prompt having been answered correctly once.
+  # Delegates git's HTTPS credential lookup to gh itself — the same mechanism
+  # `gh auth setup-git` configures — so `git push`/`git fetch` and `gh pr
+  # list` etc. share the one signed-in session. Trade-off Mike chose
+  # explicitly over GitHub App mode: this ties the bot's git access to
+  # whichever personal GitHub account is signed in, not a narrow bot
+  # identity.
+  git config --global user.name  "${OASIS_GIT_USER_NAME:-oasis-claw bot}"
+  git config --global user.email "${OASIS_GIT_USER_EMAIL:-bots@oasis-x.io}"
+  git config --global credential."https://github.com".helper "!gh auth git-credential"
+  echo "[entrypoint] git wired for gh CLI personal sign-in (push allowlist='${OASIS_GIT_REPOS:-<none set>}')"
 else
-  echo "[entrypoint] no GH_APP_ID/GH_TOKEN — git limited to anonymous public reads (no push)"
+  echo "[entrypoint] no GH_APP_ID/GH_TOKEN/gh-cli-signin — git limited to anonymous public reads (no push)"
 fi
 
 exec openclaw gateway --bind "${BIND}" --port "${PORT}"
