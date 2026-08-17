@@ -28,82 +28,100 @@ OSINT), which moots most of the "should House touch AWS at all" framing here.
 | `bots/house/role.yaml` — `git` in `exec.allow` (deploys) | **DONE 2026-08-08** |
 | `bots/house/role.yaml` — SSM endpoints in `origins.trusted` | **not needed** — `.amazonaws.com` was already trusted 2026-07-30 and covers `ssm`/`ssmmessages`/`ec2messages`/`sts` |
 | `sandbox/egress-proxy/seeds/house/allowlist.txt` | **re-emitted 2026-08-08** (also added `.kalshi.com`) |
-| `session-manager-plugin` in the runtime image | **STILL MISSING** — an interactive SSM shell will not work until §5 is done |
-| `bots/house/iam/house-ssm-readonly.policy.json` — least-priv IAM policy | written, parked — see the outstanding item below |
-| `bots/house/iam/SSM-House-ReadOnly-Shell.doc.json` — read-only SM document | written, parked |
+| Credential scoping (§ below) | **DONE 2026-08-09, CLAW-079** — `~/.aws-house` holds only `[pmt-prod]`; superseded 2026-08-17, see below |
+| `pmt-prod`'s SSM rights | **too narrow for House** (found 2026-08-17) — only `SendCommand`+`GetCommandInvocation` (the deploy pipeline's shape); widened with 3 read-only discovery actions same day |
+| `bots/house/iam/house-ssm-readonly.policy.json` — least-priv IAM policy | **APPLIED 2026-08-17**, as `iam_bootstrap/main.tf` → `aws_iam_user_policy.house_ssm_readonly` (one change from the parked file: `ssm:StartSession`'s Resource uses `instance/*` + the `Role=pmt-runner` tag condition, not a hardcoded instance ARN — the runner box already carries that tag unconditionally, and a hardcoded ARN breaks on the next box rotation, same reasoning `pmt_prod`'s own policy already used) |
+| `bots/house/iam/SSM-House-ReadOnly-Shell.doc.json` — read-only SM document | **APPLIED 2026-08-17**, as `aws_ssm_document.house_readonly_shell` |
+| `session-manager-plugin` in the runtime image | **ADDED 2026-08-17** (`Dockerfile.runtime`) — needs an image rebuild + fleet restart to take effect |
+| `house-ro` OS user on the runner box | **NOT YET CREATED** — one-time `ssm:SendCommand` needed (see § below); cloud-init has no room (350-line `user_data.sh.tpl` is 16248/16384 bytes, the EC2 hard limit) so this does not survive a box rotation automatically — re-run the one-liner after any future rotation |
 
-### Outstanding, and it is the real one: scope the credential
+### Resolved 2026-08-17: which credential, and what it can actually do
 
-The superseding model replaced cred-*separation* with cred-*scoping* — and the
-scoping half is **not done**. House currently holds **Mike's full personal AWS
-credentials** (mounted RO at `~/.aws` since 2026-07-30), not a dedicated
-least-privilege principal. His own `exec` can read that file: it matches no entry
-in the fleet `denyReadGlobs` (`*.pem`, `id_*`, `*.key`, `*_rsa`, `*_ed25519`,
-`.env*`, `*.env`), so the reviewer governs that read, not the filesystem.
+CLAW-079 (2026-08-09) scoped House down to the **existing** `pmt-prod` IAM user
+(minted 2026-07-22 for the code-deploy pipeline) rather than minting the
+dedicated `house-ssm` principal this runbook always planned — a reasonable
+shortcut for the credential-*separation* half of the problem, but it left House
+holding a principal shaped for `deploy_inplace.py`'s fire-and-forget
+`SendCommand` pattern, not for the read-only *interactive-session* need this
+runbook exists for. `pmt-prod`'s policy had zero `ssm:DescribeInstanceInformation`
+/ `ssm:StartSession` / discovery rights, so House could not do anything SSM
+beyond exactly the deploy shape. This is why "House still can't do any AWS work"
+was reported even though the credential-scoping item above says DONE.
 
-That is the same exposure the original #8 deferral existed to prevent, now carried
-by a different control. It is acceptable only if the credential is scoped. §3 below
-already has the least-privilege policy written. Only Mike can apply it — minting an
-IAM user and issuing keys is not something Claude can do.
+Fixed by doing **both** halves properly: `pmt-prod` gets three narrow read-only
+SSM discovery actions (still no `StartSession` — that stays off a principal that
+also carries `ec2:*`/`iam:*`/`secretsmanager:*`), and the originally-planned
+`house-ssm` principal from §3 below is now actually minted, holding `StartSession`
+scoped to the read-only document + the `Role=pmt-runner` tag, nothing else. House's
+container needs a second AWS profile added to `~/.aws-house` for this — see the
+key-delivery step below (unchanged from the original §4 plan, still Mike-only).
+
+Also found and worth knowing about, unrelated to House: `pmt-prod`'s ORIGINAL
+Terraform-managed access key (`AKIAW2V3V3WPGT6EHRT2`, minted 2026-06-01) is
+`Inactive` in AWS today and was never the one actually deployed — a SECOND key
+(`AKIAW2V3V3WPNLLOQENM`, created ~44 min later, `Active`) is the one actually in
+`~/.aws-house` and in use, but it was never brought under Terraform management
+(not an `aws_iam_access_key` resource in state). Applying the IAM changes above
+will incidentally flip the tracked-but-unused key back to `Active` as pure drift
+correction (Terraform has no other opinion about it) — harmless, confirmed no
+file anywhere references that key ID. The live, in-use key stays untouched and
+untracked; reconciling that (`terraform import`) is a separate, non-blocking
+cleanup item, not done here.
 
 ---
 
 ## Steps you (Mike) must do — the credential parts Claude cannot
 
-Claude cannot mint IAM users, enter access keys, or run `aws` with your root
-credentials. These are yours:
+Claude cannot mint IAM users, enter access keys, run `terraform apply` on your
+account, or `ssm send-command` against the live trading box. These are yours.
 
-### 1. Mint the read-only OS user on the runner
-On the PMT runner (one time): create `house-ro`, no sudo, member of the groups
-needed to *read* logs (`adm`/`systemd-journal`), owning nothing. This is what
-`runAsDefaultUser` in the SM document lands as.
+### 1. Apply the Terraform (steps 2 + 3 below, now declarative)
+`prediction_market_trading/infrastructure/terraform/iam_bootstrap/main.tf` now
+has both changes — `terraform plan` (with `AWS_PROFILE=personal-admin`) shows
+4 to add, 2 to change, 0 to destroy: the `house-ssm` IAM user + its read-only
+policy + the `SSM-House-ReadOnly-Shell` document + a new access key, plus
+`pmt-prod`'s policy gaining 3 read-only SSM discovery actions and — pure drift
+correction, unrelated to this change and confirmed unused elsewhere — its
+original untracked access key flipping back to `Active`. The instance is
+already tagged `Role = pmt-runner` (runner module, unconditional), so no
+`REPLACE_WITH_PMT_INSTANCE_ID` placeholder and no `aws ec2 create-tags` step
+remain: `cd prediction_market_trading/infrastructure/terraform/iam_bootstrap
+&& AWS_PROFILE=personal-admin terraform apply`.
 
-### 2. Register the SM document + tag the instance
-```
-aws ssm create-document \
-  --name SSM-House-ReadOnly-Shell \
-  --document-type Session \
-  --document-format JSON \
-  --content file://bots/house/iam/SSM-House-ReadOnly-Shell.doc.json \
+### 2. Mint the read-only OS user on the runner (one-time SSM command)
+Cloud-init has no byte budget left (`user_data.sh.tpl` is 16248/16384 bytes,
+the EC2 hard limit) to create `house-ro` automatically, so this is a one-time
+command against the live box, using `pmt-prod`'s existing `SendCommand` right
+— re-run it after any future box rotation, it's idempotent:
+```bash
+AWS_PROFILE=personal-admin aws ssm send-command \
+  --document-name AWS-RunShellScript \
+  --targets "Key=tag:Role,Values=pmt-runner" \
+  --parameters commands='["id house-ro &>/dev/null || useradd --system --no-create-home --shell /usr/sbin/nologin --groups systemd-journal house-ro","setfacl -m u:house-ro:r-- /var/log/pmt-runner.log /var/log/pmt-bootstrap.log 2>/dev/null || true"]' \
   --region us-east-1
-aws ec2 create-tags --resources <PMT_INSTANCE_ID> \
-  --tags Key=Role,Value=pmt-runner --region us-east-1
 ```
 
-### 3. Create the scoped IAM principal
-Replace `REPLACE_WITH_PMT_INSTANCE_ID` in
-`bots/house/iam/house-ssm-readonly.policy.json`, then attach it to a **dedicated**
-IAM user `house-ssm` (not a reused principal). This policy grants **only**:
-`StartSession` on that one instance **through the read-only document**,
-`DescribeInstanceInformation`/`DescribeInstances` for discovery, and
-terminate/resume of House's **own** sessions. No `SendCommand`, no write, no
-other instance.
+### 4. Deliver the new credential — add a profile, don't replace the file
 
-### 4. Deliver the credential — standing key, file-based (chosen mechanism)
+`~/.aws-house` (mounted RO at `/home/node/.aws` — CLAW-079) already holds
+`[pmt-prod]`; add a second `[house-ssm]` section using `terraform output -raw
+house_ssm_access_key_id` / `house_ssm_secret_access_key` from the
+`iam_bootstrap` stack, in both `~/.aws-house/credentials` and
+`~/.aws-house/config` (`[profile house-ssm]`), same shape as the existing
+`pmt-prod` entries. House then needs `--profile house-ssm` on any `aws ssm
+start-session` call — nothing selects it by default, same as `pmt-prod` today.
+Standing key, file-based, out of the process env — unchanged reasoning from
+the original plan (the openclaw secrets-vault plugin only injects into
+browser form fields, and env vars would print into an exec transcript).
 
-The openclaw **secrets-vault** plugin only injects into browser form fields; it
-cannot feed the `aws` CLI. Decision: since this whole grant now lands **after #8**
-(when exec is uid-split and can no longer read the credential file), deliver a
-**standing IAM access key as a file**, not env:
+### 5. Rebuild the runtime image and restart the fleet
+`session-manager-plugin` is now in `Dockerfile.runtime` (2026-08-17). Claude
+rebuilds `oasis-claw-runtime:local` and recreates the bot containers — this is
+a local Docker operation, not an AWS one.
 
-- Write the key into a host-only file House alone mounts at `~/.aws/credentials`
-  (RO). The `aws` CLI reads it natively. It stays **out of the process env**, so
-  even the pre-#8 `env`-dump leak never applies. Rotate on a schedule.
-- Do **not** use env vars (`AWS_ACCESS_KEY_ID`/`_SECRET_ACCESS_KEY`): exec env is
-  unsanitized while `agents.sandbox` is null, so `env` in a House exec would print
-  the secret into the transcript. #8 fixes that too, but file delivery is cleaner
-  regardless.
-
-Post-#8, the uid-split means House's exec uid cannot read the credentials file at
-all — that is the property that makes a *standing* key acceptable here.
-
-### 5. Put `aws` + `session-manager-plugin` in the runtime image
-Claude will add both to the shared runtime Dockerfile and rebuild once you pick
-the mechanism (holding it so the image change lands with a working end-to-end
-path, not ahead of it).
-
-### 6. Reload the proxy so the seed takes effect
-`make egress-sync` then recreate/reload the proxy (seeds load at proxy start).
+### 6. Reload the proxy — confirmed not needed
+`.amazonaws.com` was already trusted 2026-07-30 and covers `ssm`/`ssmmessages`/
+`ec2messages`/`sts`. No egress-allowlist change accompanies this grant.
 
 ---
 

@@ -61,6 +61,22 @@ RUN case "${TARGETARCH:-amd64}" in \
     chmod +x /usr/local/bin/gog && \
     /usr/local/bin/gog --version
 
+# session-manager-plugin: the AWS CLI needs this to run `aws ssm
+# start-session` (docs/HOUSE_SSM_RUNBOOK.md §5 — interactive Session Manager
+# shells were blocked on this being absent; awscli alone only covers
+# send-command/get-command-invocation, not an interactive session). Official
+# .deb, no apt repo entry exists for it. Same TARGETARCH pattern as gog above.
+RUN case "${TARGETARCH:-amd64}" in \
+      amd64) SSM_ARCH=ubuntu_64bit ;; \
+      arm64) SSM_ARCH=ubuntu_arm64 ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL -o /tmp/session-manager-plugin.deb \
+      "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/${SSM_ARCH}/session-manager-plugin.deb" && \
+    dpkg -i /tmp/session-manager-plugin.deb && \
+    rm -f /tmp/session-manager-plugin.deb && \
+    session-manager-plugin --version
+
 # openclaw CLI + tsx + sharp installed globally.
 #
 # sharp MUST be global, not at /app/node_modules: openclaw's runtime lives at
