@@ -1,7 +1,10 @@
 <#
 .SYNOPSIS
   Bootstraps a fresh Windows VDI with the CLI dev tools the oasis-claw fleet
-  needs: Claude Code and GitHub CLI, plus optional Git for Windows.
+  needs: Claude Code and GitHub CLI, plus optional Git for Windows. Also
+  reports (diagnostic only, installs nothing) whether this machine is ready
+  for a Podman/WSL2 container runtime, and separates what a local admin can
+  self-serve from what only the VDI host's own administrator can fix.
 
 .DESCRIPTION
   Self-locating and cwd-independent: every path this script touches is
@@ -16,6 +19,11 @@
   Does not touch credentials. `claude` login and `gh auth login` are both
   interactive, browser-involved steps left for the operator to run by hand
   after this script finishes — this script only gets the binaries in place.
+
+  The Podman/WSL2 readiness section never installs or enables anything —
+  enabling Windows features needs a reboot, and nested virtualization can
+  only be turned on by whoever administers the VDI host, never from inside
+  this guest. It only reports which pile each blocker falls into.
 
 .PARAMETER Root
   Persistent root directory for oasis-claw tooling on this machine. Defaults
@@ -198,9 +206,95 @@ Write-Log "--- existing installs ---"
 $claudeVersion = Test-CommandVersion -Command "claude"
 $ghVersion = Test-CommandVersion -Command "gh"
 $gitVersion = Test-CommandVersion -Command "git"
+$podmanVersion = Test-CommandVersion -Command "podman"
 Write-Log "  claude : $(if ($claudeVersion) { $claudeVersion } else { 'not found' })"
 Write-Log "  gh     : $(if ($ghVersion) { $ghVersion } else { 'not found' })"
 Write-Log "  git    : $(if ($gitVersion) { $gitVersion } else { 'not found (optional)' })"
+Write-Log "  podman : $(if ($podmanVersion) { $podmanVersion } else { 'not found' })"
+
+# ---------------------------------------------------------------------------
+# Podman/WSL2 readiness -- DIAGNOSTIC ONLY. This section never installs or
+# enables anything; it exists to sort what's blocking Podman into two piles:
+# what this machine's own user can self-serve (if elevated) versus what only
+# whoever administers this VDI's underlying hypervisor can fix. Wrapped in
+# its own try/catch so a problem here (unexpected Windows build, a cmdlet
+# missing on a locked-down image) reports a warning instead of stopping the
+# Claude Code / GitHub CLI / Git install above, which is already verified
+# working independent of any of this.
+#
+# Two different failure classes, and only one of them is fixable from
+# inside this script or even by a local admin on this machine:
+#
+#   1. Guest-level (this Windows install): the WSL and Virtual Machine
+#      Platform optional features, and the Windows edition (Podman's own
+#      docs call for Pro/Enterprise/Education). A local administrator CAN
+#      self-serve these, unless a corporate Group Policy blocks Windows
+#      feature changes even for admins -- which itself would need IT.
+#   2. Host-level (the hypervisor this VDI runs on, Hyper-V/VMware/other):
+#      whether the VM is exposed the CPU's virtualization extensions at
+#      all ("nested virtualization"). NOTHING inside this guest -- not
+#      local admin, not this script, not a reboot -- can turn this on.
+#      Only whoever administers the VDI host itself can (e.g., on Hyper-V:
+#      Set-VMProcessor -VMName <name> -ExposeVirtualizationExtensions $true,
+#      run ON THE HOST). This is almost always the real approval-needed
+#      item on a VDI, since the guest OS has no way to grant itself this.
+# ---------------------------------------------------------------------------
+
+Write-Log "--- Podman / WSL2 readiness (diagnostic only -- nothing enabled or installed by this section) ---"
+try {
+    $ci = Get-ComputerInfo -Property WindowsProductName, OsBuildNumber, HyperVisorPresent, HyperVRequirementVMMonitorModeExtensions, HyperVRequirementVirtualizationFirmwareEnabled, HyperVRequirementSecondLevelAddressTranslation, HyperVRequirementDataExecutionPreventionAvailable -ErrorAction Stop
+
+    Write-Log "  Windows edition : $($ci.WindowsProductName)"
+    Write-Log "  Windows build   : $($ci.OsBuildNumber)"
+    $editionOk = $ci.WindowsProductName -match "Pro|Enterprise|Education"
+    $buildOk = $false
+    if ($ci.OsBuildNumber) { $buildOk = [int]$ci.OsBuildNumber -ge 19041 }
+    Write-Log "  build >= 19041 (full WSL2 support): $buildOk"
+
+    Write-Log "  --- host-level: nested virtualization (cannot be fixed from inside this guest) ---"
+    Write-Log "  hypervisor already present          : $($ci.HyperVisorPresent)"
+    Write-Log "  VM Monitor Mode Extensions           : $($ci.HyperVRequirementVMMonitorModeExtensions)"
+    Write-Log "  Virtualization Enabled In Firmware   : $($ci.HyperVRequirementVirtualizationFirmwareEnabled)"
+    Write-Log "  Second Level Address Translation     : $($ci.HyperVRequirementSecondLevelAddressTranslation)"
+    Write-Log "  Data Execution Prevention Available  : $($ci.HyperVRequirementDataExecutionPreventionAvailable)"
+    $nestedVirtOk = [bool]$ci.HyperVRequirementVirtualizationFirmwareEnabled -and [bool]$ci.HyperVRequirementVMMonitorModeExtensions
+
+    Write-Log "  --- guest-level: Windows optional features (local admin can self-serve, unless Group Policy blocks it) ---"
+    $wslState = $null
+    $vmpState = $null
+    try {
+        $wslState = (Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -ErrorAction Stop).State
+        $vmpState = (Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction Stop).State
+        Write-Log "  Windows Subsystem for Linux feature : $wslState"
+        Write-Log "  Virtual Machine Platform feature     : $vmpState"
+    } catch {
+        Write-Log "  Could not query optional feature state ($($_.Exception.Message)). This check itself usually needs an elevated session -- re-run as Administrator for a real reading." "WARN"
+    }
+
+    $wslCmd = Get-Command wsl -ErrorAction SilentlyContinue
+    Write-Log "  wsl.exe present : $([bool]$wslCmd)"
+
+    Write-Log "  --- verdict ---"
+    $hostBlockers = @()
+    if (-not $nestedVirtOk) { $hostBlockers += "nested virtualization is not exposed to this VDI guest" }
+    $guestBlockers = @()
+    if (-not $editionOk) { $guestBlockers += "Windows edition ($($ci.WindowsProductName)) -- Podman's own docs call for Pro/Enterprise/Education" }
+    if ($wslState -and $wslState -ne "Enabled") { $guestBlockers += "Windows Subsystem for Linux feature is $wslState, not Enabled" }
+    if ($vmpState -and $vmpState -ne "Enabled") { $guestBlockers += "Virtual Machine Platform feature is $vmpState, not Enabled" }
+
+    if ($hostBlockers.Count -eq 0 -and $guestBlockers.Count -eq 0) {
+        Write-Log "  Nothing blocking here. If this session is elevated, WSL2 + Podman should be self-serviceable without IT."
+    } else {
+        if ($hostBlockers.Count -gt 0) {
+            Write-Log "  NEEDS THE VDI HOST ADMIN (ask for this specifically): $($hostBlockers -join '; ')" "WARN"
+        }
+        if ($guestBlockers.Count -gt 0) {
+            Write-Log "  Possibly self-serviceable by a local Windows admin on THIS machine (try first, only escalate if a Group Policy blocks it): $($guestBlockers -join '; ')" "WARN"
+        }
+    }
+} catch {
+    Write-Log "Could not run the Podman/WSL2 readiness check ($($_.Exception.Message)). This does not affect the Claude Code / GitHub CLI / Git checks above or below." "WARN"
+}
 
 if ($CheckOnly) {
     Write-Log "=== -CheckOnly: stopping here. Nothing was installed or changed. ==="
@@ -313,6 +407,7 @@ Write-Log "=== summary ==="
 Write-Log "  claude : $(if ($claudeVersion) { $claudeVersion } else { 'NOT INSTALLED -- see warnings above' })"
 Write-Log "  gh     : $(if ($ghVersion) { $ghVersion } else { 'NOT INSTALLED -- see warnings above' })"
 Write-Log "  git    : $(if ($gitVersion) { $gitVersion } elseif ($SkipGitForWindows) { 'skipped' } else { 'NOT INSTALLED -- see warnings above' })"
+Write-Log "  podman : $(if ($podmanVersion) { $podmanVersion } else { 'not installed -- this script does not install it; see the Podman/WSL2 readiness report above for what needs IT first' })"
 Write-Log "log written to: $LogFile"
 Write-Log "Next steps, run by hand (this script never touches credentials):"
 Write-Log "  claude          # first run prompts an interactive login"
