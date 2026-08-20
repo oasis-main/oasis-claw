@@ -1712,6 +1712,18 @@ fi
 export GIT_CONFIG_GLOBAL="${CONFIG_DIR}/.gitconfig"
 git config --global core.hooksPath /usr/local/lib/oasis-git-policy/hooks 2>/dev/null || true
 git config --global safe.directory '*' 2>/dev/null || true
+# --replace-all, not a plain set, on every credential.helper line below.
+# CLAW-102 (2026-08-18, remote VDI deployment): this file lives inside a volume that
+# survives every container recreation (GIT_CONFIG_GLOBAL points into it, not
+# $HOME/.gitconfig — see comment above), so any earlier boot, manual
+# recovery step, or auth-mode switch that ever left a SECOND value for this
+# key (e.g. via `git config --add`) makes every later boot's plain
+# `git config <key> <value>` fail outright with "cannot overwrite multiple
+# values with a single value" -- and this script has no `|| true` on these
+# lines, so that failure kills the entire entrypoint, and the whole
+# container exits before the gateway ever starts. `--replace-all` collapses
+# any number of existing values (zero, one, or many) down to exactly the one
+# given here, so it is safe regardless of what an earlier boot left behind.
 if [ -n "${GH_APP_ID:-}" ]; then
   # GitHub App mode (preferred): the oasis-gh-app helper mints a SHORT-LIVED,
   # per-repo-scoped installation token on demand from GH_APP_PRIVATE_KEY_B64 —
@@ -1719,14 +1731,14 @@ if [ -n "${GH_APP_ID:-}" ]; then
   # the owner/repo so it can down-scope the token to just that repo.
   git config --global user.name  "${OASIS_GIT_USER_NAME:-oasis-claw bot}"
   git config --global user.email "${OASIS_GIT_USER_EMAIL:-bots@oasis-x.io}"
-  git config --global credential."https://github.com".helper oasis-gh-app
-  git config --global credential."https://github.com".useHttpPath true
+  git config --global --replace-all credential."https://github.com".helper oasis-gh-app
+  git config --global --replace-all credential."https://github.com".useHttpPath true
   echo "[entrypoint] git wired for GitHub App ${GH_APP_ID} (per-repo tokens on demand; push allowlist='${OASIS_GIT_REPOS:-<none set>}')"
 elif [ -n "${GH_TOKEN:-}" ]; then
   # PAT fallback: static per-bot fine-grained token served for github.com https.
   git config --global user.name  "${OASIS_GIT_USER_NAME:-oasis-claw bot}"
   git config --global user.email "${OASIS_GIT_USER_EMAIL:-bots@oasis-x.io}"
-  git config --global credential."https://github.com".helper oasis-gh
+  git config --global --replace-all credential."https://github.com".helper oasis-gh
   echo "[entrypoint] git+gh wired for GitHub PAT (user='${OASIS_GIT_USER_NAME:-oasis-claw bot}', push allowlist='${OASIS_GIT_REPOS:-<none set>}')"
 elif gh auth status >/dev/null 2>&1; then
   # Personal gh CLI sign-in (Mike, 2026-08-18, House): `gh auth login` run
@@ -1752,7 +1764,7 @@ elif gh auth status >/dev/null 2>&1; then
   # identity.
   git config --global user.name  "${OASIS_GIT_USER_NAME:-oasis-claw bot}"
   git config --global user.email "${OASIS_GIT_USER_EMAIL:-bots@oasis-x.io}"
-  git config --global credential."https://github.com".helper "!gh auth git-credential"
+  git config --global --replace-all credential."https://github.com".helper "!gh auth git-credential"
   echo "[entrypoint] git wired for gh CLI personal sign-in (push allowlist='${OASIS_GIT_REPOS:-<none set>}')"
 else
   echo "[entrypoint] no GH_APP_ID/GH_TOKEN/gh-cli-signin — git limited to anonymous public reads (no push)"
