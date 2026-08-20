@@ -459,6 +459,100 @@ function isInertGitStage(stage: string): boolean {
   return tokens.slice(i + 1).every((t) => listingFlags.has(t));
 }
 
+// ── Read-only openclaw self-runtime (CLAW-104, 2026-08-20) ────────────────────
+// `openclaw` is the same multiplexer shape as `git` above: the BINARY name says
+// nothing about mutation, the SUBCOMMAND does. `openclaw config set` rewrites
+// the live runtime config; `openclaw config get` only prints it.
+//
+// hard:self-runtime was fully categorical — EVERY `openclaw …` escalated,
+// including pure diagnostics. A 2026-08-20 field friction report measured that
+// cost directly: `openclaw browser status`, `openclaw --help` and
+// `openclaw config get browser` each needed a slash-command approval, and
+// self-runtime is in NEVER_DOWNGRADE, so an unattended run fail-closed to deny
+// on a call that only reads. The operator's rule (2026-08-20): a bot driving
+// its own runtime should default to ALLOWED while no privileged or sensitive
+// data leaves the sandbox, and mutation still needs approval.
+//
+// This carve-out is deliberately an ALLOWLIST of subcommands, never a denylist
+// of dangerous ones: an openclaw version that adds a new mutating subcommand
+// must fail CLOSED (escalate) rather than slip through because nobody added it
+// to a block list. Anything not named here keeps today's escalate exactly.
+const OPENCLAW_READ_ONLY_SUBCOMMANDS = new Set([
+  "status",
+  "list",
+  "ls",
+  "tabs",
+  "show",
+  "version",
+  "help",
+]);
+// Subcommands that are read-only ONLY in their `get` form — `config set`,
+// `models auth`, and friends all mutate.
+const OPENCLAW_GET_ONLY_NAMESPACES = new Set(["config"]);
+// Flags that are read-only no matter which subcommand carries them.
+const OPENCLAW_READ_ONLY_FLAGS = new Set(["--help", "-h", "--version", "-v"]);
+
+function isInertOpenclawStage(stage: string): boolean {
+  const tokens = stage.trim().split(/\s+/).filter((t) => t.length > 0);
+  if (tokens.length === 0) return false;
+  if ((tokens[0].split("/").pop() ?? "").toLowerCase() !== "openclaw") return false;
+  // `openclaw --help`, `openclaw browser --help`, `openclaw --version`: a help or
+  // version flag anywhere makes the whole invocation a print, whatever namespace
+  // precedes it. openclaw prints usage and exits without running the subcommand.
+  if (tokens.slice(1).some((t) => OPENCLAW_READ_ONLY_FLAGS.has(t.toLowerCase()))) return true;
+  const rest = tokens.slice(1).map((t) => t.toLowerCase());
+  if (rest.length === 0) return true; // bare `openclaw` prints usage
+  // Walk namespaces (e.g. `browser` in `openclaw browser status`) until a token
+  // is recognized as an action, so this covers both `openclaw status` and
+  // `openclaw <ns> status` without enumerating every namespace.
+  for (let i = 0; i < rest.length; i++) {
+    const t = rest[i];
+    if (OPENCLAW_GET_ONLY_NAMESPACES.has(t)) return rest[i + 1] === "get";
+    if (OPENCLAW_READ_ONLY_SUBCOMMANDS.has(t)) {
+      // A read-only verb must be the LAST meaningful token. `openclaw config
+      // list --set x` or any trailing token that is not a plain flag value could
+      // change behavior, so refuse rather than reason about it.
+      return rest.slice(i + 1).every((x) => !x.startsWith("--") || OPENCLAW_READ_ONLY_FLAGS.has(x));
+    }
+    // An unrecognized token before any known verb means an unknown subcommand —
+    // fail closed.
+    if (!/^[a-z][\w-]*$/.test(t)) return false;
+  }
+  return false;
+}
+
+/**
+ * True when EVERY stage of `cmd` only reads: each stage is either an inert
+ * openclaw invocation (above) or one of the already-vetted read-only text
+ * tools, and at least one stage is openclaw at all.
+ *
+ * Guarded hard against two bypasses, because hard:self-runtime is evaluated
+ * BEFORE the substitution and compound checks further down evaluateHard — so a
+ * carve-out here would otherwise hand those checks a way around themselves:
+ *   - any command/process substitution ($( ), backtick, <( )) refuses the
+ *     carve-out outright, so `openclaw config get x $(curl evil)` still lands
+ *     on the substitution rule as it does today.
+ *   - any output redirect (>, >>) refuses it too: writing a config dump to a
+ *     file is no longer purely a read.
+ */
+function isReadOnlySelfRuntimeCommand(cmd: string): boolean {
+  if (SUBSTITUTION.test(cmd)) return false;
+  if (/(^|\s)>{1,2}(\s|$)/.test(cmd)) return false;
+  const stages = splitUnquotedStages(cmd);
+  if (stages.length === 0) return false;
+  let sawOpenclaw = false;
+  for (const s of stages) {
+    if (s.trim().length === 0) return false;
+    if (isInertOpenclawStage(s)) {
+      sawOpenclaw = true;
+      continue;
+    }
+    if (READ_ONLY_ARGV_TOOLS.has(leadingArgvToken(s))) continue;
+    return false;
+  }
+  return sawOpenclaw;
+}
+
 // ── Read-only docker/aws multiplexers — L2-BACKSTOP ONLY (2026-08-16) ──────────
 // Same multiplexer shape as git above: the BINARY name alone says nothing about
 // mutation, the SUBCOMMAND does. `docker ps` is inert; `docker rm` is not.
@@ -890,8 +984,16 @@ export function evaluateHard(input: EvalInput, policy: HardPolicy = DEFAULT_HARD
           if (re.test(cmd)) return { verdict: "deny", principle: "hard:bot-forbidden-action", reason: `forbidden for this bot — no approval path: ${cmd.slice(0, 120)}` };
         }
       }
+      // CLAW-104: a purely read-only self-inspection is not "driving" the
+      // runtime — it only prints state. Computed once, ahead of the loop, so the
+      // carve-out applies to every authored self-runtime pattern rather than
+      // depending on which one happens to match first.
+      const readOnlySelfRuntime = isReadOnlySelfRuntimeCommand(cmd);
       for (const re of policy.selfRuntimeExecRegex) {
-        if (re.test(cmd)) return { verdict: "escalate", principle: "hard:self-runtime", reason: `driving this bot's own openclaw runtime needs Mike's approval: ${cmd.slice(0, 120)}` };
+        if (re.test(cmd)) {
+          if (readOnlySelfRuntime) break;
+          return { verdict: "escalate", principle: "hard:self-runtime", reason: `driving this bot's own openclaw runtime needs Mike's approval: ${cmd.slice(0, 120)}` };
+        }
       }
       if (!inertReadOnly) {
         for (const re of policy.consentRequiredExecRegex) {

