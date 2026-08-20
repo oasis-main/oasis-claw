@@ -668,10 +668,19 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
           title: "Reviewer approval required",
           description: `${decision.reason}\n(rule: ${decision.principle}, bot: ${botKey}, tool: ${toolName})`,
           severity: "warning" as const,
-          // 3 min: the operator copy-pastes `/approve <id> <decision>` from the DM;
-          // 90s was too tight (a late reply hit "unknown or expired approval id").
-          // Unattended still fail-closes (timeoutBehavior:"deny").
-          timeoutMs: 180_000,
+          // 10 min (= MAX_PLUGIN_APPROVAL_TIMEOUT_MS, the runtime ceiling): the
+          // operator copy-pastes `/approve <id> <decision>` from a Telegram DM,
+          // often from a phone. 90s was too tight, and so was the 180s that
+          // replaced it — on 2026-08-20 House logged 8 waits pinned at ~179.98s
+          // (the ceiling) against ~12 that landed, i.e. roughly 40% of approval
+          // requests died as "exec failed: Approval timed out" and broke the
+          // agent's task mid-flight. Raising the window costs nothing when Mike
+          // answers promptly (the wait ends on his reply, not on the timeout).
+          // This CANNOT hang an unattended run: the unattended adjustment above
+          // resolves every escalate to allow/deny before this path is reached,
+          // so requireApproval is only ever issued in an attended session.
+          // Security posture is unchanged — timeoutBehavior stays "deny".
+          timeoutMs: 600_000,
           timeoutBehavior: "deny" as const,
           allowedDecisions: ["allow-once", "allow-always", "deny"] as const,
         },
