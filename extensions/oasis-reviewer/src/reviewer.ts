@@ -85,16 +85,69 @@ const REQUEST_CACHE_MAX = 64;
 const REQUEST_MAX_CHARS = 1500;
 const requestByRun = new Map<string, string>();
 
-function rememberRequest(runId: string, prompt: string): void {
-  if (!runId || !prompt) return;
-  // Keep the FIRST prompt of a run: that is the ask. Later ReAct steps re-enter
-  // this hook and would otherwise overwrite it with intermediate state.
-  if (requestByRun.has(runId)) return;
-  if (requestByRun.size >= REQUEST_CACHE_MAX) {
-    const oldest = requestByRun.keys().next().value;
-    if (oldest !== undefined) requestByRun.delete(oldest);
+// ── Standing task across run boundaries (CLAW-103, 2026-08-20) ───────────────
+// requestByRun above is keyed by RUN. A run ends when a turn fails mid-flight
+// ("[assistant turn failed before producing content]") or the operator's
+// message arrives garbled/truncated. The next message opens a NEW run with a
+// NEW runId, so the lookup below found only that run's own first prompt — a
+// short follow-up — and the judge lost the work actually underway.
+//
+// Confirmed twice in a deployment's reviewer-audit.jsonl, both citing only the short
+// follow-up in their stated reason:
+//   2026-08-14 — a read-only `find`/`grep` survey escalated as "explores an
+//     unrelated repo ... no connection to Mike's stated request", right after a
+//     turn failure; the survey served the broader ask from earlier turns.
+//   2026-08-18 — a `git stash` and a file edit escalated as "operator's message
+//     is only a question about a 'slop-cop check'" and "message is
+//     garbled/interrupted ... gives no clear instruction", during an
+//     in-progress bugfix verification.
+// In both, detecting the fragment was CORRECT behavior; having no path back to
+// the standing task was the defect.
+//
+// Deliberately a SECOND map rather than a change to the per-run one. The
+// consent-downgrade at the Layer 2 call site keys on the per-run request
+// specifically — "he asked for it THIS run" — and must not be satisfiable by a
+// stale ask from earlier in the session. Keeping the two separate makes that
+// distinction structural instead of a comment nobody re-reads.
+const STANDING_CACHE_MAX = 64;
+// Length is a crude proxy for "this is a real instruction, not a fragment".
+// Chosen because the two confirmed failures were a 14-character question and a
+// truncated send, while genuine asks in the same logs run to whole paragraphs.
+// A misjudgment here is SAFE in both directions: too low and the judge sees a
+// slightly noisier standing block alongside this run's own turn; too high and
+// it simply falls back to today's behavior. It can never suppress or override
+// the run's own request, which is always sent.
+const STANDING_MIN_CHARS = 120;
+const standingBySession = new Map<string, string>();
+
+function evictOldest(cache: Map<string, string>, max: number): void {
+  if (cache.size < max) return;
+  const oldest = cache.keys().next().value;
+  if (oldest !== undefined) cache.delete(oldest);
+}
+
+function rememberRequest(runId: string, sessionId: string, prompt: string): void {
+  if (!prompt) return;
+  const trimmed = prompt.slice(0, REQUEST_MAX_CHARS);
+  if (runId && !requestByRun.has(runId)) {
+    // Keep the FIRST prompt of a run: that is the ask. Later ReAct steps re-enter
+    // this hook and would otherwise overwrite it with intermediate state.
+    evictOldest(requestByRun, REQUEST_CACHE_MAX);
+    requestByRun.set(runId, trimmed);
   }
-  requestByRun.set(runId, prompt.slice(0, REQUEST_MAX_CHARS));
+  // The session's standing task, by contrast, tracks the LATEST substantive ask
+  // — a new real instruction supersedes an older one, so the judge is never
+  // reasoning from a task Mike has already moved on from. Short prompts never
+  // overwrite it, which is exactly what keeps a "slop-cop check" from erasing
+  // the work it was asking about.
+  if (sessionId && prompt.trim().length >= STANDING_MIN_CHARS) {
+    // Delete first so re-setting moves this session to the end of the insertion
+    // order; without it the eviction above would treat a long-running, actively
+    // updated session as the oldest and drop it.
+    standingBySession.delete(sessionId);
+    evictOldest(standingBySession, STANDING_CACHE_MAX);
+    standingBySession.set(sessionId, trimmed);
+  }
 }
 
 // ── Repeated-reply loop guard (CLAW-13x, 2026-08-13 House incident) ──────────
@@ -296,7 +349,8 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
   api.on("llm_input", (event: Record<string, unknown>, ctx: Record<string, unknown>) => {
     try {
       const runId = String(ctx?.runId ?? event?.runId ?? "");
-      rememberRequest(runId, String(event?.prompt ?? ""));
+      const sessionId = String(ctx?.sessionId ?? event?.sessionId ?? "");
+      rememberRequest(runId, sessionId, String(event?.prompt ?? ""));
     } catch {
       /* never let request capture affect the run */
     }
@@ -330,6 +384,11 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
       const unattended = isUnattended(sessionKey);
       // What Mike asked for this run — the judge's evidence for intent.
       const operatorRequest = requestByRun.get(String(ctx?.runId ?? "")) ?? "";
+      // CLAW-103: the standing task from earlier in this session, sent ALONGSIDE
+      // the per-run request (never instead of it) so a call made after a failed
+      // or garbled turn is still judged against the work it actually serves.
+      // Read via sessionId, which survives the run boundary that runId does not.
+      const standingRequest = standingBySession.get(String(sessionId)) ?? "";
 
       // ── Which calls are worth a model judgment ──
       // constitutionalReviewRequired bots (nimbus/helloworld) → EVERY call: their
@@ -365,7 +424,7 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         const l1 = decision;
         const r = await judgeConstitution(
           l2Complete as LlmComplete,
-          { botKey, toolName, family, subject, params: paramsJson, constitution, operatorRequest },
+          { botKey, toolName, family, subject, params: paramsJson, constitution, operatorRequest, standingRequest },
           { model: l2Model, timeoutMs: l2TimeoutMs, thinkingLevel: l2Thinking, maxTokens: l2MaxTokens },
         );
         // ── Operator-consent downgrade (CLAW-079) — deliberately narrow ──
@@ -520,6 +579,12 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         l2Mode,
         l2Judged: l2Eligible,
         hadOperatorRequest: !!operatorRequest,
+        // CLAW-103: true when a standing task from an EARLIER run in this session
+        // was carried into the judgment. Grep for rows where this is true and
+        // hadOperatorRequest is false — that is exactly the failure shape the fix
+        // targets (a run whose own prompt was a fragment), so it is the cheapest
+        // way to confirm the fix fires in production rather than assuming it does.
+        hadStandingRequest: !!standingRequest && standingRequest !== operatorRequest,
         layer2Pending: l2Eligible && l2Mode === "shadow",
         // See the injection-review dispatch block below: when true, a separate
         // phase:"injection_review" row for this same toolCallId follows once the
@@ -539,7 +604,7 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         const l1Principle = decision.principle;
         void judgeConstitution(
           l2Complete as LlmComplete,
-          { botKey, toolName, family, subject, params: paramsJson, constitution, operatorRequest },
+          { botKey, toolName, family, subject, params: paramsJson, constitution, operatorRequest, standingRequest },
           // No agentId: passing it is treated as a target-agent OVERRIDE and
           // rejected ("Plugin LLM completion cannot override the target agent").
           // Omitting it uses the ambient agent's own model/credentials.
