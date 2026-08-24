@@ -115,6 +115,37 @@ const DESTRUCTIVE = [
   />\s*\/dev\/(sd|nvme|disk|hd)\w*/,
   /\bchmod\s+-R\s+0*\s+\//,
 ];
+// ── Safe scratch-directory rm carve-out (2026-08-24, confirmed live friction) ──
+// House's real reviewer-audit.jsonl hard-denied routine "clean up my scratch
+// dir before reusing it" work twice: 2026-08-19 `rm -f` of two individually
+// named /tmp files before a read-only balance/positions check, and 2026-08-24
+// `rm -rf /tmp/<worktree-dir>` before `git worktree add` there to run tests
+// against a PR branch. DESTRUCTIVE's second pattern (line below) matches `rm
+// -rf` against ANY absolute path, not just a bare `/` — `\/)\b` is satisfied
+// by the leading slash of literally any path, since a slash-to-word-char
+// transition is always a `\b`. That pattern is paired with --no-preserve-root
+// in the same alternation, so its evident intent was "catch a root wipe",
+// which DESTRUCTIVE's FIRST pattern already does correctly and independently.
+//
+// Deliberately narrow: this strips an `rm` invocation ONLY when every target
+// is under /tmp or the bot's own persistent scratch dir
+// (/home/node/.openclaw/workspace/tmp) — both are container-private space
+// nothing but the bot itself ever populates (the rest of the root filesystem
+// is read-only). It does NOT touch the DESTRUCTIVE regexes themselves, so
+// `rm -rf` of a bare `/` or of any OTHER absolute path (a real project
+// directory, /etc, anything outside these two scratch roots) still denies
+// exactly as before — this closes the observed false positive without
+// widening what DESTRUCTIVE catches everywhere else. If the lookahead below
+// finds a non-scratch argument tailing the same invocation (e.g. `rm -rf
+// /tmp/x /etc/passwd`), the match fails outright and the ENTIRE original
+// command still hits the unmodified DESTRUCTIVE checks — mixing one safe
+// target with one unsafe one gets no benefit from this carve-out.
+const SAFE_SCRATCH_RM =
+  /\brm\s+-[a-z]+((?:\s+(?:\/tmp|\/home\/node\/\.openclaw\/workspace\/tmp)(?:\/[^\s;&|<>$`()]*)?)+)(?=\s*(?:;|&&|\|\||\||$))/gi;
+function stripSafeScratchRm(cmd: string): string {
+  return cmd.replace(SAFE_SCRATCH_RM, "");
+}
+
 // Download/decode → shell execution (obfuscated RCE): fetched or decoded content
 // piped/chained INTO a shell interpreter. Hard-deny even on a reviewer-gated bot
 // (a legit install is done in inspectable steps, or by Mike).
@@ -951,8 +982,9 @@ export function evaluateHard(input: EvalInput, policy: HardPolicy = DEFAULT_HARD
   if (input.family === "exec") {
     const cmd = firstString(params, "command", "cmd", "script", "input", "code");
     if (cmd) {
+      const destructiveCheckCmd = stripSafeScratchRm(cmd);
       for (const re of DESTRUCTIVE) {
-        if (re.test(cmd)) {
+        if (re.test(destructiveCheckCmd)) {
           // "allow" means this rule ABSTAINS, not "stop evaluating". Returning
           // early on allow would short-circuit the escalate patterns below and
           // hand the bot an unconditional pass on `rm -rf /`, which is the exact

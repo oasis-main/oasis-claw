@@ -365,7 +365,7 @@ describe("evaluateHard — read-only git under House's real policy", () => {
         // escalateActions below names a pattern from THIS map, so the fixture
         // has to carry it or the git rule silently resolves to nothing.
         escalateExecPatterns: {
-          "git-push-clone-commit": "\\bgit(hub)?\\b.*\\b(push|clone|commit|remote\\s+add)\\b|\\bgh\\b\\s+(pr|release|repo)\\b",
+          "git-push-clone-commit": "\\bgit(hub)?\\b.*\\b(push|clone|commit|remote\\s+add)\\b|\\bgh\\b\\s+(pr|issue)\\s+(?!(?:list|view|diff|checks|status|download|watch|create|comment|edit)\\b)|\\bgh\\b\\s+(release|repo|run)\\s+(?!(?:list|view|diff|checks|status|download|watch)\\b)",
         },
       },
       per_bot: { house: {
@@ -388,6 +388,111 @@ describe("evaluateHard — read-only git under House's real policy", () => {
       .toMatchObject({ verdict: "escalate", principle: "hard:operator-consent-action" });
     expect(evaluateHard(exec("git push origin dev"), house))
       .toMatchObject({ verdict: "escalate", principle: "hard:operator-consent-action" });
+  });
+
+  // 2026-08-24: confirmed live in House's real reviewer-audit.jsonl — `gh pr
+  // list`, `gh pr view`, and a chain ending in `gh pr view` after `gh run
+  // view` all escalated identically to a real `gh pr merge`, because the old
+  // pattern matched the NOUN (pr/release/repo) with no regard to the verb.
+  it("allows read-only gh subcommands across every gated noun", () => {
+    const reads = [
+      "XDG_CACHE_HOME=/tmp/gh-cache gh pr list --repo MikeHLee/exp --state open --json number,title",
+      "gh pr view 32 --repo MikeHLee/exp --json number,title,state,mergeable",
+      "gh pr diff 32 --repo MikeHLee/exp",
+      "gh pr checks 32 --repo MikeHLee/exp",
+      "gh release view v1.0 --repo MikeHLee/exp",
+      "gh repo view MikeHLee/exp",
+      "gh run view 32680809023 --repo MikeHLee/exp --json status,conclusion && gh pr view 32 --repo MikeHLee/exp --json number",
+      "gh issue list --repo MikeHLee/exp",
+    ];
+    for (const cmd of reads) expect(evaluateHard(exec(cmd), house).verdict).toBe("allow");
+  });
+
+  it("still escalates a gh subcommand that mutates GitHub state", () => {
+    const writes = [
+      "gh pr merge 32 --repo MikeHLee/exp",
+      "gh pr close 32 --repo MikeHLee/exp",
+      "gh pr reopen 32 --repo MikeHLee/exp",
+      "gh pr review 32 --approve",
+      "gh pr lock 32",
+      "gh release create v1.1 --repo MikeHLee/exp",
+      "gh repo delete MikeHLee/exp",
+      "gh repo create MikeHLee/new-repo --public",
+      "gh run rerun 12345",
+      "gh issue close 5 --repo MikeHLee/exp",
+    ];
+    for (const cmd of writes) {
+      expect(evaluateHard(exec(cmd), house))
+        .toMatchObject({ verdict: "escalate", principle: "hard:operator-consent-action" });
+    }
+  });
+
+  // 2026-08-24, Mike: "PR create, comment, and edit are usually very low-risk
+  // writes so long as the trajectory they are used in is not malicious or
+  // compromised" — a blanket hard-escalate on these is compliance box-ticking,
+  // not trajectory analysis. Layer 1 now lets them through to Layer 2 (the
+  // constitution's trajectory judgment) instead of forcing Mike's sign-off on
+  // every one regardless of context. Deliberately NOT extended to
+  // release/repo/run — those keep the original read-only carve-out.
+  it("lets a low-risk gh pr/issue write through to trajectory judgment instead of hard-escalating", () => {
+    const lowRiskWrites = [
+      "gh pr create --repo MikeHLee/exp --title x --body y",
+      "gh pr comment 32 --repo MikeHLee/exp --body 'lgtm'",
+      "gh pr edit 32 --repo MikeHLee/exp --title 'new title'",
+      "gh issue create --repo MikeHLee/exp --title x --body y",
+      "gh issue comment 5 --repo MikeHLee/exp --body 'ack'",
+      "gh issue edit 5 --repo MikeHLee/exp --title 'new title'",
+    ];
+    for (const cmd of lowRiskWrites) expect(evaluateHard(exec(cmd), house).verdict).toBe("allow");
+  });
+
+  it("still hard-escalates the equivalent create/edit write on release/repo/run (broader or harder-to-undo blast radius)", () => {
+    const stillGated = [
+      "gh release edit v1.1 --repo MikeHLee/exp --notes 'x'",
+      "gh repo edit MikeHLee/exp --description 'x'",
+    ];
+    for (const cmd of stillGated) {
+      expect(evaluateHard(exec(cmd), house))
+        .toMatchObject({ verdict: "escalate", principle: "hard:operator-consent-action" });
+    }
+  });
+});
+
+describe("evaluateHard — safe scratch-directory rm carve-out (2026-08-24)", () => {
+  // Confirmed live in House's real reviewer-audit.jsonl: `rm -f` of two named
+  // /tmp files (2026-08-19) and `rm -rf /tmp/<worktree>` before `git worktree
+  // add` there (2026-08-24) were both hard-DENIED as "destructive" — the
+  // second DESTRUCTIVE pattern matches `rm -rf` against ANY absolute path
+  // (the leading `/` is always followed by a word-boundary), not just a bare
+  // `/`, even though it is paired with --no-preserve-root, whose only purpose
+  // is forcing a root wipe.
+  it("allows rm -rf/-f of /tmp paths, including multiple targets", () => {
+    const safe = [
+      "rm -rf /tmp/exp-pr33-check && git worktree add --detach /tmp/exp-pr33-check abc123 && python3 -m pytest -q",
+      "rm -f /tmp/sentinel-evals.jsonl /tmp/pmt-signals.log",
+      "rm -rf /home/node/.openclaw/workspace/tmp/verify-venv",
+    ];
+    for (const cmd of safe) expect(evaluateHard(exec(cmd), P).verdict).not.toBe("deny");
+  });
+
+  it("still denies a bare root wipe", () => {
+    expect(evaluateHard(exec("rm -rf /"), P))
+      .toMatchObject({ verdict: "deny", principle: "hard:destructive-exec" });
+    expect(evaluateHard(exec("rm -rf / --no-preserve-root"), P))
+      .toMatchObject({ verdict: "deny", principle: "hard:destructive-exec" });
+  });
+
+  it("still denies rm -rf of a non-scratch absolute path", () => {
+    expect(evaluateHard(exec("rm -rf /reach/exp/important-directory"), P))
+      .toMatchObject({ verdict: "deny", principle: "hard:destructive-exec" });
+  });
+
+  it("denies a mixed command that rm's one scratch path and one real path", () => {
+    // The carve-out only strips an rm invocation when EVERY target is a
+    // scratch path; a mixed target list gets no benefit from it at all, so
+    // the whole original command still hits the unmodified DESTRUCTIVE check.
+    expect(evaluateHard(exec("rm -rf /tmp/x /etc/passwd"), P))
+      .toMatchObject({ verdict: "deny", principle: "hard:destructive-exec" });
   });
 });
 
