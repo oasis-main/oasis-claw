@@ -15,6 +15,21 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 compose_file="${repo_root}/docker-compose.runtime.yml"
 voice_dir="${repo_root}/vendor/oasis-voice"
 
+# DUAL-HOMING (fixed 2026-08-24). docker-compose.runtime.yml attaches oasis-voice
+# to oasis_runtime ONLY. sandbox/docker-compose.sandbox-runtime.yml re-declares the
+# same service on BOTH oasis_runtime and oasis_sandboxed, and that second network
+# is the only way the five sandboxed bots (house, kolmogorov, yesman, butterbolt,
+# vanhelsing) resolve the hostname. Recreating the sidecar from the runtime file
+# alone silently drops it back to oasis_runtime — no error, no warning — and every
+# sandboxed bot loses voice until someone notices. This is the same trap the root
+# Makefile documents under "DUAL-HOMED SIDECAR TRAP".
+# Layer the sandbox overlay whenever it exists so the attachment survives.
+sandbox_file="${repo_root}/sandbox/docker-compose.sandbox-runtime.yml"
+compose_args=(-f "${compose_file}")
+if [[ -f "${sandbox_file}" ]]; then
+  compose_args+=(-f "${sandbox_file}")
+fi
+
 note()  { printf "\033[1;34m[rebuild]\033[0m %s\n" "$*"; }
 ok()    { printf "\033[1;32m[ ok ]\033[0m %s\n" "$*"; }
 fail()  { printf "\033[1;31m[fail]\033[0m %s\n" "$*" >&2; exit 1; }
@@ -28,8 +43,19 @@ note "Building oasis-voice:cpu from ${voice_dir}"
 ok "image built"
 
 note "Recreating sidecar container"
-docker compose -f "${compose_file}" up -d --no-deps oasis-voice
+docker compose "${compose_args[@]}" up -d --no-deps oasis-voice
 ok "container up"
+
+# Prove the dual-homing survived. A sidecar on oasis_runtime alone is the exact
+# silent failure this script used to cause, so assert instead of assuming.
+if [[ -f "${sandbox_file}" ]]; then
+  note "Verifying oasis_sandboxed attachment"
+  nets="$(docker inspect oasis-voice --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}')"
+  case "${nets}" in
+    *oasis_sandboxed*) ok "dual-homed: ${nets}" ;;
+    *) fail "oasis-voice is on '${nets}' with no oasis_sandboxed attachment — the five sandboxed bots have just lost voice. Restore with: cd bots && make sidecars-up" ;;
+  esac
+fi
 
 note "Waiting for container to be running"
 for i in {1..20}; do

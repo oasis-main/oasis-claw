@@ -859,6 +859,37 @@ if find_roots:
             also.append(t)
 else:
     also = [x for x in also if x not in FIND_TOOLS]
+# ---- `message`: the outbound attachment tool (2026-08-24) ------------------
+# The media audit found the fleet has no deliberate way to hand a file back to a
+# human. `message` is the core tool that does it — it carries the attachments
+# array that the whole generated-attachments path feeds. It sits in the
+# "messaging" profile only (vendor/openclaw/src/agents/tool-catalog.ts:222-229),
+# so tools.profile="coding" strips it on every bot. Live proof: every bot's
+# tool-policy line reads "removed N tool(s) via tools.profile (coding): ...,
+# message, ...".
+#
+# GATED, DEFAULT OFF, and deliberately NOT fleet-wide. `message` can send to
+# arbitrary chats and carries arbitrary media, so it is an exfiltration primitive.
+# The fleet's own rule is that privilege is inversely proportional to adversarial
+# exposure (bots/yesman/role.yaml:16-17). House ingests market narratives and
+# Kolmogorov ingests papers that argue for their own conclusions; neither should
+# gain a send primitive to close out a media gap. Nimbus talks to Mike, holds the
+# lowest injection exposure of the reach-enabled bots, and is the one bot whose
+# reviewer runs constitutionalReviewRequired on EVERY call — so it is where this
+# belongs first. Turn it on per-bot with OASIS_MESSAGE_TOOL_ENABLE=1.
+#
+# Pruned when the flag is unset, the same shape as FIND_TOOLS above, so turning
+# the flag back off actually removes the tool instead of leaving it stranded in
+# the persisted alsoAllow forever.
+MESSAGE_TOOLS = ("message",)
+if os.environ.get("OASIS_MESSAGE_TOOL_ENABLE", "").strip() == "1":
+    for t in MESSAGE_TOOLS:
+        if t not in also:
+            also.append(t)
+    print("[entrypoint] message tool: ENABLED (outbound attachments + media allowed)")
+else:
+    also = [x for x in also if x not in MESSAGE_TOOLS]
+
 if also:
     tools_cfg["alsoAllow"] = also
 elif "alsoAllow" in tools_cfg:
@@ -1144,19 +1175,35 @@ if oasis_voice_tts_voice_env:
 # route that makes the media-understanding runner attempt oasis-voice's
 # (runtime-registered) provider first.
 #
-# Order = fallback order: oasis-voice (local Moonshine) first; openai
-# (gpt-4o-transcribe) second so a sidecar outage degrades to cloud rather
-# than failing the transcription outright. Drop the openai entry if you
-# want strict local-only. This is the inbound counterpart of the
+# The list is STRICT LOCAL-ONLY as of 2026-08-24: oasis-voice (local Moonshine)
+# and nothing else. It used to carry an openai/gpt-4o-transcribe second entry
+# described as a cloud degradation path; that entry could never fire and the
+# claim was false — see the block immediately below the assignment for the three
+# independent reasons. This is the inbound counterpart of the
 # `messages.tts.provider` outbound pin below, and is hard-overwritten on
-# every boot for the same reason that pin is.
+# every boot for the same reason that pin is. Both pins are asserted at the end
+# of this script so neither can silently rot.
 config.setdefault("tools", {})
 config["tools"].setdefault("media", {})
 config["tools"]["media"].setdefault("audio", {})
 config["tools"]["media"]["audio"]["enabled"] = True
+# 2026-08-24: the openai/gpt-4o-transcribe fallback was REMOVED. It could never
+# fire, for three independent reasons found in the media audit:
+#   1. No bot has an `openai` block under models.providers, so the provider-auth
+#      resolver has nothing to resolve.
+#   2. The five sandboxed bots cannot reach api.openai.com at all — the egress
+#      allowlist is .anthropic.com + api.telegram.org plus per-bot seeds, and no
+#      bot's seed or learned list names an OpenAI host.
+#   3. The shared OpenAI key has no quota. Two persisted error bodies prove it:
+#      /home/node/.openclaw/media/inbound/file_3---872b4d69-*.txt and
+#      file_5---454367bc-*.txt each contain "type": "insufficient_quota".
+# A fallback that cannot fire is worse than no fallback: the comment above used
+# to promise that a sidecar outage "degrades to cloud rather than failing", and
+# that promise was false. Transcription is local-only. If the sidecar is down,
+# inbound voice fails loudly — which is the honest behaviour. To restore a real
+# fallback, add a models.providers entry, an egress origin, and a funded key.
 config["tools"]["media"]["audio"]["models"] = [
     {"provider": "oasis-voice", "model": "moonshine-base"},
-    {"provider": "openai", "model": "gpt-4o-transcribe"},
 ]
 # Strip stale `provider` key from prior boots — that key isn't valid in
 # the audio-config schema. Idempotent merge alone wouldn't clean up a
@@ -1194,6 +1241,38 @@ config["models"]["providers"]["oasis-voice"].setdefault("models", [])
 config["models"]["providers"]["oasis-voice"]["apiKey"] = (
     oasis_voice_bearer if oasis_voice_bearer else "anonymous"
 )
+
+# ---- media retention (2026-08-24) --------------------------------------
+# Nothing has EVER been pruned from any bot's media tree. The cause is a single
+# unset key: vendor/openclaw/src/gateway/server-maintenance.ts:345-353 returns
+# `mediaCleanup: null` when mediaCleanupTtlMs is not a number, and `cfg.media`
+# was unset on all 7 bots — so the cleanup timer was never installed at all.
+# Evidence at audit time: Nimbus's oldest inbound file dated 2026-05-04, and
+# every sticker ever received is downloaded and kept (the description cache is
+# bypassed whenever the model has vision, which is always on this fleet).
+#
+# ttlHours is an int bounded [1, 168] by zod-schema.ts:906-911, so 168 (7 days)
+# is the MAXIMUM the schema allows and the most conservative setting that still
+# turns cleanup on. Cleanup walks the full media tree recursively and prunes
+# empty dirs, so it removes BOTH inbound and outbound media past the window.
+# Override per-bot with OASIS_MEDIA_TTL_HOURS; set it to 0 to opt out entirely
+# and keep the old never-prune behaviour.
+_media_ttl_raw = os.environ.get("OASIS_MEDIA_TTL_HOURS", "").strip()
+try:
+    _media_ttl = int(_media_ttl_raw) if _media_ttl_raw else 168
+except ValueError:
+    print(f"[entrypoint] media retention: OASIS_MEDIA_TTL_HOURS={_media_ttl_raw!r} "
+          f"is not an integer — falling back to 168")
+    _media_ttl = 168
+if _media_ttl > 0:
+    _media_ttl = max(1, min(_media_ttl, 168))
+    config.setdefault("media", {})["ttlHours"] = _media_ttl
+    print(f"[entrypoint] media retention: {_media_ttl}h (cleanup timer INSTALLED)")
+else:
+    config.get("media", {}).pop("ttlHours", None)
+    if config.get("media") == {}:
+        config.pop("media", None)
+    print("[entrypoint] media retention: disabled (media is never pruned)")
 
 # ---- outbound voice (CLAW-021): voice-in → voice-out ------------------
 # Three knobs together make this work:
@@ -1631,6 +1710,41 @@ if _thinking_level:
     _agents_defaults["thinkingDefault"] = _thinking_level
     print(f"[entrypoint] thinking default: {_thinking_level} (EXPLICIT override — "
           f"reasoning moves to native thinking blocks / reasoning lane)")
+
+# ---- BOOT ASSERTIONS: the media pins (2026-08-24) -----------------------
+# Both media routes are single unguarded assignments in this file with no test
+# and no health check. The media audit found that inbound audio routing depends
+# entirely on `tools.media.audio.models` naming oasis-voice FIRST: the plugin
+# ships without a manifest `contracts` block on purpose, which makes it
+# invisible to media-understanding's autoPriority registry, so nothing else
+# would select it. If a future edit drops or reorders that pin, transcription
+# silently stops routing to the local sidecar — no error, no log line, the
+# failure only shows up as voice notes that never get answered.
+# Outbound TTS has the same shape via `messages.tts.provider`.
+# These assertions FAIL THE BOOT rather than let either pin rot silently.
+_audio_models = config.get("tools", {}).get("media", {}).get("audio", {}).get("models")
+if not isinstance(_audio_models, list) or not _audio_models:
+    raise SystemExit(
+        "[entrypoint] FATAL: tools.media.audio.models is missing or empty. "
+        "Inbound voice transcription would silently stop. Restore the "
+        "oasis-voice pin in this script."
+    )
+if _audio_models[0].get("provider") != "oasis-voice":
+    raise SystemExit(
+        f"[entrypoint] FATAL: tools.media.audio.models[0].provider is "
+        f"{_audio_models[0].get('provider')!r}, expected 'oasis-voice'. "
+        "oasis-voice has no manifest contracts block, so autoPriority cannot "
+        "select it — it MUST be pinned first or transcription leaves the fleet."
+    )
+_tts_provider = config.get("messages", {}).get("tts", {}).get("provider")
+if _tts_provider != "oasis-voice":
+    raise SystemExit(
+        f"[entrypoint] FATAL: messages.tts.provider is {_tts_provider!r}, "
+        "expected 'oasis-voice'. Outbound voice replies would fall through to "
+        "a cloud TTS provider or fail."
+    )
+print(f"[entrypoint] media pins OK: audio={_audio_models[0]['provider']}/"
+      f"{_audio_models[0].get('model')} tts={_tts_provider}")
 
 config_path.parent.mkdir(parents=True, exist_ok=True)
 config_path.write_text(json.dumps(config, indent=2) + "\n")
