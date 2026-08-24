@@ -29,6 +29,7 @@ import {
   type LlmComplete,
 } from "./layer2.js";
 import { sendTelegramMessage } from "./telegram.js";
+import { fallbackSessionFilePath, readSessionTranscriptSummary } from "./transcript.js";
 
 // Layer 2 concurrency cap — bound the number of in-flight model judgments so a
 // burst of ambiguous calls can't spawn dozens of top-tier completions at once.
@@ -365,7 +366,14 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
   // alert lands in the SAME chat as the agent's self-report alert.
   const telegramBotToken = process.env.OASIS_TELEGRAM_BOT_TOKEN;
   const telegramChatId = process.env.OASIS_TELEGRAM_CHAT_ID;
-  const runtime = (api as unknown as { runtime?: { llm?: { complete?: LlmComplete } } }).runtime;
+  const runtime = (
+    api as unknown as {
+      runtime?: {
+        llm?: { complete?: LlmComplete };
+        session?: { resolveSessionFilePath?: (sessionId: string, entry?: unknown, opts?: unknown) => string };
+      };
+    }
+  ).runtime;
   // Available when EITHER switch wants it — injection review must not be starved of a
   // model just because OASIS_REVIEWER_L2 (ordinary tool-call tightening) is off for
   // this bot; the two features are independent by design (see above).
@@ -375,6 +383,46 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
       : undefined;
   if ((l2Mode !== "off" || injectionReviewMode !== "off") && !l2Complete) {
     api.logger.info("oasis-reviewer: Layer 2 / injection review requested but runtime.llm.complete unavailable — staying OFF");
+  }
+
+  // ── Context depth: three tiers of "how much conversation does the judge see" ──
+  // (2026-08-24, Mike: "the reviewer needs to see the entire session history/
+  // trajectory to analyze it... this is not our first session addressing it" —
+  // generalizes the trade-approval fix into a configurable, per-bot dial rather
+  // than one fixed shape. Mike also flagged the cost tradeoff directly, hence
+  // this being a dial rather than always defaulting to the deepest tier.
+  //   "initial" ("Sound | Initial Request")   — operatorRequest only. The
+  //     narrowest, cheapest tier: no standing task, no last message, no
+  //     transcript. Closest to the reviewer's original pre-CLAW-103 shape.
+  //   "recent"  ("Sound | Recent Conversation") — operatorRequest +
+  //     standingRequest + lastAssistantMessage (CLAW-103 + 2026-08-24's
+  //     consent-context fix). DEFAULT — the shape already shipped fleet-wide
+  //     today; choosing it here means introducing this dial changes nobody's
+  //     behavior or cost until a bot is explicitly moved to a different tier.
+  //   "full"    ("Sound | Full Trajectory") — the WHOLE session transcript
+  //     (or its most recent portion if it exceeds contextMaxChars), read via
+  //     transcript.ts. Deepest and most expensive: a real disk read+parse
+  //     plus materially more judge-prompt tokens on every L2-eligible call.
+  // Unrecognized values fall back to "recent" (fail toward the shipped
+  // default, not toward the cheapest or the most expensive tier).
+  const contextDepthRaw = (process.env.OASIS_REVIEWER_CONTEXT_DEPTH ?? "recent").toLowerCase();
+  const contextDepth: "initial" | "recent" | "full" =
+    contextDepthRaw === "initial" || contextDepthRaw === "full" ? contextDepthRaw : "recent";
+  const contextMaxChars = Number(process.env.OASIS_REVIEWER_CONTEXT_MAX_CHARS ?? "20000") || 20_000;
+  // Resolved once at register, same pattern as l2Complete above: prefer the
+  // plugin runtime's own session.resolveSessionFilePath (the SAME resolution
+  // logic openclaw core itself uses — sessionStore lookups, custom sessionFile
+  // overrides, multi-store configs, all handled correctly), falling back to
+  // transcript.ts's hand-built path only if that API is unavailable. Logged at
+  // startup below so a version drift here is visible without guessing.
+  const resolveSessionFilePath =
+    typeof runtime?.session?.resolveSessionFilePath === "function"
+      ? runtime.session.resolveSessionFilePath.bind(runtime.session)
+      : undefined;
+  if (contextDepth === "full" && !resolveSessionFilePath) {
+    api.logger.info(
+      "oasis-reviewer: context depth 'full' requested but runtime.session.resolveSessionFilePath is unavailable — using the fallback path convention instead (see transcript.ts)",
+    );
   }
 
   // Capture the operator's ask for this run so the judge can evaluate intent, not
@@ -442,6 +490,44 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
       const l2Worthwhile = l2All || alwaysConstitutional || family === "exec" || isWriteLike || family === "web";
       const l2Eligible = needsConstitution && l2Worthwhile && !!l2Complete && l2Mode !== "off";
 
+      // ── Context depth (2026-08-24) — apply the configured tier ──
+      // Only pays the transcript-read cost when the call will actually reach
+      // Layer 2 (l2Eligible) — reading+parsing a session file for a call that
+      // was never going to be judged is pure waste. "initial" clears the
+      // deeper fields down to operatorRequest alone; "full" tries to read the
+      // whole session and, on ANY failure (missing file, empty transcript,
+      // resolveSessionFilePath throwing), silently keeps the "recent" fields
+      // already computed above rather than judging with no context at all —
+      // see the module comment on contextDepth.
+      let effectiveStandingRequest = standingRequest;
+      let effectiveLastAssistantMessage = lastAssistantMessage;
+      let sessionTranscript = "";
+      let sessionTranscriptTruncated = false;
+      if (contextDepth === "initial") {
+        effectiveStandingRequest = "";
+        effectiveLastAssistantMessage = "";
+      } else if (contextDepth === "full" && l2Eligible) {
+        const sid = String(sessionId ?? "");
+        if (sid && sid !== "unknown") {
+          try {
+            const agentIdForPath = String(ctx?.agentId ?? "main");
+            const filePath = resolveSessionFilePath
+              ? resolveSessionFilePath(sid, undefined, { agentId: agentIdForPath })
+              : fallbackSessionFilePath(sid, agentIdForPath);
+            const summary = readSessionTranscriptSummary(filePath, contextMaxChars);
+            if (summary.text) {
+              sessionTranscript = summary.text;
+              sessionTranscriptTruncated = summary.truncated;
+              // The transcript already contains both — no need to duplicate.
+              effectiveStandingRequest = "";
+              effectiveLastAssistantMessage = "";
+            }
+          } catch {
+            /* degrade to the "recent" fields already computed above */
+          }
+        }
+      }
+
       // report_injection's independent review (see the dispatch block near the end of
       // this hook, and formatInjectionReviewAlert above). Computed here, ahead of the
       // main audit write below, purely so that row can record whether a follow-up
@@ -462,7 +548,19 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         const l1 = decision;
         const r = await judgeConstitution(
           l2Complete as LlmComplete,
-          { botKey, toolName, family, subject, params: paramsJson, constitution, operatorRequest, standingRequest, lastAssistantMessage },
+          {
+            botKey,
+            toolName,
+            family,
+            subject,
+            params: paramsJson,
+            constitution,
+            operatorRequest,
+            standingRequest: effectiveStandingRequest,
+            lastAssistantMessage: effectiveLastAssistantMessage,
+            sessionTranscript: sessionTranscript || undefined,
+            sessionTranscriptTruncated,
+          },
           { model: l2Model, timeoutMs: l2TimeoutMs, thinkingLevel: l2Thinking, maxTokens: l2MaxTokens },
         );
         // ── Operator-consent downgrade (CLAW-079) — deliberately narrow ──
@@ -620,18 +718,31 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         retryHint: decision.retryHint ?? null,
         l2Mode,
         l2Judged: l2Eligible,
+        // 2026-08-24: the configured context tier ("initial"|"recent"|"full")
+        // and what it actually produced for THIS call — see the contextDepth
+        // block comment above. The had* fields below reflect what was
+        // actually SENT to the judge (post context-depth filtering /
+        // fallback), not just what was captured, so they are the ground
+        // truth for "did the fix actually fire" rather than an intent proxy.
+        contextDepth,
         hadOperatorRequest: !!operatorRequest,
         // CLAW-103: true when a standing task from an EARLIER run in this session
         // was carried into the judgment. Grep for rows where this is true and
         // hadOperatorRequest is false — that is exactly the failure shape the fix
         // targets (a run whose own prompt was a fragment), so it is the cheapest
         // way to confirm the fix fires in production rather than assuming it does.
-        hadStandingRequest: !!standingRequest && standingRequest !== operatorRequest,
+        hadStandingRequest: !!effectiveStandingRequest && effectiveStandingRequest !== operatorRequest,
         // 2026-08-24: true when the bot's own last message was available to
         // feed the judge — see lastAssistantMessageBySession above. Grep for
         // rows where this is true and l2Tightened is false on a call whose
         // operatorRequest is short — that is the shape this fix targets.
-        hadLastAssistantMessage: !!lastAssistantMessage,
+        hadLastAssistantMessage: !!effectiveLastAssistantMessage,
+        // "Sound | Full Trajectory" — true only when contextDepth is "full"
+        // AND the transcript read actually produced content (a failed read
+        // silently falls back to the "recent" fields above, so this can be
+        // false even in full mode — see the contextDepth block comment).
+        hadSessionTranscript: !!sessionTranscript,
+        sessionTranscriptTruncated: sessionTranscript ? sessionTranscriptTruncated : null,
         layer2Pending: l2Eligible && l2Mode === "shadow",
         // See the injection-review dispatch block below: when true, a separate
         // phase:"injection_review" row for this same toolCallId follows once the
@@ -651,7 +762,19 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         const l1Principle = decision.principle;
         void judgeConstitution(
           l2Complete as LlmComplete,
-          { botKey, toolName, family, subject, params: paramsJson, constitution, operatorRequest, standingRequest, lastAssistantMessage },
+          {
+            botKey,
+            toolName,
+            family,
+            subject,
+            params: paramsJson,
+            constitution,
+            operatorRequest,
+            standingRequest: effectiveStandingRequest,
+            lastAssistantMessage: effectiveLastAssistantMessage,
+            sessionTranscript: sessionTranscript || undefined,
+            sessionTranscriptTruncated,
+          },
           // No agentId: passing it is treated as a target-agent OVERRIDE and
           // rejected ("Plugin LLM completion cannot override the target agent").
           // Omitting it uses the ambient agent's own model/credentials.
@@ -677,6 +800,8 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
               l2ParseFail: r.decision ? undefined : (r.raw || null),
               l2Error: r.error ?? null,
               l2RetryHint: r.decision?.retryHint ?? null,
+              contextDepth,
+              hadSessionTranscript: !!sessionTranscript,
               enforced: false, // shadow: L2 never changes the decision yet
             });
           })
@@ -893,6 +1018,9 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
     layer2: l2Complete
       ? `${l2Mode} (model=${l2Model ?? "agent-default"}, timeout=${l2TimeoutMs}ms, scope=${l2All ? "all-calls" : alwaysConstitutional ? "all-calls(constitutional-bot)" : "exec+write+web"})`
       : "off",
+    // 2026-08-24: "Sound | Initial Request" | "Sound | Recent Conversation" |
+    // "Sound | Full Trajectory" — see the contextDepth block comment above.
+    contextDepth: `${contextDepth} (maxChars=${contextMaxChars}, sessionFilePathSource=${resolveSessionFilePath ? "runtime" : "fallback"})`,
     loopGuard: loopGuardMode === "off" ? "off" : `${loopGuardMode} (threshold=${loopGuardThreshold})`,
     injectionReview:
       injectionReviewMode === "off"
