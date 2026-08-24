@@ -740,9 +740,33 @@ function leadingArgvToken(stage: string): string {
 // decide that escalating a read is never the right tightening (CLAW-090).
 // Keeping one implementation means the two layers can never drift into
 // disagreeing about what a side-effect-free command is.
+// ── Sensitive read targets defeat the inert carve-out (CLAW-105, 2026-08-20) ──
+// The carve-outs above reason about the TOOL's capability: `cat` and `grep`
+// cannot execute, write, or reach the network, so a pipeline built only from
+// them was treated as inert and SKIPPED the per-bot deny/consent/escalate loops
+// entirely (see the `if (!inertReadOnly)` guards in evaluateHard).
+//
+// That reasoning has a hole: it says nothing about the SENSITIVITY of what is
+// being read. Found while building a bot whose whole posture depends on these
+// rules — `cat /proc/self/environ` returned hard:default-allow on a live bot
+// whose own constitution names /proc/self/environ as a DENY, because `cat` made
+// the stage inert before any per-bot rule was consulted. `printenv` and
+// `env | grep TOKEN` escalated correctly; only the file-read spelling slipped.
+//
+// These two pseudo-files exist specifically to expose a process's secrets:
+//   /proc/<pid|self>/environ  — the full environment, i.e. every token
+//   /proc/<pid|self>/cmdline  — the launch command line, which on some hosts
+//                                carries a credential as an argument
+// Reading either is never ordinary text processing, whatever tool spells it. A
+// stage naming one is therefore NOT inert, and falls through to the normal
+// per-bot rules — which is all this changes. It adds no new denial by itself;
+// it restores the authored rules' ability to see the command at all.
+const SENSITIVE_READ_TARGET = /\/proc\/(?:\d+|self|thread-self)\/(?:environ|cmdline)\b/;
+
 export function isInertReadOnlyPipeline(cmd: string): boolean {
   const stages = splitUnquotedStages(cmd);
   if (stages.length === 0) return false;
+  if (SENSITIVE_READ_TARGET.test(cmd)) return false;
   return stages.every((s) => {
     if (s.trim().length === 0) return false;
     if (READ_ONLY_ARGV_TOOLS.has(leadingArgvToken(s))) return true;
@@ -760,6 +784,11 @@ export function isInertReadOnlyPipeline(cmd: string): boolean {
 export function isInertReadOnlyPipelineForL2Backstop(cmd: string): boolean {
   const stages = splitUnquotedStages(cmd);
   if (stages.length === 0) return false;
+  // CLAW-105: same sensitive-target exclusion as the Layer 1 variant above.
+  // This one gates the Layer 2 backstop that says "escalating a read is never
+  // the right tightening" — which would otherwise force an ALLOW on exactly the
+  // credential read the judge should be free to stop.
+  if (SENSITIVE_READ_TARGET.test(cmd)) return false;
   return stages.every((s) => {
     if (s.trim().length === 0) return false;
     if (READ_ONLY_ARGV_TOOLS.has(leadingArgvToken(s))) return true;

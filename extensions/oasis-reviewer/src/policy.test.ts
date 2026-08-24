@@ -752,3 +752,54 @@ describe("evaluateHard — retryHint on shape-based deny/escalate", () => {
     expect(v.retryHint).toBeUndefined();
   });
 });
+
+// ── CLAW-105: sensitive read targets defeat the inert carve-out ──────────────
+// The inert-read carve-out reasons about the TOOL's capability and said nothing
+// about the SENSITIVITY of the target, so `cat /proc/self/environ` skipped every
+// per-bot rule and returned hard:default-allow -- on a bot whose own
+// constitution named that exact path as a DENY. `printenv` escalated correctly;
+// only the file-read spelling slipped through.
+describe("isInertReadOnlyPipeline — sensitive read targets (CLAW-105)", () => {
+  it("no longer treats process-secret pseudo-files as inert", () => {
+    for (const c of [
+      "cat /proc/self/environ",
+      "head -c 4000 /proc/self/environ",
+      "cat /proc/1/cmdline",
+      "grep -a TOKEN /proc/self/environ",
+      "cat /proc/self/environ | tr '\\0' '\\n'",
+      "cat /proc/thread-self/environ",
+    ]) {
+      expect(isInertReadOnlyPipeline(c), c).toBe(false);
+      expect(isInertReadOnlyPipelineForL2Backstop(c), c).toBe(false);
+    }
+  });
+
+  it("leaves ordinary /proc reads and normal text pipelines inert", () => {
+    // Narrow on purpose: this must not become a blanket ban on /proc, which
+    // carries plenty of harmless diagnostics a bot legitimately reads.
+    for (const c of [
+      "cat /proc/meminfo",
+      "cat /proc/cpuinfo",
+      "cat /proc/self/status",
+      "cat /proc/loadavg",
+      "grep -r TODO /work",
+      "cat /work/notes.md | head -20",
+    ]) {
+      expect(isInertReadOnlyPipeline(c), c).toBe(true);
+    }
+  });
+
+  it("lets an authored per-bot rule actually see the command now", () => {
+    // The point of the fix: it adds no denial by itself, it restores the
+    // authored rules' ability to be consulted at all.
+    const withEnvDump = {
+      ...P,
+      escalateExecRegex: [new RegExp("/proc/self/environ|\\bprintenv\\b", "i")],
+    };
+    expect(evaluateHard(exec("cat /proc/self/environ"), withEnvDump)).toMatchObject({
+      verdict: "escalate",
+    });
+    // ...and an unrelated read is untouched.
+    expect(evaluateHard(exec("cat /proc/meminfo"), withEnvDump).verdict).toBe("allow");
+  });
+});
