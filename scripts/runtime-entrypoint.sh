@@ -475,6 +475,65 @@ merge_config(
 # not a stale persisted value — merge_config setdefaults config keys, which would
 # otherwise pin whatever landed first. Force it every boot.
 entries["oasis-reviewer"]["config"]["mode"] = os.environ.get("OASIS_REVIEWER_MODE", "shadow")
+#
+# ── LAYER 2 JUDGE MODEL PIN + OVERRIDE GRANT (CLAW-106, 2026-08-24) ───────────
+# The reviewer passes OASIS_REVIEWER_MODEL to runtime.llm.complete() as `model`.
+# openclaw REFUSES that parameter unless the plugin entry carries an explicit
+# grant. The guard is assertAllowedModelOverride() in
+#   vendor/openclaw/src/plugins/runtime/runtime-llm.runtime.ts:313
+# reached from :408 only when a `model` value is present. It reads
+#   cfg.plugins.entries["oasis-reviewer"].llm
+# via resolvePluginLlmOverridePolicy() at :284. Note the path: `llm` is a
+# SIBLING of `config` in PluginEntrySchema (config/zod-schema.ts:273-300), NOT a
+# key inside it. `config` is z.record(z.unknown()), so an `llm` block misplaced
+# under it VALIDATES and is then never read — a silent failure.
+#
+# Without the grant the judge throws "Plugin LLM completion cannot override the
+# target model." on EVERY call. On a constitutionalReviewRequired bot (nimbus,
+# helloworld) that fails CLOSED and denies every tool call. That was the
+# 2026-08-24 16:50-20:08 UTC outage.
+#
+# The grant is DERIVED from the same env var that sets the pin, so the two can
+# never drift apart: no OASIS_REVIEWER_MODEL means no grant at all, which is
+# byte-identical to the pre-CLAW-106 safe state. A set value grants exactly
+# itself and nothing else.
+_reviewer_model = os.environ.get("OASIS_REVIEWER_MODEL", "").strip()
+if _reviewer_model:
+    # openclaw normalizes an allowlist entry with parseModelCatalogRef
+    # (runtime-llm.runtime.ts normalizeAllowedModelRef), which requires the
+    # provider/model form. A bare "claude-sonnet-5" parses to None and is
+    # dropped, leaving hasConfiguredAllowedModels=True with an EMPTY set, which
+    # throws "model override allowlist has no valid models" on every judged call.
+    #
+    # MEASURED 2026-08-24 in oasis-claw-house, three isolated probes:
+    #   grant + "anthropic/claude-sonnet-5"  -> HTTP 200, reply "OK."
+    #   no grant + any ref                   -> "cannot override the target model"
+    #   grant + bare id in BOTH model and allowlist -> "allowlist has no valid models"
+    #
+    # Note what this corrects in the CLAW-106 write-up: a bare params.model on
+    # its OWN is harmless — resolveSimpleCompletionSelectionForAgent resolves it
+    # against the agent catalog and it returns 200. The bare form only becomes
+    # fatal once the allowlist exists, because the allowlist does NOT get that
+    # resolution step. So the outage had ONE cause (the missing grant); the bare
+    # ref is a defect this fix INTRODUCES if left unguarded. Hence the assertion.
+    if "/" not in _reviewer_model or _reviewer_model.startswith("/") or _reviewer_model.endswith("/"):
+        raise SystemExit(
+            f"[entrypoint] FATAL: OASIS_REVIEWER_MODEL is {_reviewer_model!r}, which is not "
+            f"a provider/model reference. openclaw's parseModelCatalogRef requires the "
+            f"provider/model form (for example 'anthropic/claude-sonnet-5'). A bare model id "
+            f"is silently dropped from the override allowlist and denies every judged call."
+        )
+    entries["oasis-reviewer"]["llm"] = {
+        "allowModelOverride": True,
+        "allowedModels": [_reviewer_model],
+    }
+    print(f"[entrypoint] reviewer L2 judge model: {_reviewer_model} (override GRANTED, allowlist=1)")
+else:
+    # No pin -> no grant. The reviewer sends model=undefined, the guard at
+    # runtime-llm.runtime.ts:408 never runs, and the judge inherits the agent's
+    # own model. Strip any stale grant a previous boot persisted.
+    entries["oasis-reviewer"].pop("llm", None)
+    print("[entrypoint] reviewer L2 judge model: agent-default (no override, no grant)")
 # oasis-reach (CLAW-076) inter-bot mail. enabled + peers are DEPLOYMENT-driven per
 # bot (env from the bot's compose overlay), so force them every boot rather than
 # letting merge_config pin a stale first value — same reasoning as the reviewer
