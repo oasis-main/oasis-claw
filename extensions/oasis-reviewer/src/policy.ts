@@ -13,6 +13,17 @@ export interface Decision {
   verdict: Verdict;
   principle: string;
   reason: string;
+  // OPTIONAL — a concrete, safer way to retry the SAME underlying goal
+  // (2026-08-24: Mike asked for denial/escalation feedback so an agent can
+  // self-correct instead of just being blocked). Only set where a genuinely
+  // safer command SHAPE exists for a rule that trips on shape, not on scope
+  // or permission — see the three DESTRUCTIVE/DOWNLOAD_EXEC/SUBSTITUTION
+  // retry-hint constants below. Deliberately omitted for scope/permission
+  // denials (control-plane write, secret read, out-of-scope write, a
+  // per-bot forbidden action) — there is no safer parameterization of an
+  // action that is forbidden for a structural reason, and inventing one
+  // would be actively misleading.
+  retryHint?: string;
 }
 
 // Resolved per-bot policy = fleet ∪ per_bot[botKey], flattened for evaluation.
@@ -145,6 +156,24 @@ const SAFE_SCRATCH_RM =
 function stripSafeScratchRm(cmd: string): string {
   return cmd.replace(SAFE_SCRATCH_RM, "");
 }
+
+// ── Retry-hint constants (2026-08-24) ────────────────────────────────────────
+// Mike: give the agent something to act on besides "no" — a concrete way to
+// retry the SAME goal in a shape that passes review, mirroring two real cases
+// (a command-substitution escalate on a legitimate PR-diff comparison piping
+// `git show | sha256sum`, and a destructive/download-execute denial on a
+// base64-encoded script payload). These three rules exist BECAUSE of the
+// command's SHAPE, not because the underlying goal is out of bounds, so a
+// differently-shaped command can achieve the same result safely. Kept as
+// static strings (not model-generated) because the safe alternative is the
+// SAME for every match of a given rule — Layer 2 generates a dynamic hint on
+// top of this for cases these three don't cover (see layer2.ts).
+const DESTRUCTIVE_RETRY_HINT =
+  "If this is scratch cleanup, target /tmp or the bot's own workspace tmp dir explicitly (that exact shape is exempt). If specific files must go, name each one instead of a recursive/force flag. A real path outside scratch has no safe retry shape — that needs Mike to do it himself, or an explicit ask for his approval.";
+const DOWNLOAD_EXEC_RETRY_HINT =
+  "Write the decoded or fetched content to a file with the write tool first, then run that file as its own separate step (e.g. `python3 script.py`), instead of piping it into a shell (`... | sh`, `... | bash`, `base64 -d | sh`). Piping fetched/decoded bytes straight into an interpreter is what this rule exists to catch, regardless of what the content actually does.";
+const SUBSTITUTION_RETRY_HINT =
+  "Avoid $(...), backticks, and <(...). Run the inner command as its own separate step and use its own tool output directly, or write intermediate output to a file with the write tool and read/diff files directly. Inlining a subshell's result into a command line is what this rule exists to catch, not the underlying goal.";
 
 // Download/decode → shell execution (obfuscated RCE): fetched or decoded content
 // piped/chained INTO a shell interpreter. Hard-deny even on a reviewer-gated bot
@@ -994,12 +1023,24 @@ export function evaluateHard(input: EvalInput, policy: HardPolicy = DEFAULT_HARD
           // deny and escalate still return immediately, so no existing bot's
           // behaviour changes.
           if (policy.destructiveExec !== "allow") {
-            return { verdict: policy.destructiveExec, principle: "hard:destructive-exec", reason: `refusing destructive command: ${cmd.slice(0, 120)}` };
+            return {
+              verdict: policy.destructiveExec,
+              principle: "hard:destructive-exec",
+              reason: `refusing destructive command: ${cmd.slice(0, 120)}`,
+              retryHint: DESTRUCTIVE_RETRY_HINT,
+            };
           }
           break;
         }
       }
-      if (DOWNLOAD_EXEC.test(cmd)) return { verdict: "deny", principle: "hard:download-execute", reason: `refusing pipe/decode into a shell (obfuscated RCE): ${cmd.slice(0, 120)}` };
+      if (DOWNLOAD_EXEC.test(cmd)) {
+        return {
+          verdict: "deny",
+          principle: "hard:download-execute",
+          reason: `refusing pipe/decode into a shell (obfuscated RCE): ${cmd.slice(0, 120)}`,
+          retryHint: DOWNLOAD_EXEC_RETRY_HINT,
+        };
+      }
       // denyExtra / consentRequiredExtra / escalateExtra are naive substring
       // regexes over the whole raw command — they cannot tell a trade/transfer
       // word used as a verb on a real target apart from the same word appearing
@@ -1035,7 +1076,14 @@ export function evaluateHard(input: EvalInput, policy: HardPolicy = DEFAULT_HARD
           if (re.test(cmd)) return { verdict: "escalate", principle: "hard:operator-consent-action", reason: `action needs Mike's slash-command approval: ${cmd.slice(0, 120)}` };
         }
       }
-      if (SUBSTITUTION.test(cmd) && !hasOnlySafeSubstitution(cmd)) return { verdict: policy.substitutionExec, principle: "hard:command-substitution", reason: `command/process substitution routed to human: ${cmd.slice(0, 120)}` };
+      if (SUBSTITUTION.test(cmd) && !hasOnlySafeSubstitution(cmd)) {
+        return {
+          verdict: policy.substitutionExec,
+          principle: "hard:command-substitution",
+          reason: `command/process substitution routed to human: ${cmd.slice(0, 120)}`,
+          retryHint: SUBSTITUTION_RETRY_HINT,
+        };
+      }
       if (BENIGN_COMPOUND.test(cmd)) return { verdict: policy.compoundExec, principle: "hard:compound-exec", reason: `compound/redirect: ${cmd.slice(0, 120)}` };
     }
     return ALLOW;

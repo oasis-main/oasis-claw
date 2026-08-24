@@ -52,11 +52,27 @@ function readAuditRows(): Record<string, unknown>[] {
 }
 
 describe("loop guard — off by default", () => {
-  it("registers no before_agent_finalize handler when OASIS_REVIEWER_LOOP_GUARD is unset", () => {
+  // 2026-08-24: before_agent_finalize is now ALWAYS registered — it also
+  // captures the bot's own last message for Layer 2's consent-context fix
+  // (see reviewer.consent-context.test.ts), which every bot needs regardless
+  // of loop-guard mode. What must still hold with the loop guard off is its
+  // OWN behavior: no loop_guard audit row and no action, even past a repeat
+  // streak that would trip enforce mode.
+  it("registers before_agent_finalize (for capture) but takes no loop-guard action when OASIS_REVIEWER_LOOP_GUARD is unset", () => {
     delete process.env.OASIS_REVIEWER_LOOP_GUARD;
     const { api, handlers } = makeApi();
     registerReviewer(api, { auditDir, mode: "shadow" });
-    expect(handlers.has("before_agent_finalize")).toBe(false);
+    expect(handlers.has("before_agent_finalize")).toBe(true);
+
+    const handler = handlers.get("before_agent_finalize")!;
+    const sessionId = "loop-guard-off-session";
+    const text = "the same reply, over and over";
+    let result: unknown;
+    for (let i = 0; i < 5; i++) {
+      result = handler({ sessionId, lastAssistantMessage: text }, {});
+    }
+    expect(result).toBeUndefined();
+    expect(readAuditRows().filter((r) => r.phase === "loop_guard")).toHaveLength(0);
   });
 });
 

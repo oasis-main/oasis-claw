@@ -120,6 +120,36 @@ const STANDING_CACHE_MAX = 64;
 const STANDING_MIN_CHARS = 120;
 const standingBySession = new Map<string, string>();
 
+// ── Bot's own last message across a run boundary (2026-08-24) ────────────────
+// Generalizes a real trade-approval incident: House proposed a specific order
+// in full, Mike replied "go for it", and the Layer 2 judge escalated it anyway
+// — reasoning correctly over an INCOMPLETE picture. operatorRequest and
+// standingRequest above only ever capture MIKE's own words (llm_input only
+// fires for the operator's turn), so the judge never saw House's own proposal
+// that "go for it" was actually confirming. A short reply with no visible
+// antecedent reads as "a bare approval fragment", even when a human reading
+// the same chat would recognize it instantly.
+//
+// Captured from before_agent_finalize's lastAssistantMessage — the SAME event
+// the loop guard below already consumes, for a different purpose. Kept as its
+// own single-slot-per-session cache (not folded into standingBySession) because
+// this is the bot's OWN words, not the operator's, and the two must never be
+// presented to the judge as if they were the same kind of evidence.
+const LAST_ASSISTANT_CACHE_MAX = 64;
+const LAST_ASSISTANT_MAX_CHARS = 1500;
+const lastAssistantMessageBySession = new Map<string, string>();
+
+function rememberLastAssistantMessage(sessionId: string, text: string): void {
+  if (!sessionId || !text.trim()) return;
+  const trimmed = text.trim().slice(0, LAST_ASSISTANT_MAX_CHARS);
+  // Delete-then-set moves this session to the end of insertion order, same as
+  // rememberRequest's standing-task cache — an active session must never be
+  // the one evicted just because it was least-recently-inserted.
+  lastAssistantMessageBySession.delete(sessionId);
+  evictOldest(lastAssistantMessageBySession, LAST_ASSISTANT_CACHE_MAX);
+  lastAssistantMessageBySession.set(sessionId, trimmed);
+}
+
 function evictOldest(cache: Map<string, string>, max: number): void {
   if (cache.size < max) return;
   const oldest = cache.keys().next().value;
@@ -191,6 +221,10 @@ function tightenOnly(l1: Decision, l2: Layer2Decision): Decision {
     verdict: l2.verdict,
     principle: `l2:${l2.principle || "constitution"}`,
     reason: l2.reason || `constitution tightened ${l1.verdict} → ${l2.verdict}`,
+    // 2026-08-24: carry Layer 2's own retry guidance through the tightening —
+    // see Layer2Decision.retryHint and the DESTRUCTIVE/DOWNLOAD_EXEC/
+    // SUBSTITUTION static hints in policy.ts for the Layer 1 counterpart.
+    retryHint: l2.retryHint,
   };
 }
 
@@ -389,6 +423,10 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
       // or garbled turn is still judged against the work it actually serves.
       // Read via sessionId, which survives the run boundary that runId does not.
       const standingRequest = standingBySession.get(String(sessionId)) ?? "";
+      // 2026-08-24: the bot's own last message, so a short operator reply
+      // ("go for it", "yes") can be matched to whatever it was confirming —
+      // see the block comment above lastAssistantMessageBySession.
+      const lastAssistantMessage = lastAssistantMessageBySession.get(String(sessionId)) ?? "";
 
       // ── Which calls are worth a model judgment ──
       // constitutionalReviewRequired bots (nimbus/helloworld) → EVERY call: their
@@ -424,7 +462,7 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         const l1 = decision;
         const r = await judgeConstitution(
           l2Complete as LlmComplete,
-          { botKey, toolName, family, subject, params: paramsJson, constitution, operatorRequest, standingRequest },
+          { botKey, toolName, family, subject, params: paramsJson, constitution, operatorRequest, standingRequest, lastAssistantMessage },
           { model: l2Model, timeoutMs: l2TimeoutMs, thinkingLevel: l2Thinking, maxTokens: l2MaxTokens },
         );
         // ── Operator-consent downgrade (CLAW-079) — deliberately narrow ──
@@ -526,6 +564,7 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
           // the constitution's own drift stays measurable after the prose fix.
           l2InertReadKept: inertReadKept || undefined,
           l2FailClosed: !r.decision && alwaysConstitutional,
+          l2RetryHint: r.decision?.retryHint ?? null,
         };
       }
 
@@ -576,6 +615,9 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         verdict: decision.verdict,
         principle: decision.principle,
         reason: decision.reason,
+        // 2026-08-24: the safer-retry suggestion surfaced to the agent/Mike
+        // alongside the reason, when one exists — see Decision.retryHint.
+        retryHint: decision.retryHint ?? null,
         l2Mode,
         l2Judged: l2Eligible,
         hadOperatorRequest: !!operatorRequest,
@@ -585,6 +627,11 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         // targets (a run whose own prompt was a fragment), so it is the cheapest
         // way to confirm the fix fires in production rather than assuming it does.
         hadStandingRequest: !!standingRequest && standingRequest !== operatorRequest,
+        // 2026-08-24: true when the bot's own last message was available to
+        // feed the judge — see lastAssistantMessageBySession above. Grep for
+        // rows where this is true and l2Tightened is false on a call whose
+        // operatorRequest is short — that is the shape this fix targets.
+        hadLastAssistantMessage: !!lastAssistantMessage,
         layer2Pending: l2Eligible && l2Mode === "shadow",
         // See the injection-review dispatch block below: when true, a separate
         // phase:"injection_review" row for this same toolCallId follows once the
@@ -604,7 +651,7 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         const l1Principle = decision.principle;
         void judgeConstitution(
           l2Complete as LlmComplete,
-          { botKey, toolName, family, subject, params: paramsJson, constitution, operatorRequest, standingRequest },
+          { botKey, toolName, family, subject, params: paramsJson, constitution, operatorRequest, standingRequest, lastAssistantMessage },
           // No agentId: passing it is treated as a target-agent OVERRIDE and
           // rejected ("Plugin LLM completion cannot override the target agent").
           // Omitting it uses the ambient agent's own model/credentials.
@@ -629,6 +676,7 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
               l2Ms: r.ms,
               l2ParseFail: r.decision ? undefined : (r.raw || null),
               l2Error: r.error ?? null,
+              l2RetryHint: r.decision?.retryHint ?? null,
               enforced: false, // shadow: L2 never changes the decision yet
             });
           })
@@ -726,12 +774,21 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
 
     if (mode !== "enforce") return; // shadow: log only
 
-    if (decision.verdict === "deny") return { block: true, blockReason: `reviewer: ${decision.reason}` };
+    // 2026-08-24: surface the retry hint (if any) alongside the reason, so the
+    // agent reading a deny — or Mike reading an escalate — has something
+    // actionable besides "no". See Decision.retryHint / Layer2Decision.retryHint.
+    if (decision.verdict === "deny") {
+      const retrySuffix = decision.retryHint ? ` — safer retry: ${decision.retryHint}` : "";
+      return { block: true, blockReason: `reviewer: ${decision.reason}${retrySuffix}` };
+    }
     if (decision.verdict === "escalate") {
+      const retrySuffix = decision.retryHint
+        ? `\nIf you'd rather retry now instead of waiting on approval: ${decision.retryHint}`
+        : "";
       return {
         requireApproval: {
           title: "Reviewer approval required",
-          description: `${decision.reason}\n(rule: ${decision.principle}, bot: ${botKey}, tool: ${toolName})`,
+          description: `${decision.reason}\n(rule: ${decision.principle}, bot: ${botKey}, tool: ${toolName})${retrySuffix}`,
           severity: "warning" as const,
           // 10 min (= MAX_PLUGIN_APPROVAL_TIMEOUT_MS, the runtime ceiling): the
           // operator copy-pastes `/approve <id> <decision>` from a Telegram DM,
@@ -755,66 +812,77 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
     return;
   });
 
-  // ── Loop guard hook ──
-  // Independent of before_tool_call above: fires once per turn, right before
-  // the agent's reply would be sent/finalized. Never throws past its own
-  // try/catch — a bug here must degrade to "did nothing", the same fail-safe
-  // posture as before_tool_call's shadow mode, not fail-closed like enforce's
-  // deny-on-error (there is no useful "deny" for a reply that already exists).
+  // ── before_agent_finalize hook: last-message capture + loop guard ──
+  // Fires once per turn, right before the agent's reply would be sent/finalized.
+  // ALWAYS registered (2026-08-24): the last-assistant-message capture that
+  // before_tool_call's Layer 2 judgment now depends on (see
+  // lastAssistantMessageBySession above) must run on every bot, not only ones
+  // with the loop guard turned on — the two features happen to share this one
+  // event but are otherwise unrelated. The loop-guard body below is unchanged
+  // and still gated on loopGuardMode, same as before.
   const loopGuardMode = (process.env.OASIS_REVIEWER_LOOP_GUARD ?? "off").toLowerCase();
   const loopGuardThreshold = Number(process.env.OASIS_REVIEWER_LOOP_GUARD_THRESHOLD ?? "3") || 3;
-  if (loopGuardMode !== "off") {
-    api.on("before_agent_finalize", (event: Record<string, unknown>, ctx: Record<string, unknown>) => {
-      try {
-        const sessionId = String(event?.sessionId ?? ctx?.sessionId ?? "unknown");
-        const text = String(event?.lastAssistantMessage ?? "");
-        if (!text.trim()) return;
+  api.on("before_agent_finalize", (event: Record<string, unknown>, ctx: Record<string, unknown>) => {
+    // Capture first, unconditionally. Own try/catch, never returns a value —
+    // a bug here must never suppress or alter the loop guard below.
+    try {
+      const sessionId = String(ctx?.sessionId ?? event?.sessionId ?? "");
+      rememberLastAssistantMessage(sessionId, String(event?.lastAssistantMessage ?? ""));
+    } catch {
+      /* never let capture affect the turn */
+    }
 
-        const hash = hashForLoopGuard(text);
-        const prior = loopGuardHistory.get(sessionId);
-        const streak = prior && prior.hash === hash ? prior.streak + 1 : 1;
+    if (loopGuardMode === "off") return; // capture-only: no loop guard configured
 
-        if (!loopGuardHistory.has(sessionId) && loopGuardHistory.size >= LOOP_GUARD_HISTORY_MAX) {
-          const oldest = loopGuardHistory.keys().next().value;
-          if (oldest !== undefined) loopGuardHistory.delete(oldest);
-        }
-        loopGuardHistory.set(sessionId, { hash, streak });
+    try {
+      const sessionId = String(event?.sessionId ?? ctx?.sessionId ?? "unknown");
+      const text = String(event?.lastAssistantMessage ?? "");
+      if (!text.trim()) return;
 
-        if (streak < loopGuardThreshold) return;
+      const hash = hashForLoopGuard(text);
+      const prior = loopGuardHistory.get(sessionId);
+      const streak = prior && prior.hash === hash ? prior.streak + 1 : 1;
 
-        write({
-          ts: new Date().toISOString(),
-          phase: "loop_guard",
-          loopGuardMode,
-          bot: botKey,
-          sessionId,
-          streak,
-          threshold: loopGuardThreshold,
-          textPreview: text.slice(0, 200),
-          enforced: loopGuardMode === "enforce",
-        });
-
-        if (loopGuardMode !== "enforce") return; // shadow: log only, never act
-
-        // Reset so we don't force-finalize every subsequent turn too — only the
-        // turn that crosses the threshold gets stopped.
-        loopGuardHistory.delete(sessionId);
-        return {
-          action: "finalize" as const,
-          reason: `oasis-reviewer loop guard: the same reply repeated ${streak} times in a row for this session — forcing this turn to end instead of continuing the loop.`,
-        };
-      } catch (err) {
-        write({
-          ts: new Date().toISOString(),
-          phase: "loop_guard",
-          loopGuardMode,
-          bot: botKey,
-          error: String((err as Error)?.message ?? err),
-        });
-        return; // never block finalize on a bug in this guard itself
+      if (!loopGuardHistory.has(sessionId) && loopGuardHistory.size >= LOOP_GUARD_HISTORY_MAX) {
+        const oldest = loopGuardHistory.keys().next().value;
+        if (oldest !== undefined) loopGuardHistory.delete(oldest);
       }
-    });
-  }
+      loopGuardHistory.set(sessionId, { hash, streak });
+
+      if (streak < loopGuardThreshold) return;
+
+      write({
+        ts: new Date().toISOString(),
+        phase: "loop_guard",
+        loopGuardMode,
+        bot: botKey,
+        sessionId,
+        streak,
+        threshold: loopGuardThreshold,
+        textPreview: text.slice(0, 200),
+        enforced: loopGuardMode === "enforce",
+      });
+
+      if (loopGuardMode !== "enforce") return; // shadow: log only, never act
+
+      // Reset so we don't force-finalize every subsequent turn too — only the
+      // turn that crosses the threshold gets stopped.
+      loopGuardHistory.delete(sessionId);
+      return {
+        action: "finalize" as const,
+        reason: `oasis-reviewer loop guard: the same reply repeated ${streak} times in a row for this session — forcing this turn to end instead of continuing the loop.`,
+      };
+    } catch (err) {
+      write({
+        ts: new Date().toISOString(),
+        phase: "loop_guard",
+        loopGuardMode,
+        bot: botKey,
+        error: String((err as Error)?.message ?? err),
+      });
+      return; // never block finalize on a bug in this guard itself
+    }
+  });
 
   api.logger.info(`oasis-reviewer: Layer 1 active (mode=${mode}, bot=${botKey})`, {
     auditFile,
