@@ -1529,6 +1529,12 @@ if oasis_gen_token:
         _gen_model("gemma-4-12b-coder", "Gemma-4 12B Coder (Local)", 32768),
         _gen_model("gemma-4-12b-agentic", "Gemma-4 12B Agentic (Local)", 32768),
         _gen_model("claude-opus-4-8", "Claude Opus 4.8 (Bedrock)", 200000, ["text", "image"]),
+        # Opus 5 added 2026-08-24 (ADM-048). Before this, Opus 5 reached ONLY
+        # Nimbus, via a direct amazon-bedrock provider on Mike's personal IAM
+        # key; the other six bots had no route to it and the gateway 404'd
+        # `claude-opus-5`. Routing it through oasis-generation puts every bot on
+        # one metered path. Must stay in sync with the gateway's catalog.py.
+        _gen_model("claude-opus-5", "Claude Opus 5 (Bedrock)", 200000, ["text", "image"]),
         _gen_model("claude-sonnet-5", "Claude Sonnet 5 (Bedrock)", 200000, ["text", "image"]),
         _gen_model("gpt-5.6-sol", "GPT-5.6-sol (Bedrock)", 272000, ["text", "image"]),
         _gen_model("glm-5", "GLM-5 (Bedrock)", 131072),
