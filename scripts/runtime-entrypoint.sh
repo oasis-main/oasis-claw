@@ -210,6 +210,11 @@ declare -A PLUGINS=(
   [clawhub-skill-audit]="--dangerously-force-unsafe-install"
   [model-switcher]=""
   [oasis-voice]=""
+  # oasis-voice-control (CLAW-107 phase 1): voice_list / voice_set. A SEPARATE
+  # extension from oasis-voice on purpose — tools need a contracts.tools block,
+  # and oasis-voice cannot declare one without dropping out of the gateway
+  # entirely (see its own _contracts_NOTE). Registers tools only, no providers.
+  [oasis-voice-control]=""
   [oasis-semantics]=""
   # browser vendored from upstream openclaw; ships legitimate child_process
   # usage for Chromium launch — same false-positive shape as secrets-vault.
@@ -930,6 +935,28 @@ if os.environ.get("OASIS_TTS_TOOL_DISABLE", "").strip() == "1":
     print("[entrypoint] tts tool: DISABLED (OASIS_TTS_TOOL_DISABLE=1)")
 else:
     for t in TTS_TOOLS:
+        if t not in also:
+            also.append(t)
+
+# ---- SELF-SERVICE VOICE (CLAW-107 phase 1) --------------------------------
+# voice_list is read-only. voice_set changes only THIS bot's own speaking voice
+# and cannot address another bot, so the blast radius is "how I sound" and
+# nothing else. Both are admitted fleet-wide.
+#
+# voice_set writes ~/.openclaw/voice-choice.json, NOT openclaw.json. Rewriting
+# openclaw.json under a live gateway kills the next turn with "config changed
+# since last load"; the oasis-voice speech provider reads the side file per
+# synthesis instead, so a change lands on the next spoken reply with no restart.
+#
+# NOTE the tool names must match extensions/oasis-voice-control/openclaw.plugin.json
+# contracts.tools exactly — that manifest block makes them materialize, and this
+# list re-admits them past tools.profile. BOTH gates are required (CLAW-082).
+VOICE_CONTROL_TOOLS = ("voice_list", "voice_set")
+if os.environ.get("OASIS_VOICE_CONTROL_DISABLE", "").strip() == "1":
+    also = [x for x in also if x not in VOICE_CONTROL_TOOLS]
+    print("[entrypoint] voice control tools: DISABLED (OASIS_VOICE_CONTROL_DISABLE=1)")
+else:
+    for t in VOICE_CONTROL_TOOLS:
         if t not in also:
             also.append(t)
 

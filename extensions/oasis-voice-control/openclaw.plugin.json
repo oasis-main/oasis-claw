@@ -1,0 +1,30 @@
+{
+  "id": "oasis-voice-control",
+  "name": "Oasis Voice Control",
+  "description": "Lets a bot see which speaking voices are installed (voice_list) and choose its own (voice_set). Talks to the oasis-voice sidecar over HTTP; changes take effect on the next spoken reply with no restart.",
+  "_why_a_separate_extension": "The tools CANNOT live in the oasis-voice extension. A plugin's registerTool'd tools materialize only if declared in contracts.tools (openclaw plugins/tools.ts:606), but oasis-voice deliberately declares NO contracts block at all: its own _contracts_NOTE records a VERIFIED 2026-05-16 result where adding one made the loader treat the plugin as lazy, the lazy load never fired for an /app/extensions/-mounted plugin, and the whole plugin dropped out of the gateway (16 plugins -> 15) taking inbound audio for the entire fleet with it. The two requirements are in direct conflict inside one plugin. This extension registers TOOLS ONLY and no providers, so it can declare contracts normally and the eager-load conflict never applies. Do NOT 'simplify' this by folding it back into oasis-voice.",
+  "contracts": {
+    "_doc": "REQUIRED for agent-tool exposure: registerTool'd tools materialize ONLY if declared here. This is HALF the gate — tools.alsoAllow must ALSO re-admit them past tools.profile='coding' (CLAW-082). Keep in sync with the api.registerTool names in index.ts.",
+    "tools": [
+      "voice_list",
+      "voice_set"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean"
+      },
+      "endpoint": {
+        "type": "string",
+        "description": "oasis-voice sidecar base URL. Overridden by OASIS_VOICE_ENDPOINT."
+      },
+      "bearer_token": {
+        "type": "string",
+        "description": "Optional bearer token for the sidecar. Overridden by OASIS_VOICE_BEARER_TOKEN."
+      }
+    }
+  }
+}

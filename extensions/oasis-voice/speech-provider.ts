@@ -7,9 +7,43 @@ import type {
   SpeechTelephonySynthesisRequest,
   SpeechTelephonySynthesisResult,
 } from "openclaw/plugin-sdk/speech";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 const DEFAULT_ENDPOINT = "http://127.0.0.1:8731";
 const DEFAULT_VOICE = "piper:en_GB-aru-medium";
+
+// ── Self-service voice override (CLAW-107 Phase 1) ───────────────────────────
+// The bot's own chosen voice, written by the `voice_set` tool in the SEPARATE
+// oasis-voice-control extension. Kept as a FILE rather than as config because a
+// running gateway must never have its openclaw.json rewritten underneath it —
+// the next turn dies with "config changed since last load". A file read per
+// synthesis is cheap and takes effect immediately, with no recreate.
+//
+// The writer is extensions/oasis-voice-control/src/voice-state.ts. This reader
+// is deliberately a small duplicate rather than a cross-extension import:
+// extensions are separate packages mounted side by side, and a relative import
+// across them is fragile. Keep the PATH and the FIELD NAME in sync.
+const VOICE_OVERRIDE_FILE = "voice-choice.json";
+
+function overridePath(): string {
+  const home = process.env.OPENCLAW_HOME || path.join(os.homedir(), ".openclaw");
+  return path.join(home, VOICE_OVERRIDE_FILE);
+}
+
+function readVoiceOverride(): string | undefined {
+  try {
+    const raw = JSON.parse(fs.readFileSync(overridePath(), "utf8")) as { voice_id?: unknown };
+    const v = raw?.voice_id;
+    return typeof v === "string" && v.length > 0 ? v : undefined;
+  } catch {
+    // Absent (the normal case) or malformed. Either way fall through to config
+    // rather than failing synthesis: losing the chosen voice is recoverable,
+    // losing speech entirely is not.
+    return undefined;
+  }
+}
 
 // Piper's lite-tier output is 22050 Hz int16 WAV.
 // Twilio Media Streams expect 8000 Hz µ-law (mulaw).  We ask oasis-voice
@@ -23,6 +57,14 @@ function getEndpoint(providerConfig: Record<string, unknown>): string {
 }
 
 function getVoice(providerConfig: Record<string, unknown>): string {
+  // Resolution order, highest first:
+  //   1. the bot's own choice, set at runtime via the voice_set tool
+  //   2. tts_voice from config (OASIS_VOICE_TTS_VOICE, set by the operator)
+  //   3. the built-in default
+  const chosen = readVoiceOverride();
+  if (chosen) {
+    return chosen;
+  }
   const raw = providerConfig["tts_voice"];
   return typeof raw === "string" && raw.length > 0 ? raw : DEFAULT_VOICE;
 }
