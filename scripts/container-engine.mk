@@ -1,12 +1,27 @@
-# ── Container engine resolution: Docker or Podman ────────────────────────────
+# ── Container engine resolution: Docker, Podman, or Colima ───────────────────
 #
-# oasis-claw runs on either engine. This file is the ONE place that decides
-# which engine a `make` run uses, so every Makefile in the repo agrees.
+# oasis-claw runs on all three. This file is the ONE place that decides which
+# engine a `make` run uses, so every Makefile in the repo agrees.
 #
 # Why this exists: Docker Desktop needs a paid licence at most large companies,
-# so a corporate Linux workstation or VDI usually ships rootless Podman instead.
-# The compose files themselves are engine-neutral; only the CLI names and a
-# handful of rootless-Podman details differ, and both live here.
+# so a corporate Linux workstation or VDI usually ships rootless Podman instead,
+# and a macOS host usually ships Colima. The compose files themselves are
+# engine-neutral; only the CLI names, the virtual machine front end, and a
+# handful of rootless-Podman details differ, and all of them live here.
+#
+# Colima is not a third CLI. Colima is a Lima virtual machine that runs dockerd,
+# and the ordinary docker CLI drives it. ENGINE therefore stays `docker` on a
+# Colima host, and no compose file changes. What Colima does change is the
+# daemon: the docker CLI is on PATH as soon as you install it, but every target
+# still fails until `colima start` runs. CONTAINER_VM below reports that state
+# in one line, instead of leaving the user with "Cannot connect to the Docker
+# daemon".
+#
+# Licences, because that is usually why a host ends up on one engine and not
+# another: Docker Desktop is the licensed product. The docker CLI and dockerd
+# are Apache-2.0, Compose v2 is Apache-2.0, Podman is Apache-2.0, and Colima is
+# MIT. Docker Desktop is the only part of this set with a subscription
+# requirement.
 #
 # Include it, then use the variables below:
 #
@@ -36,6 +51,12 @@
 #                        $(if $(IS_PODMAN),--userns=$(PODMAN_KEEPID),)
 #   PODMAN_KEEPID      The keep-id user-namespace mode for rootless Podman.
 #                      See "Rootless Podman" below.
+#   CONTAINER_VM       colima | podman-machine | none.  Auto-detected.
+#                      Names the virtual machine that hosts the engine daemon.
+#                      macOS has no native container daemon, so one always runs
+#                      inside a virtual machine there. `none` means the CLI
+#                      reaches a local daemon directly, the normal case on
+#                      Linux.
 #   OASIS_MOUNT_LABEL  ",z" on a host that enforces SELinux, empty elsewhere.
 #                      EXPORTED, so a compose file can append it to a bind
 #                      mount option string:
@@ -76,6 +97,36 @@
 # works under the default mapping and does not need it. keep-id needs a
 # /etc/subuid and /etc/subgid entry for the user; without one, Podman fails at
 # container creation with a mapping error.
+#
+# ── macOS: Colima ────────────────────────────────────────────────────────────
+#
+# Colima gives macOS a dockerd without Docker Desktop:
+#
+#     brew install colima docker docker-compose
+#     colima start --cpu 4 --memory 6 --disk 60
+#
+# ENGINE resolves to `docker`, because the docker CLI is the client.
+#
+# On an INTEL Mac, add two flags:
+#
+#     colima start --cpu 4 --memory 6 --disk 60 --vm-type qemu --mount-type 9p
+#
+# The `vz` virtualisation backend and the virtiofs mount type are Apple Silicon
+# features. Colima does fall back on its own, but the failure is slow and the
+# message is unclear, so pass the flags. `make engine` prints the correct
+# command for the host it runs on.
+#
+# Podman is the alternative on Apple Silicon: `podman machine start`. It is NOT
+# an alternative on an Intel Mac. Podman 6.0, released July 2026, dropped Intel
+# Mac support, and Homebrew ships the 6.x line, so `brew install podman` fails
+# there with an arm64 requirement. Colima is the supported path on Intel.
+#
+# A bind mount under Colima crosses the virtual machine boundary, so the host
+# user maps into the virtual machine and a container UID that does not match it
+# cannot write the mount. This is the same class of problem PODMAN_KEEPID
+# solves above, but the fix differs: adjust the UID on the service or on the
+# mount. Prove it with a real write into the mount. Do not trust an inspect
+# field.
 
 # ── engine ───────────────────────────────────────────────────────────────────
 # `ifndef` covers the environment case. A command-line assignment (make
@@ -91,6 +142,24 @@ endif
 
 IS_PODMAN := $(filter podman,$(ENGINE))
 PODMAN_KEEPID := keep-id:uid=1000,gid=1000
+
+# ── virtual machine hosting the engine daemon ────────────────────────────────
+# Knowing WHICH virtual machine turns "Cannot connect to the Docker daemon" into
+# a command the user can run. On Linux this resolves to `none` and costs one
+# `command -v`.
+ifndef CONTAINER_VM
+CONTAINER_VM := $(shell \
+	if [ "$(ENGINE)" = "docker" ] && command -v colima >/dev/null 2>&1; then echo colima; \
+	elif [ "$(ENGINE)" = "podman" ] && [ "$$(uname -s)" = "Darwin" ]; then echo podman-machine; \
+	else echo none; fi)
+endif
+
+# Intel Macs need an explicit backend and mount type; see "macOS: Colima" above.
+# Empty on Apple Silicon and on Linux, so COLIMA_START is correct on any host.
+COLIMA_INTEL_FLAGS := $(shell \
+	[ "$$(uname -s)" = "Darwin" ] && [ "$$(uname -m)" = "x86_64" ] \
+	  && echo ' --vm-type qemu --mount-type 9p')
+COLIMA_START := colima start --cpu 4 --memory 6 --disk 60$(COLIMA_INTEL_FLAGS)
 
 # ── CLI + compose front end ──────────────────────────────────────────────────
 ifeq ($(ENGINE),podman)
@@ -148,20 +217,49 @@ engine: ## print the resolved container engine and compose front end
 	@echo "ENGINE            = $(ENGINE)"
 	@echo "CONTAINER         = $(CONTAINER)"
 	@echo "COMPOSE_CMD       = $(COMPOSE_CMD)"
+	@echo "CONTAINER_VM      = $(CONTAINER_VM)"
 	@echo "OASIS_MOUNT_LABEL = '$(OASIS_MOUNT_LABEL)'$(if $(OASIS_MOUNT_LABEL), (SELinux is enforcing),)"
 	$(if $(PODMAN_COMPOSE_PROVIDER),@echo "compose provider  = $(PODMAN_COMPOSE_PROVIDER) (pinned)")
 	@printf "%-18s= " "version"; { $(CONTAINER) --version 2>/dev/null || echo "(engine CLI not runnable)"; } | head -1
 	@printf "%-18s= " "compose"; { $(COMPOSE_CMD) version 2>/dev/null || echo "(compose front end not runnable)"; } | head -1
+	@printf "%-18s= " "daemon"; { $(CONTAINER) info >/dev/null 2>&1 && echo "reachable"; } || echo "NOT reachable"
+	@if [ "$(CONTAINER_VM)" = "colima" ]; then \
+	  printf "%-18s= " "colima"; colima status 2>&1 | head -1; \
+	  echo "start it with:      $(COLIMA_START)"; \
+	elif [ "$(CONTAINER_VM)" = "podman-machine" ]; then \
+	  printf "%-18s= " "podman machine"; podman machine list 2>/dev/null | tail -n +2 | head -1; \
+	  echo "start it with:      podman machine start"; \
+	fi
 	@echo ""
 	@echo "Override with:  make ENGINE=podman <target>   (or export ENGINE=podman)"
 
 # Gate for any target that runs a container. Keeps `make help` and `make engine`
 # usable on a host with no engine at all.
+#
+# The third check costs one `info` call per target. It buys the Colima and
+# Podman-machine cases a command to run: on macOS the CLI is present long before
+# the daemon is, so "not on PATH" is the wrong diagnosis and the raw engine error
+# names no fix.
 _require-engine:
 	@test "$(ENGINE)" != "none" || { \
-	  echo "No container engine found. Install Docker or Podman, or set ENGINE=<name>."; \
+	  echo "No container engine found. Install one, or set ENGINE=<name>."; \
 	  echo "  Debian / Ubuntu:  sudo apt-get install -y podman uidmap"; \
 	  echo "  RHEL / Fedora:    sudo dnf install -y podman"; \
+	  echo "  macOS:            brew install colima docker docker-compose"; \
 	  exit 2; }
 	@command -v $(CONTAINER) >/dev/null 2>&1 || { \
 	  echo "ENGINE=$(ENGINE) but '$(CONTAINER)' is not on PATH."; exit 2; }
+	@$(CONTAINER) info >/dev/null 2>&1 || { \
+	  echo "ENGINE=$(ENGINE): the CLI is installed, but its daemon does not answer."; \
+	  if [ "$(CONTAINER_VM)" = "colima" ]; then \
+	    echo "  Colima is installed and its virtual machine is not running. Start it:"; \
+	    echo "    $(COLIMA_START)"; \
+	  elif [ "$(CONTAINER_VM)" = "podman-machine" ]; then \
+	    echo "  Start the Podman machine:  podman machine start"; \
+	  elif [ "$(ENGINE)" = "docker" ]; then \
+	    echo "  Start the Docker daemon, or install Colima and start it:"; \
+	    echo "    brew install colima docker docker-compose && $(COLIMA_START)"; \
+	  else \
+	    echo "  Start the $(ENGINE) service, then run this target again."; \
+	  fi; \
+	  exit 2; }

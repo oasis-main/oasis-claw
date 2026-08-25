@@ -96,7 +96,7 @@ Every LLM input, output, and tool call is written to an append-only JSONL file b
 
 ---
 
-## Running with Docker
+## Running the fleet: Docker, Podman, or Colima
 
 The runtime image bakes all eleven extensions in at build time. Credentials come from `.env`. The build also pulls in pinned Chromium + Playwright via the `browser` plugin (~400MB on top of bookworm-slim). See [AUDIT_LOG.md](./AUDIT_LOG.md) for the per-plugin audit verdicts that gate every release.
 
@@ -111,10 +111,39 @@ make logs           # tail gateway logs
 make smoke          # plugin registration smoke test (mock API, no live LLM)
 ```
 
+### Container engines
+
+The fleet runs on Docker, Podman, or Colima. [`scripts/container-engine.mk`](scripts/container-engine.mk) is the one place that decides which, and every `make` target agrees with it. The compose files are engine-neutral, so nothing else changes.
+
+| Host | Engine | Starting the daemon |
+|---|---|---|
+| Linux | rootless `podman`, or `docker` | already running as a service |
+| macOS, Apple Silicon | `podman`, or `docker` via Colima | `podman machine start` / `colima start` |
+| macOS, Intel | `docker` via Colima | `colima start … --vm-type qemu --mount-type 9p` |
+
+```sh
+make engine                 # what this host resolved, and whether the daemon answers
+make ENGINE=podman up       # override for one run
+```
+
+**Colima** gives macOS a `dockerd` without Docker Desktop. It is a Lima virtual machine running the daemon, driven by the ordinary `docker` CLI — so `ENGINE` stays `docker` and no compose file changes:
+
+```sh
+brew install colima docker docker-compose
+colima start --cpu 4 --memory 6 --disk 60
+```
+
+On an **Intel** Mac add `--vm-type qemu --mount-type 9p`; the `vz` backend and virtiofs are Apple Silicon features. Podman is not an alternative there — Podman 6.0 (July 2026) dropped Intel Mac support and Homebrew ships the 6.x line, so `brew install podman` fails with an arm64 requirement. `make engine` prints the correct start command for the host it runs on.
+
+**Licences**, since that is usually what picks the engine. Docker Desktop is the licensed product: commercial use needs a paid subscription above a company-size threshold. Nothing else here does. The `docker` CLI and `dockerd` are Apache-2.0, Compose v2 is Apache-2.0, Podman is Apache-2.0, and Colima is MIT.
+
+**Bind mounts** need attention on both non-Docker paths, for different reasons: rootless Podman maps the host user to container UID 0 (`PODMAN_KEEPID` fixes it), and Colima crosses a virtual machine boundary (adjust the UID on the service or the mount). Both have the same symptom — the container starts, and only the first write fails. Prove the fix with a real write into the mount; an `inspect` field will lie to you. See the header of `container-engine.mk` for the detail.
+
 ### Make targets
 
 | Target | What it does | When to use |
 |---|---|---|
+| `make engine` | Print the resolved engine, compose front end, VM, and daemon state | Before a first run, or when a container command fails |
 | `make restart` | Restart gateway process | After `openclaw config set` changes |
 | `make recreate` | Recreate container | After `.env` changes (creds, cortex swap) |
 | `make rebuild` | Rebuild image + recreate | After Dockerfile or entrypoint changes |
