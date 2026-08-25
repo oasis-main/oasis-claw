@@ -156,9 +156,18 @@ endif
 
 # Intel Macs need an explicit backend and mount type; see "macOS: Colima" above.
 # Empty on Apple Silicon and on Linux, so COLIMA_START is correct on any host.
+#
+# `uname -m` CANNOT be used here. On an Apple Silicon Mac, an x86_64 build of
+# make or of /bin/sh runs under Rosetta, and every `uname -m` inside it reports
+# x86_64. Homebrew's Intel prefix (/usr/local) is a common way to end up with
+# one. The flags would then be added on Apple Silicon, where they force a slow
+# emulated VM. `hw.optional.arm64` is a hardware property and reports the real
+# machine whether or not the caller is translated. The sysctl does not exist off
+# macOS, so the Darwin test guards it.
 COLIMA_INTEL_FLAGS := $(shell \
-	[ "$$(uname -s)" = "Darwin" ] && [ "$$(uname -m)" = "x86_64" ] \
-	  && echo ' --vm-type qemu --mount-type 9p')
+	if [ "$$(uname -s)" = "Darwin" ] \
+	   && [ "$$(sysctl -n hw.optional.arm64 2>/dev/null)" != "1" ]; then \
+	  echo ' --vm-type qemu --mount-type 9p'; fi)
 COLIMA_START := colima start --cpu 4 --memory 6 --disk 60$(COLIMA_INTEL_FLAGS)
 
 # ── CLI + compose front end ──────────────────────────────────────────────────
