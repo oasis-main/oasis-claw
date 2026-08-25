@@ -906,6 +906,33 @@ for t in SECURITY_TOOLS:
     if t not in also:
         also.append(t)
 
+# ---- MEDIA OUT: the `tts` tool (2026-08-25, Mike: "all bots ... respond in kind") ----
+# `tts` is a SPECIAL CASE in openclaw's catalog: tool-catalog.ts gives it
+# `profiles: []` — it belongs to NO profile at all, so EVERY profile strips it,
+# `coding` included. alsoAllow is the only route that admits it. That is why no
+# bot could deliberately speak, on any profile, ever.
+#
+# This is distinct from `messages.tts.auto="inbound"`, which is already on and
+# makes a bot reply with VOICE when the user sent VOICE. That is automatic and
+# reactive. The tool is the deliberate route: the bot chooses to speak.
+#
+# It does NOT depend on the `message` tool. tts-tool.ts states "Audio
+# auto-delivered from tool result" — the audio rides back on the tool result's
+# details.media and the channel delivers it. So this is safe to admit fleet-wide
+# without also handing out `message`, which is an exfiltration primitive and
+# stays Nimbus-only.
+#
+# Synthesis is LOCAL (oasis-voice/Piper on the sandboxed net), so admitting this
+# adds no egress and no cloud spend.
+TTS_TOOLS = ("tts",)
+if os.environ.get("OASIS_TTS_TOOL_DISABLE", "").strip() == "1":
+    also = [x for x in also if x not in TTS_TOOLS]
+    print("[entrypoint] tts tool: DISABLED (OASIS_TTS_TOOL_DISABLE=1)")
+else:
+    for t in TTS_TOOLS:
+        if t not in also:
+            also.append(t)
+
 # oasis-find (CLAW-082 phase 3). Read-only, root-confined, refuses secret-shaped
 # files, and never sees /reach/mail. Gated on the same roots the plugin needs.
 # deep_search (CLAW-092) joins the same gate: it is the same plugin, the same
@@ -1246,6 +1273,42 @@ config.setdefault("tools", {})
 config["tools"].setdefault("media", {})
 config["tools"]["media"].setdefault("audio", {})
 config["tools"]["media"]["audio"]["enabled"] = True
+
+# ---- VIDEO media-understanding (2026-08-25, item 4) -----------------------
+# Inbound video had NO route at all: tools.media held only `audio`, and the
+# native-vision skip in media-understanding/runner.ts is coded for
+# `capability === "image"` alone, so video got no equivalent free pass.
+#
+# The capability exists and is real. openclaw's bundled `google` extension
+# declares capabilities ["image","audio","video"] and implements describeVideo
+# (dist/extensions/google/media-understanding-provider.js). The plugin is loaded
+# on all 7 bots.
+#
+# REACH is the constraint, not capability. Measured 2026-08-25 against
+# generativelanguage.googleapis.com:
+#   nimbus, hello-world      -> HTTP 403 (reached the API, unauthenticated)
+#   the 5 sandboxed bots     -> HTTP 000 (blocked at the egress proxy)
+# So this is OPT-IN per bot. Enabling it on a sandboxed bot without first adding
+# the Google API origin to that bot's egress allowlist would just produce a
+# slower failure, not video support.
+#
+# NOTE this key is capability-scoped and does NOT disturb images:
+# runner.ts binds `cfg.tools.media[capability]`, so tools.media.video is read
+# only on the video path. See the image block below for why that matters.
+if os.environ.get("OASIS_MEDIA_VIDEO_ENABLE", "").strip() == "1":
+    _video_model = os.environ.get("OASIS_MEDIA_VIDEO_MODEL", "").strip() or "gemini-3.1-flash-lite"
+    config["tools"]["media"].setdefault("video", {})
+    config["tools"]["media"]["video"]["enabled"] = True
+    config["tools"]["media"]["video"]["models"] = [
+        {"provider": "google", "model": _video_model},
+    ]
+    print(f"[entrypoint] media video: ENABLED via google/{_video_model}")
+else:
+    # Leave the key ABSENT rather than enabled-false: an absent capability is
+    # the documented "no route" state, and a stale key from an earlier boot
+    # would otherwise pin a provider this bot cannot reach.
+    config["tools"]["media"].pop("video", None)
+    print("[entrypoint] media video: no route (set OASIS_MEDIA_VIDEO_ENABLE=1 on a bot that can reach the provider)")
 # 2026-08-24: the openai/gpt-4o-transcribe fallback was REMOVED. It could never
 # fire, for three independent reasons found in the media audit:
 #   1. No bot has an `openai` block under models.providers, so the provider-auth
@@ -1810,6 +1873,52 @@ if _tts_provider != "oasis-voice":
     )
 print(f"[entrypoint] media pins OK: audio={_audio_models[0]['provider']}/"
       f"{_audio_models[0].get('model')} tts={_tts_provider}")
+
+# ---- IMAGE route visibility (2026-08-25, item 3 — REVISED) ------------------
+# The original plan was "make tools.media.image explicit so images stop
+# depending on an implicit behaviour". That plan was WRONG and would have
+# BROKEN images on the five sandboxed bots. Recording why, because the wrong
+# fix is the intuitive one:
+#
+#   media-understanding/runner.ts:1085 skips image understanding when the agent
+#   model has native vision — but ONLY when there is no explicit config:
+#       capability === "image" && !hasExplicitImageUnderstandingConfig({config})
+#   and hasExplicitImageUnderstandingConfig is simply
+#       (config?.models?.length ?? 0) > 0                        (runner.ts:724)
+#
+# So WRITING tools.media.image.models is exactly what DISABLES the free,
+# local, zero-egress native-vision path and forces images out to a provider.
+# The only image-capable provider configured here is google, and the five
+# sandboxed bots cannot reach it (HTTP 000, measured 2026-08-25). The "make it
+# explicit" fix would have turned working images into broken images.
+#
+# The real requirement was VISIBILITY, not configuration. So: assert the skip
+# is still available, name the route in the boot log, and warn when the primary
+# model is not a model we know has native vision.
+#
+# Deliberately NOT fatal. Images are not load-bearing, and a hard boot failure
+# on a model bump would take the whole fleet down to protect a soft capability —
+# the wrong trade, and the CLAW-106 lesson about blast radius.
+_img_cfg = config.get("tools", {}).get("media", {}).get("image", {}) or {}
+if (_img_cfg.get("models") or []):
+    print("[entrypoint] WARNING image: an explicit tools.media.image.models is set, "
+          "which DISABLES the native-vision fast path. On a sandboxed bot the "
+          "provider is unreachable and inbound images will fail. Remove it unless "
+          "this bot genuinely has provider reach.")
+else:
+    _primary = ((config.get("agents", {}).get("defaults", {}) or {}).get("model", {}) or {}).get("primary", "")
+    # Models we have CONFIRMED carry native vision. Extend deliberately.
+    _NATIVE_VISION_PREFIXES = (
+        "anthropic/claude-sonnet-", "anthropic/claude-opus-", "anthropic/claude-haiku-",
+        "google/gemini-", "amazon-bedrock/anthropic.claude-",
+    )
+    if _primary.startswith(_NATIVE_VISION_PREFIXES):
+        print(f"[entrypoint] media image: native vision via {_primary} (no provider, no egress)")
+    else:
+        print(f"[entrypoint] WARNING image: primary model {_primary!r} is not in the known "
+              "native-vision list. Inbound images may be silently ignored. Either confirm "
+              "the model has vision and add its prefix to _NATIVE_VISION_PREFIXES, or give "
+              "this bot a reachable tools.media.image provider.")
 
 config_path.parent.mkdir(parents=True, exist_ok=True)
 config_path.write_text(json.dumps(config, indent=2) + "\n")
