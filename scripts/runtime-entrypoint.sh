@@ -1501,28 +1501,85 @@ config["browser"]["evaluateEnabled"] = False
 config["browser"].pop("dataDir", None)
 
 # ---- default LLM model (OPENCLAW_DEFAULT_MODEL env var) ----------------
-# Set via .env + make recreate, or live via `openclaw config set` + make restart.
-# Provider strings: "anthropic/claude-sonnet-4-6", "gemini/gemini-2.0-flash",
-#   "openai/gpt-4o", "bedrock/anthropic.claude-sonnet-4-5-v1:0",
-#   "ollama/llama3.3" (needs host.docker.internal reachable from container).
-# Leave unset to keep a model already configured (e.g. hot-swapped via
-# model-switcher and persisted in openclaw.json); if none is configured, fall
-# back to Claude rather than openclaw's openai/gpt-5.5 built-in default.
+# Set via .env + make recreate, or live from chat via /setmodel (model-switcher,
+# which writes agents.defaults.model.primary through replaceConfigFile).
+# Provider strings: "oasis-generation/claude-sonnet-5", "anthropic/claude-sonnet-4-6",
+#   "google/gemini-3.1-flash-lite", "openai/gpt-4o", "ollama/llama3.3".
+#
+# PRECEDENCE (CLAW-113). Until 2026-08-25 this block was "env always wins": every
+# boot overwrote primary with OPENCLAW_DEFAULT_MODEL. Restarts are frequent (the
+# config-audit log shows 5 on 2026-08-25 alone), so a /setmodel made from Telegram
+# survived only until the next restart and the bot silently fell back to the .env
+# model. That is the reversion Mike reported, and on Nimbus it is what kept the
+# fleet on direct Anthropic instead of the oasis-generation gateway.
+#
+# The rule now is SEED-ONCE, CHAT-WINS, with .env changes still propagating. A
+# side file records the value this entrypoint last seeded — the same side-file
+# pattern oasis-voice uses for the selected voice, and for the same reason: the
+# marker must NOT go into openclaw.json, whose strict zod schema rejects unknown
+# keys. Cases:
+#   1. no marker file        -> unmanaged/migrating bot: seed from env, write marker.
+#   2. primary == marker     -> nobody changed it from chat: adopt the current env
+#                               value (so editing .env still rotates the fleet).
+#   3. primary != marker     -> a human changed it from chat: LEAVE IT ALONE.
+#   4. OPENCLAW_DEFAULT_MODEL_FORCE=1 -> always take env (break-glass rollback).
+# Marker lives beside openclaw.json in the bot's persistent volume.
 default_model = os.environ.get("OPENCLAW_DEFAULT_MODEL", "").strip() or None
+force_default = os.environ.get("OPENCLAW_DEFAULT_MODEL_FORCE", "").strip() in ("1", "true", "yes")
 config.setdefault("agents", {})
 config["agents"].setdefault("defaults", {})
 config["agents"]["defaults"].setdefault("model", {})
 existing_primary = config["agents"]["defaults"]["model"].get("primary")
+
+_seed_path = config_path.parent / "oasis-model-seed.json"
+try:
+    _seed_state = json.loads(_seed_path.read_text())
+    if not isinstance(_seed_state, dict):
+        _seed_state = {}
+except Exception:
+    _seed_state = {}
+_seeded_primary = _seed_state.get("primary")
+
+
+def _write_seed_marker(**fields) -> None:
+    """Persist what this entrypoint seeded, so the next boot can tell an
+    operator .env rotation apart from a /setmodel made in chat."""
+    _seed_state.update(fields)
+    try:
+        _seed_path.write_text(json.dumps(_seed_state, indent=2) + "\n")
+    except Exception as exc:  # non-fatal: degrades to "env wins", never blocks boot
+        print(f"[entrypoint] WARN: could not write {_seed_path.name}: {exc}")
+
+
 if default_model:
-    # Env always wins — lets .env rotation change the active model on recreate.
-    config["agents"]["defaults"]["model"]["primary"] = default_model
-    print(f"[entrypoint] default model set to: {default_model}")
+    if force_default:
+        _reason = "OPENCLAW_DEFAULT_MODEL_FORCE=1"
+    elif _seeded_primary is None:
+        _reason = "no seed marker (first managed boot)"
+    elif existing_primary == _seeded_primary:
+        _reason = "primary still matches the last seeded value"
+    else:
+        _reason = None
+
+    if _reason is not None:
+        config["agents"]["defaults"]["model"]["primary"] = default_model
+        _write_seed_marker(primary=default_model)
+        print(f"[entrypoint] default model set to: {default_model} ({_reason})")
+    else:
+        print(
+            f"[entrypoint] default model KEPT as {existing_primary} — changed from chat "
+            f"(last seeded {_seeded_primary!r}); .env asks for {default_model!r}. "
+            f"Set OPENCLAW_DEFAULT_MODEL_FORCE=1 to override."
+        )
 elif not existing_primary:
     # No env override and nothing already configured (fresh fleet bot): default
-    # to Claude instead of falling through to openclaw's openai/gpt-5.5 built-in,
-    # which needs an OpenAI key no bot has. Overridable via OPENCLAW_DEFAULT_MODEL.
-    fallback_model = "anthropic/claude-sonnet-5"
+    # to the oasis-generation gateway instead of falling through to openclaw's
+    # openai/gpt-5.5 built-in, which needs an OpenAI key no bot has. Routing the
+    # default through the gateway keeps inference on Bedrock (billed to the AWS
+    # account) rather than direct-Anthropic credits. Override via .env.
+    fallback_model = "oasis-generation/claude-sonnet-5"
     config["agents"]["defaults"]["model"]["primary"] = fallback_model
+    _write_seed_marker(primary=fallback_model)
     print(f"[entrypoint] no OPENCLAW_DEFAULT_MODEL set; defaulting to {fallback_model}")
 
 # ---- agent identity: name / emoji (CLAW-057) ---------------------------
