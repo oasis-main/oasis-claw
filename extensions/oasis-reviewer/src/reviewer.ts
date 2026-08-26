@@ -642,10 +642,37 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
           // whose constitution is MANDATORY. Falling back to L1 here would recreate
           // exactly the "constitutionalReviewRequired has no teeth" gap, so this
           // fails CLOSED instead.
+          //
+          // NAME THE ACTUAL FAILURE (2026-08-26). This used to read
+          // `${r.error ?? "unparseable verdict"}`, which reported a TIMEOUT as a
+          // parse failure — on abort the provider resolves with empty text rather
+          // than rejecting, so r.error was undefined and the fallback string won.
+          // Nimbus relayed that wording to Mike verbatim for 4 lost tool calls on
+          // 2026-08-25 and it sent the investigation after the wrong defect. The
+          // three causes have three different remedies, so they get three
+          // different sentences. Order matters: an aborted call may ALSO carry an
+          // error (the abort itself), and the timeout is the more useful of the
+          // two facts. See JudgeResult.timedOut.
+          const cause = r.timedOut
+            ? `judge timed out after ${r.timeoutMs} ms`
+            : (r.error ?? "unparseable verdict");
           decision = {
             verdict: "deny",
             principle: "l2:unavailable-fail-closed",
-            reason: `constitution could not be evaluated (${r.error ?? "unparseable verdict"}) and is mandatory for ${botKey}`,
+            reason: `constitution could not be evaluated (${cause}) and is mandatory for ${botKey}`,
+            // A timeout is the ONE fail-closed cause where the identical call is
+            // safe to repeat: nothing about the call was judged and found wanting,
+            // the judge simply did not answer in time. Without this the agent
+            // cannot tell a "no" from a "not yet" — Nimbus read the old wording as
+            // a policy refusal and stopped using reads and exec altogether
+            // (2026-08-25). A parse failure and a transport error get no hint,
+            // because repeating those just burns the same failure again.
+            ...(r.timedOut
+              ? {
+                  retryHint:
+                    "the judge did not answer in time; nothing about this call was refused. Retry the identical call once. If it times out again, tell Mike and stop — do not route around the reviewer.",
+                }
+              : {}),
           };
         }
         // Other bots: keep the L1 verdict (L1 is still a real gate) — recorded below.
@@ -657,6 +684,14 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
           l2Ms: r.ms,
           l2ParseFail: r.decision ? undefined : (r.raw || null),
           l2Error: r.error ?? null,
+          // Makes a timeout greppable instead of inferable. Before this, a
+          // timeout and a parse failure produced IDENTICAL rows (l2Verdict,
+          // l2Error and l2ParseFail all null) and the only way to separate them
+          // was to compare l2Ms against the configured limit by hand.
+          // l2TimeoutMs records that limit so the comparison needs no outside
+          // knowledge of what the bot's env said at the time.
+          l2TimedOut: r.timedOut || undefined,
+          l2TimeoutMs: r.timeoutMs,
           l2Tightened: !!combined && !inertReadKept && combined.verdict !== l1.verdict,
           // Records every escalate-on-an-inert-read the backstop absorbed, so
           // the constitution's own drift stays measurable after the prose fix.
@@ -799,6 +834,13 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
               l2Ms: r.ms,
               l2ParseFail: r.decision ? undefined : (r.raw || null),
               l2Error: r.error ?? null,
+              // Shadow rows are exactly what gets read to decide whether
+              // enforcing this bot would be safe, so they need the same
+              // timeout-vs-parse-failure split as the enforcing rows above —
+              // a shadow row full of timeouts means "raise the limit first",
+              // not "the judge writes garbage".
+              l2TimedOut: r.timedOut || undefined,
+              l2TimeoutMs: r.timeoutMs,
               l2RetryHint: r.decision?.retryHint ?? null,
               contextDepth,
               hadSessionTranscript: !!sessionTranscript,
@@ -861,6 +903,9 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
             reviewerReason: r.decision?.reason ?? null,
             reviewerParseFail: r.decision ? undefined : (r.raw || null),
             reviewerError: r.error ?? null,
+            // Same timeout-vs-parse-failure ambiguity as the l2 row above.
+            reviewerTimedOut: r.timedOut || undefined,
+            reviewerTimeoutMs: r.timeoutMs,
             ms: r.ms,
             // This feature never gates report_injection, so `enforced` (used
             // elsewhere in this file to mean "the reviewer's verdict changed what

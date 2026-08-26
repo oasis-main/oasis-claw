@@ -201,6 +201,30 @@ export interface JudgeResult {
   raw: string;
   error?: string;
   ms: number;
+  /**
+   * TRUE when this judgment's own deadline fired, whichever way the provider
+   * then behaved. Read from the AbortController, NOT from whether complete()
+   * threw — that distinction is the whole point of this field.
+   *
+   * WHY (2026-08-25, Nimbus lost 4 tool calls): on abort the provider path
+   * RESOLVES with empty text instead of rejecting. The catch below therefore
+   * never runs, `error` stays undefined, parseVerdict returns null on "", and
+   * the caller reported a timeout as an "unparseable verdict" — a judge that
+   * emitted NOTHING described as a judge that emitted GARBAGE. The two have
+   * opposite remedies: a timeout is retryable as-is and means raise
+   * OASIS_REVIEWER_L2_TIMEOUT_MS, a parse failure is not and means fix the
+   * prompt or the model. The audit rows were identical in both cases
+   * (l2Verdict/l2Error/l2ParseFail all null), so the only way to tell them
+   * apart was to compare l2Ms against the configured limit by hand.
+   *
+   * The signal read is race-free: if complete() resolves first, its
+   * continuation is a microtask and runs before the timer's macrotask, so
+   * `aborted` is still false. If the timer fires first, `aborted` is true
+   * whether the provider then throws or resolves.
+   */
+  timedOut?: boolean;
+  /** The deadline actually applied, so a caller can name it in its message. */
+  timeoutMs: number;
 }
 
 /** Call the model to judge the call. Bounded by timeoutMs; never throws. */
@@ -212,7 +236,8 @@ export async function judgeConstitution(
   const started = Date.now();
   const { system, user } = buildJudgePrompt(input);
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), opts.timeoutMs ?? 20_000);
+  const timeoutMs = opts.timeoutMs ?? 20_000;
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
   try {
     const res = await complete({
       systemPrompt: system,
@@ -249,9 +274,24 @@ export async function judgeConstitution(
       purpose: "oasis-reviewer:layer2-constitution",
       signal: ac.signal,
     });
-    return { decision: parseVerdict(res.text), raw: (res.text ?? "").slice(0, 500), ms: Date.now() - started };
+    return {
+      decision: parseVerdict(res.text),
+      raw: (res.text ?? "").slice(0, 500),
+      ms: Date.now() - started,
+      // Set even here: an aborted call can RESOLVE with empty text rather than
+      // reject. See JudgeResult.timedOut.
+      timedOut: ac.signal.aborted,
+      timeoutMs,
+    };
   } catch (err) {
-    return { decision: null, raw: "", error: String((err as Error)?.message ?? err), ms: Date.now() - started };
+    return {
+      decision: null,
+      raw: "",
+      error: String((err as Error)?.message ?? err),
+      ms: Date.now() - started,
+      timedOut: ac.signal.aborted,
+      timeoutMs,
+    };
   } finally {
     clearTimeout(timer);
   }
@@ -352,6 +392,10 @@ export interface InjectionReviewResult {
   raw: string;
   error?: string;
   ms: number;
+  /** Same meaning and same rationale as JudgeResult.timedOut — see there. */
+  timedOut?: boolean;
+  /** The deadline actually applied. */
+  timeoutMs: number;
 }
 
 /**
@@ -369,7 +413,8 @@ export async function judgeInjectionReport(
   const started = Date.now();
   const { system, user } = buildInjectionReviewPrompt(input);
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), opts.timeoutMs ?? 20_000);
+  const timeoutMs = opts.timeoutMs ?? 20_000;
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
   try {
     const res = await complete({
       systemPrompt: system,
@@ -386,9 +431,18 @@ export async function judgeInjectionReport(
       decision: parseInjectionReviewVerdict(res.text),
       raw: (res.text ?? "").slice(0, 500),
       ms: Date.now() - started,
+      timedOut: ac.signal.aborted,
+      timeoutMs,
     };
   } catch (err) {
-    return { decision: null, raw: "", error: String((err as Error)?.message ?? err), ms: Date.now() - started };
+    return {
+      decision: null,
+      raw: "",
+      error: String((err as Error)?.message ?? err),
+      ms: Date.now() - started,
+      timedOut: ac.signal.aborted,
+      timeoutMs,
+    };
   } finally {
     clearTimeout(timer);
   }
