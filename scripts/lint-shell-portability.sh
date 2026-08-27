@@ -44,7 +44,6 @@ else
   while IFS= read -r f; do
     [ -f "$f" ] || continue
     case "$f" in
-      */lint-shell-portability.sh) continue ;;   # documents the patterns it bans
       vendor/*|node_modules/*) continue ;;
     esac
     case "$f" in
@@ -67,18 +66,21 @@ for f in "${files[@]}"; do
   fi
 
   # 1. unbraced expansion immediately followed by a non-ASCII byte
+  # A COMMENT CANNOT EXECUTE, so neither check applies to one. Skipping them
+  # also lets a file document these very patterns without tripping the lint.
   hits=""
-  [ "$linux_only" = "1" ] || hits="$(perl -ne 'print "$.: $_" if /\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]/' "$f" 2>/dev/null || true)"
+  [ "$linux_only" = "1" ] || hits="$(perl -ne 'next if /^\s*#/; print "$.: $_" if /\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]/' "$f" 2>/dev/null || true)"
   if [ -n "$hits" ]; then
     printf '%s: unbraced expansion followed by a multi-byte character (breaks bash 3.2 + UTF-8)\n' "$f"
     printf '%s\n' "$hits" | sed 's/^/    /'
     report "fix: brace it as \${NAME}, or replace the character with ASCII"
   fi
 
-  # 2. bash 4+ only syntax. Patterns are written so this file's own prose
-  #    cannot match them.
+  # 2. bash 4+ only syntax.
   b4=""
-  [ "$linux_only" = "1" ] || b4="$(grep -nE 'declare[[:space:]]+-A|local[[:space:]]+-n[[:space:]]|mapfile|readarray|\$\{[A-Za-z_][A-Za-z0-9_]*(,,|\^\^)\}|&>>|;;&' "$f" 2>/dev/null || true)"
+  # Number FIRST, then drop numbered comment lines. Filtering before numbering
+  # would renumber the output and point the reader at the wrong line.
+  [ "$linux_only" = "1" ] || b4="$(grep -nE 'declare[[:space:]]+-A|local[[:space:]]+-n[[:space:]]|mapfile|readarray|\$\{[A-Za-z_][A-Za-z0-9_]*(,,|\^\^)\}|&>>|;;&' "$f" 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
   if [ -n "$b4" ]; then
     printf '%s: bash 4+ only syntax (macOS ships bash 3.2)\n' "$f"
     printf '%s\n' "$b4" | sed 's/^/    /'
