@@ -53,6 +53,24 @@ jobs:
       - name: Test all extensions
         run: pnpm -r run test
 
+  shell-portability:
+    name: shell portability (bash 3.2 / macOS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # macOS ships bash 3.2.57 and nothing newer, so a Mac with no Homebrew
+      # bash runs these scripts on it. Two classes of breakage follow and
+      # neither is visible on bash 5: a multi-byte character straight after an
+      # unbraced expansion (bash 3.2 absorbs its first byte into the variable
+      # NAME, and `set -u` then aborts), and bash 4+ only syntax. This lint is
+      # STATIC, so it catches both from Linux. A script that only ever runs in
+      # the container is exempt via a `shell-portability: linux-only` marker.
+      - name: Lint shell scripts
+        run: ./scripts/lint-shell-portability.sh
+
   smoke:
     name: plugin registration smoke
     runs-on: ubuntu-latest

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# shell-portability: linux-only  -- runs only inside the oasis-state sidecar
+# (invoked by snapshot.sh via a container run), so the image bash 5 applies.
 # Runs inside the oasis-state sidecar. Called by snapshot.sh — don't call
 # directly. Reads from /state-src (openclaw volume, ro), writes to /state-repo
 # and rclone remotes. Allowlists at /lists/*.list.

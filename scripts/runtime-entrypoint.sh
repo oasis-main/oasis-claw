@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# shell-portability: linux-only  -- this is the image ENTRYPOINT (Dockerfile.runtime:297);
+# it never runs on a host, so the image bash 5 applies, not macOS bash 3.2.
 #
 # Container entrypoint for oasis-claw-runtime.
 #

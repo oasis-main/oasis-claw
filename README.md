@@ -139,6 +139,41 @@ On an **Intel** Mac add `--vm-type qemu --mount-type 9p`; the `vz` backend and v
 
 **Bind mounts** need attention on both non-Docker paths, for different reasons: rootless Podman maps the host user to container UID 0 (`PODMAN_KEEPID` fixes it), and Colima crosses a virtual machine boundary (adjust the UID on the service or the mount). Both have the same symptom — the container starts, and only the first write fails. Prove the fix with a real write into the mount; an `inspect` field will lie to you. See the header of `container-engine.mk` for the detail.
 
+### Running behind a corporate proxy
+
+Three things bite in a locked-down environment. All three are measured here, not assumed.
+
+**TLS interception.** A re-signing proxy makes every external host present a corporate-issued certificate. The runtime image trusts the Mozilla bundle, so the symptom is every model call failing with `CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate` — *after* the container starts, reports healthy, and passes every other check. Export the host's own corporate root to a PEM, mount it read-only, and point both runtimes at it:
+
+```yaml
+environment:
+  SSL_CERT_FILE: /etc/ssl/corp/corp-ca.crt       # python, curl, anything on OpenSSL
+  NODE_EXTRA_CA_CERTS: /etc/ssl/corp/corp-ca.crt # node keeps its own store
+volumes:
+  - ./corp-ca.crt:/etc/ssl/corp/corp-ca.crt:ro
+```
+
+Both variables **add** trust rather than replacing it. Measured in this image: OpenSSL consults `SSL_CERT_FILE` *and* the hashed system directory, so a corporate-roots-only file leaves the Mozilla roots in place — pointing only `SSL_CERT_FILE` at an empty file still validates a public host, and only pointing `SSL_CERT_DIR` away as well reproduces the failure. `NODE_EXTRA_CA_CERTS` is additive by design. An empty file is inert, so this wiring is safe to leave in place unconditionally.
+
+This changes only whether certificates validate. It does not widen reach — an egress allowlist still decides which hosts are reachable.
+
+**`read_only: true` and package caches.** The compose files run containers with a read-only rootfs and a small tmpfs. `~/.npm` therefore does not exist and cannot be created, so `npm install` fails before it reaches the network — and `pip`'s cache competes for a tmpfs sized for temp files, not downloads. Redirect both onto a writable bind mount instead of enlarging the tmpfs, which costs VM memory and is lost on restart:
+
+```yaml
+environment:
+  PIP_CACHE_DIR: /work/.cache/pip
+  npm_config_cache: /work/.cache/npm
+```
+
+**A fresh named volume is owned by root.** An image that sets a non-root `USER` cannot write one on first use. Seeding a volume — model weights, a state directory — needs `--user 0` explicitly:
+
+```sh
+gunzip -c weights.tar.gz | $CONTAINER run --rm -i --user 0 --entrypoint sh \
+  -v my_weights:/w oasis-claw-runtime:local -c 'tar -C /w -xf - && chmod -R a+rX /w'
+```
+
+Streaming over stdin, rather than bind-mounting the source directory, also removes any dependency on the host path being visible inside the VM.
+
 ### Make targets
 
 | Target | What it does | When to use |

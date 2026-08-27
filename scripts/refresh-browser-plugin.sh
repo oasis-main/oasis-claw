@@ -144,7 +144,7 @@ done
 
 # ─────────────────── replay patches ───────────────────
 if [[ -d "$PATCHES_DIR" ]] && [[ -n "$(ls -A "$PATCHES_DIR"/*.patch 2>/dev/null || true)" ]]; then
-  echo "[refresh] replaying patches from $PATCHES_DIR…"
+  echo "[refresh] replaying patches from ${PATCHES_DIR}..."
   for p in "$PATCHES_DIR"/*.patch; do
     echo "  → $(basename "$p")"
     if ! ( cd "$SCRATCH/staged/extensions/browser" && \
