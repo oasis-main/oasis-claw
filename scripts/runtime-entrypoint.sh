@@ -1687,6 +1687,16 @@ if oasis_gen_token:
         _gen_model("claude-sonnet-5", "Claude Sonnet 5 (Bedrock)", 200000, ["text", "image"]),
         _gen_model("gpt-5.6-sol", "GPT-5.6-sol (Bedrock)", 272000, ["text", "image"]),
         _gen_model("glm-5", "GLM-5 (Bedrock)", 131072),
+        # Cheaper tier (ADM-052, 2026-08-28). Added because GPT-5.6-sol was
+        # 87.5% of August's Bedrock spend and there was no cheap option in the
+        # picker at all — every task, however mechanical, ran on a frontier
+        # model. All six were probed THROUGH THE GATEWAY before landing here.
+        _gen_model("gpt-5.6-luna", "GPT-5.6-luna (Bedrock)", 272000, ["text", "image"]),
+        _gen_model("gpt-5.6-terra", "GPT-5.6-terra (Bedrock)", 272000, ["text", "image"]),
+        _gen_model("claude-haiku-4-5", "Claude Haiku 4.5 (Bedrock)", 200000, ["text", "image"]),
+        _gen_model("llama3-3-70b", "Llama 3.3 70B (Bedrock)", 131072),
+        _gen_model("nova-2-lite", "Nova 2 Lite (Bedrock)", 300000),
+        _gen_model("nova-micro", "Nova Micro (Bedrock)", 128000),
     ]
     config.setdefault("models", {}).setdefault("providers", {})["oasis-generation"] = {
         "baseUrl": oasis_gen_url,
