@@ -1697,6 +1697,15 @@ if oasis_gen_token:
         _gen_model("llama3-3-70b", "Llama 3.3 70B (Bedrock)", 131072),
         _gen_model("nova-2-lite", "Nova 2 Lite (Bedrock)", 300000),
         _gen_model("nova-micro", "Nova Micro (Bedrock)", 128000),
+        # Direct providers moved behind the gateway (ADM-053). These used to run
+        # from per-bot OPENAI/GEMINI/ANTHROPIC keys, bypassing the gateway
+        # entirely — no ledger row, no rate card, three keys in every container.
+        _gen_model("gpt-5.4-mini", "GPT-5.4-mini (OpenAI)", 400000, ["text", "image"]),
+        _gen_model("gpt-5.5", "GPT-5.5 (OpenAI)", 400000, ["text", "image"]),
+        _gen_model("gemini-3.6-flash", "Gemini 3.6 Flash (Google)", 1000000, ["text", "image"]),
+        _gen_model("gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite (Google)", 1000000, ["text", "image"]),
+        _gen_model("claude-sonnet-4-6", "Claude Sonnet 4.6 (Bedrock)", 200000, ["text", "image"]),
+        _gen_model("claude-opus-4-7", "Claude Opus 4.7 (Bedrock)", 200000, ["text", "image"]),
     ]
     config.setdefault("models", {}).setdefault("providers", {})["oasis-generation"] = {
         "baseUrl": oasis_gen_url,
@@ -1722,6 +1731,55 @@ if oasis_gen_token:
         _allow[_k] = {}
     if _seeded:
         print(f"[entrypoint] oasis-generation: seeded {len(_seeded)} model(s) into the /models allowlist")
+
+    # RECONCILE, don't just add (ADM-052). Seeding was previously add-only, so a
+    # bot's picker became the accumulated history of every roster it had ever
+    # seen rather than a view of the current catalog. Nimbus — the oldest volume
+    # — was still offering claude-sonnet-4-6, deepseek-v3.2, gpt-oss-120b and
+    # llama-4-maverick more than a month after they were retired on 2026-07-24;
+    # selecting any of them returned 404 from the gateway.
+    #
+    # Scoped to the `oasis-generation/` namespace ONLY. That roster is generated
+    # from the gateway catalog on every boot, so it has a definitive source of
+    # truth and pruning it cannot destroy anything a human chose. Entries for
+    # other providers are left untouched — the model-switcher plugin's curation
+    # there is deliberate, and this loop has no way to tell a stale entry from a
+    # considered one.
+    _current = {f"oasis-generation/{m['id']}" for m in gen_models}
+    _stale = [k for k in list(_allow)
+              if k.startswith("oasis-generation/") and k not in _current]
+    for _k in _stale:
+        _allow.pop(_k, None)
+    if _stale:
+        print(f"[entrypoint] oasis-generation: pruned {len(_stale)} stale model(s) "
+              f"from the /models allowlist: {', '.join(sorted(_stale))}")
+
+    # Retire the direct-provider entries (ADM-053). Their API keys no longer
+    # exist in this container — they live on the gateway now — so these would
+    # render in /models and then fail on use. Removing the keys alone is not
+    # enough: the allowlist entry persists in the bot's own volume.
+    # amazon-bedrock is here too. Only Nimbus ever had it, and it was the last
+    # thing keeping the seven pickers from matching — the original complaint.
+    # Both models it offered (claude-sonnet-5, claude-opus-5) now serve through
+    # oasis-generation, so the direct block was pure duplication that also
+    # bypassed the usage ledger and ran on Mike's PERSONAL IAM user
+    # (arn:aws:iam::451873237418:user/MikeHLee) rather than the gateway's key.
+    _retired_prefixes = ("anthropic/", "openai/", "google/", "amazon-bedrock/")
+    _retired = [k for k in list(_allow) if k.startswith(_retired_prefixes)]
+    for _k in _retired:
+        _allow.pop(_k, None)
+    if _retired:
+        print(f"[entrypoint] retired {len(_retired)} direct-provider model(s) from "
+              f"the /models allowlist; equivalents now serve via oasis-generation")
+
+    # Drop the provider blocks as well, not just the allowlist entries. A left
+    # behind block keeps openclaw resolving auth for a provider we deliberately
+    # retired, and on Nimbus it would keep a direct Bedrock route alive that
+    # never appears in the usage ledger.
+    _provs = config.setdefault("models", {}).setdefault("providers", {})
+    for _p in ("anthropic", "openai", "amazon-bedrock"):
+        if _provs.pop(_p, None) is not None:
+            print(f"[entrypoint] removed the direct '{_p}' provider block")
 
 # ---- durable model fallback chain (OPENCLAW_MODEL_FALLBACKS) ------------
 # Comma-separated provider/model refs. Set per-bot in .env so the chain survives
