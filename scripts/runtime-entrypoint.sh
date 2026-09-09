@@ -204,6 +204,12 @@ declare -A PLUGINS=(
   # ITSELF when OASIS_FIND_ROOTS names no readable directory (hello-world has
   # no reach mounts at all).
   [oasis-find]=""
+  # oasis-brave-search (2026-09-08): registers the Brave web_search provider
+  # that openclaw ships but never registers. Directory name and plugin id
+  # differ on purpose — the manifest declares id "brave", which is the id the
+  # shipped provider itself uses and therefore where its credential lookup
+  # expects plugins.entries.brave to live.
+  [oasis-brave-search]=""
   # clawhub-skill-audit's audit-prompt.ts intentionally contains the
   # exact "dynamic code execution" string patterns the auditor looks
   # FOR in third-party skills. openclaw's install-time scanner reads
@@ -252,6 +258,7 @@ done
 
 # ---- merge gateway + per-plugin config into openclaw.json --------------
 python3 - "${CONFIG_FILE}" "${BIND}" "${PORT}" "${OPENCLAW_GATEWAY_TOKEN}" <<'PY'
+import glob
 import json
 import os
 import sys
@@ -836,6 +843,170 @@ if role_profile:
 web_cfg = tools_cfg.setdefault("web", {})
 fetch_cfg = web_cfg.setdefault("fetch", {})
 fetch_cfg["useTrustedEnvProxy"] = True
+
+# ---- web_search: turn the managed tool ON (2026-09-03) --------------------
+# Mike: "butterbolt's browser and web search tools aren't working."
+#
+# Every container has carried BRAVE_API_KEY for months, but NOTHING ever wrote
+# `tools.web.search`, so openclaw left the managed web_search tool DISABLED and
+# every call died with:
+#   "web_search is disabled or no provider is available."
+# That message names two different faults and we chased the wrong half. The
+# provider was fine; the tool was simply never enabled. Confirmed live on
+# ButterBolt 2026-09-03: it reported this verbatim AFTER its egress to
+# api.search.brave.com had already been fixed and measured at HTTP 200.
+#
+# `provider` is left to openclaw's own auto-detection ("Auto-detected from
+# available API keys if omitted", schema.help.ts) so a future key swap does not
+# need a matching edit here. Enabling the tool does NOT widen reach: the
+# sandboxed bots still only reach api.search.brave.com because their role.yaml
+# lists it under origins.trusted, and Yes Man (posture: locked) deliberately
+# does not.
+# `enabled` alone is NOT sufficient, and the error message hides why.
+# web_search resolves its providers from PLUGIN entries
+# (loadSortedWebSearchProviders in web-search/runtime.ts). With no provider
+# plugin enabled the candidate list is empty and runtime.ts throws the SAME
+# string as when the tool is switched off:
+#   "web_search is disabled or no provider is available."
+#
+# THE PROVIDER IS DUCKDUCKGO, NOT BRAVE. openclaw 2026.7.1-2 ships exactly one
+# web-search provider plugin, `duckduckgo`, and it is DISABLED by default
+# (`openclaw plugins list`: 49/68 enabled, duckduckgo among the disabled).
+# There is no `brave` plugin in this build at all — the dist carries a
+# brave-web-search-provider module and docs/tools/brave-search.md documents a
+# `plugins.entries.brave` config, but no such plugin is registered, so that
+# config is silently inert. Verified on ButterBolt 2026-09-03: with
+# tools.web.search.enabled=true, provider="brave", plugins.entries.brave
+# enabled, AND measured HTTP 200 egress to api.search.brave.com, web_search
+# still reported "disabled or no provider is available".
+#
+# DuckDuckGo needs no API key, which also removes BRAVE_API_KEY from the
+# critical path. Sandboxed bots additionally need duckduckgo.com and
+# html.duckduckgo.com in their role.yaml origins.trusted; Yes Man
+# (posture: locked) deliberately gets neither.
+# SUPERSEDED 2026-09-08 — DuckDuckGo now answers with a bot-detection
+# challenge. Measured from inside both Nimbus and House: an anomaly page with
+# ZERO result rows, even with a full browser User-Agent. Symptom in the logs
+# was every search failing "DuckDuckGo returned a bot-detection challenge",
+# fleet-wide. Keyless was convenient right up until the unauthenticated
+# endpoint started refusing us; an API key is what buys a stable answer.
+#
+# BRAVE IS NOW THE PRIMARY. The "there is no brave plugin" note above was
+# accurate about the stock build and is now obsolete: extensions/oasis-brave-search
+# supplies the missing registration, wrapping the Brave provider openclaw
+# already ships. The key is read from BRAVE_API_KEY, which every container
+# already carries, via the provider's own envVars declaration — it is NOT
+# written into openclaw.json, so it stays out of a file the agent can read.
+#
+# DuckDuckGo stays INSTALLED AND ENABLED on purpose. It is the fallback if the
+# Brave registration ever fails to resolve (see the hashed-module note in
+# extensions/oasis-brave-search/index.ts) or the key is missing. Provider
+# selection is explicit, so the fallback is only reached when Brave is absent.
+#
+# Sandboxed bots need api.search.brave.com in their role.yaml origins.trusted;
+# Yes Man (posture: locked) deliberately gets nothing.
+search_cfg = web_cfg.setdefault("search", {})
+search_cfg["enabled"] = True
+search_cfg.setdefault("maxResults", 5)
+search_cfg.setdefault("timeoutSeconds", 30)
+_entries = config.setdefault("plugins", {}).setdefault("entries", {})
+_entries.setdefault("duckduckgo", {})["enabled"] = True
+if os.environ.get("BRAVE_API_KEY"):
+    _entries.setdefault("brave", {})["enabled"] = True
+    search_cfg["provider"] = "brave"
+    print("[entrypoint] web_search: brave provider (key from BRAVE_API_KEY), duckduckgo kept as fallback")
+else:
+    search_cfg["provider"] = "duckduckgo"
+    print("[entrypoint] web_search: no BRAVE_API_KEY; falling back to duckduckgo "
+          "(NOTE: duckduckgo has been serving bot-detection challenges since 2026-09-08)")
+
+# ---- browser: point openclaw at the chromium we actually ship -------------
+# The image installs Playwright's chromium under PLAYWRIGHT_BROWSERS_PATH
+# (/opt/playwright), which is NOT one of the standard locations openclaw's
+# browser detection probes. So detection returned nothing and every browser
+# call failed with:
+#   "No supported browser found (Chrome/Brave/Edge/Chromium on macOS, Linux, or
+#    Windows)."
+# ButterBolt's own browser status confirmed it: detectedBrowser=null,
+# detectedExecutablePath=null, while /opt/playwright/chromium-*/chrome-linux/
+# chrome runs fine and reaches the network through the egress proxy.
+# Resolved at boot by glob so a Playwright version bump does not strand this.
+_pw_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or "/opt/playwright"
+_chrome = sorted(glob.glob(os.path.join(_pw_root, "chromium-*", "chrome-linux", "chrome")))
+if _chrome:
+    browser_cfg = config.setdefault("browser", {})
+    browser_cfg["executablePath"] = _chrome[-1]
+    # Chrome's OWN internal zygote/renderer sandbox needs unprivileged user
+    # namespaces this container image does not grant. Without this, Chrome
+    # dies on launch: "FATAL ... No usable sandbox!", and openclaw's own error
+    # names the fix: "If running in a container or as root, try setting
+    # browser.noSandbox: true." Confirmed live on ButterBolt 2026-09-04 — the
+    # browser tool failed with this exact FATAL before any network request,
+    # on every site, even after the proxy/SSRF fixes above. Standard practice
+    # for headless Chrome in Docker: Docker's own container isolation is the
+    # real boundary here (and for the 5 sandboxed bots, the egress-proxy
+    # allowlist on top of that); Chrome's redundant internal sandbox is not
+    # load-bearing beyond that. Fleet-wide — this is an image/kernel-namespace
+    # constraint, not a network one, so it applies whether or not the bot is
+    # behind the egress proxy.
+    browser_cfg["noSandbox"] = True
+    print(f"[entrypoint] browser executable: {_chrome[-1]} (noSandbox=true)")
+else:
+    print(f"[entrypoint] WARN: no chromium under {_pw_root}; the browser tool will report 'No supported browser found'")
+
+# ---- browser: route THROUGH the egress proxy on sandboxed bots (2026-09-04) --
+# Mike: "Butterbolt still can't use the browser."
+#
+# The browser plugin ALWAYS strips HTTP_PROXY/HTTPS_PROXY/ALL_PROXY from the
+# spawned Chrome process's env (browser-proxy-mode.ts's omitChromeProxyEnv,
+# unconditional) and ALSO passes --no-proxy-server UNLESS browser.extraArgs
+# already contains a proxy-control flag (chrome.ts:271-276). This is a
+# deliberate double lock — inheriting the parent env would let anything that
+# can set an env var redirect the agent's browsing through an attacker proxy.
+# The intended escape hatch is an EXPLICIT browser.extraArgs entry.
+#
+# Without it, on a sandboxed bot (internal:true network, no DNS resolver
+# outside the egress proxy) Chrome tried a direct connection and failed
+# identically on every host, including unblocked ones:
+#   "Error: getaddrinfo EAI_AGAIN pypi.org"
+# Confirmed live on ButterBolt 2026-09-03: same error on pypi.org, ebay.com and
+# amazon.com — not a per-site block, no DNS path existed at all.
+#
+# Scoped to sandboxed bots ONLY, detected by the same HTTPS_PROXY env var the
+# egress-proxy overlay sets (butterbolt/house/kolmogorov/vanhelsing/yesman).
+# Nimbus and Hello World run the plain, non-sandboxed stack with normal DNS and
+# must NOT get this — it would pointlessly route them through a proxy that
+# their network cannot even reach.
+_https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+if _https_proxy:
+    browser_cfg = config.setdefault("browser", {})
+    _extra = browser_cfg.setdefault("extraArgs", [])
+    _proxy_arg = f"--proxy-server={_https_proxy}"
+    if not any(str(a).startswith("--proxy-server=") for a in _extra):
+        _extra.append(_proxy_arg)
+    # navigation-guard.ts THROWS on every navigation once Chrome is
+    # proxy-routed ("explicit-browser-proxy" mode), unless
+    # browser.ssrfPolicy.dangerouslyAllowPrivateNetwork is set. Confirmed live
+    # on ButterBolt 2026-09-04, immediately after the extraArgs fix above:
+    #   "Navigation blocked: strict browser SSRF policy cannot be enforced
+    #    while this browser profile is proxy-routed"
+    # WHY THIS IS SAFE HERE, not a blanket loosening: this check exists
+    # because openclaw's own Node-side SSRF pinning (re-resolving a hostname
+    # and checking the IP is not private) cannot see what Chromium resolves
+    # when a proxy does the DNS lookup, so the check fails closed rather than
+    # give a false sense of protection. Our egress-proxy is a SEPARATE, real
+    # enforcement boundary: it allowlists by hostname at the CONNECT layer
+    # (verified 2026-09-03: an unlisted host gets refused with HTTP 503, a
+    # listed one passes) regardless of what this flag does. This flag also
+    # does NOT loosen openclaw's own CDP control-plane checks — read
+    # cdp-reachability-policy.ts: those are already skipped for a local
+    # loopback profile independent of ssrfPolicy. So this affects only page
+    # NAVIGATION targets, and the proxy still refuses anything not
+    # allowlisted. Mirrors the identical reasoning already applied to
+    # tools.web.fetch.useTrustedEnvProxy above ("does NOT broaden reach — the
+    # egress-proxy's allowlist is still the single control point").
+    browser_cfg.setdefault("ssrfPolicy", {})["dangerouslyAllowPrivateNetwork"] = True
+    print(f"[entrypoint] browser: routing through {_https_proxy}")
 
 # ---- Layer 1: tools.alsoAllow (role.yaml seed + sleep-cycle toggle) ------
 # Re-admit specific tools past the tools.profile filter. Role.yaml's
@@ -1697,13 +1868,12 @@ if oasis_gen_token:
         _gen_model("llama3-3-70b", "Llama 3.3 70B (Bedrock)", 131072),
         _gen_model("nova-2-lite", "Nova 2 Lite (Bedrock)", 300000),
         _gen_model("nova-micro", "Nova Micro (Bedrock)", 128000),
-        # Direct providers moved behind the gateway (ADM-053). These used to run
-        # from per-bot OPENAI/GEMINI/ANTHROPIC keys, bypassing the gateway
-        # entirely — no ledger row, no rate card, three keys in every container.
-        _gen_model("gpt-5.4-mini", "GPT-5.4-mini (OpenAI)", 400000, ["text", "image"]),
-        _gen_model("gpt-5.5", "GPT-5.5 (OpenAI)", 400000, ["text", "image"]),
-        _gen_model("gemini-3.6-flash", "Gemini 3.6 Flash (Google)", 1000000, ["text", "image"]),
-        _gen_model("gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite (Google)", 1000000, ["text", "image"]),
+        # ADM-055 (2026-09-09): the four DIRECT-provider entries that used to sit
+        # here — gpt-5.4-mini, gpt-5.5, gemini-3.6-flash, gemini-3.1-flash-lite —
+        # are RETIRED. The catalog now serves Bedrock and self-hosted models only,
+        # so the fleet has ONE retention story instead of three. The reconcile
+        # block below prunes them from every bot's allowlist on the next boot.
+        # See oasis-generation/src/oasis_generation/catalog.py for the rationale.
         _gen_model("claude-sonnet-4-6", "Claude Sonnet 4.6 (Bedrock)", 200000, ["text", "image"]),
         _gen_model("claude-opus-4-7", "Claude Opus 4.7 (Bedrock)", 200000, ["text", "image"]),
     ]
@@ -2061,12 +2231,32 @@ if (_img_cfg.get("models") or []):
           "this bot genuinely has provider reach.")
 else:
     _primary = ((config.get("agents", {}).get("defaults", {}) or {}).get("model", {}) or {}).get("primary", "")
-    # Models we have CONFIRMED carry native vision. Extend deliberately.
+    # Models we have CONFIRMED carry native vision on a DIRECT provider route.
+    # Extend deliberately.
     _NATIVE_VISION_PREFIXES = (
         "anthropic/claude-sonnet-", "anthropic/claude-opus-", "anthropic/claude-haiku-",
         "google/gemini-", "amazon-bedrock/anthropic.claude-",
     )
-    if _primary.startswith(_NATIVE_VISION_PREFIXES):
+    # FIXED 2026-09-04 (Mike: images sent over Telegram must be processed).
+    # This check only ever recognized DIRECT provider prefixes, but every bot's
+    # primary has been "oasis-generation/claude-sonnet-5" since ADM-053
+    # (2026-08-30) retired the direct anthropic/openai/google provider blocks —
+    # see the model-allowlist reconcile above. "oasis-generation/..." matched
+    # NONE of the prefixes above, so this fired on EVERY bot on EVERY boot,
+    # confirmed live on nimbus and butterbolt. The gateway model IS the same
+    # Claude Sonnet 5 with real vision; the check just never learned the new
+    # prefix. Rather than hand-copy another prefix (which drifted once
+    # already), read the SAME capability declared for it two hundred lines up
+    # in gen_models — "image" in that model's "input" list is the actual,
+    # single source of truth for what the gateway will accept for this id, and
+    # it cannot drift out of sync with itself.
+    _has_vision = _primary.startswith(_NATIVE_VISION_PREFIXES)
+    if not _has_vision and _primary.startswith("oasis-generation/") and oasis_gen_token:
+        _gen_id = _primary[len("oasis-generation/"):]
+        _has_vision = any(
+            m["id"] == _gen_id and "image" in m.get("input", []) for m in gen_models
+        )
+    if _has_vision:
         print(f"[entrypoint] media image: native vision via {_primary} (no provider, no egress)")
     else:
         print(f"[entrypoint] WARNING image: primary model {_primary!r} is not in the known "
@@ -2210,6 +2400,74 @@ elif gh auth status >/dev/null 2>&1; then
   echo "[entrypoint] git wired for gh CLI personal sign-in (push allowlist='${OASIS_GIT_REPOS:-<none set>}')"
 else
   echo "[entrypoint] no GH_APP_ID/GH_TOKEN/gh-cli-signin — git limited to anonymous public reads (no push)"
+fi
+
+# ---- memory index self-heal (CLAW-110) ----------------------------------
+# WHY THIS EXISTS. memory-core stores a `scopeHash` next to the vector index
+# and compares it on every boot against a hash of the RESOLVED extraPaths plus
+# the multimodal settings. extraPaths is not a fixed list: it is DERIVED at
+# boot by walking OASIS_MEMORY_SWARM_ROOTS for `.swarm` directories. So adding
+# ONE new project directory that contains a `.swarm` folder — ordinary repo
+# work, nothing to do with this fleet — changes the resolved path set, changes
+# the hash, and memory-core PAUSES vector search until a human re-indexes.
+#
+# The failure is silent and the message is misleading. memory_search returns
+# {"results": [], "disabled": true, "error": "index scope changed"} with a
+# warning blaming "a different embedding provider/model/settings" — but the
+# provider and model did not change, only the path set did. The bot does not
+# crash and the container stays healthy, so nothing surfaces it: the bot just
+# mentions conversationally that recall came back empty.
+#
+# Measured 2026-09-09: FOUR of seven bots were in this state at once (house
+# and kolmogorov reported by Mike, yesman and vanhelsing found only by
+# probing them and unnoticed by anyone). The repair is always the same single
+# command, it is idempotent, and it was verified NOT to mutate openclaw.json
+# (md5 unchanged before/after on all four), so it is safe to automate.
+#
+# WHY IT RUNS IN THE BACKGROUND, AFTER THE GATEWAY. A full re-index takes far
+# longer than boot should, so running it inline would delay every restart and
+# hold Telegram down. The re-index was verified safe to run CONCURRENTLY with
+# a live gateway (it is how all four bots were repaired, with the gateway up
+# and serving). This waits for the gateway's own HTTP port, checks the
+# identity, and re-indexes ONLY when the index is actually paused — a healthy
+# index costs one cheap status call and no re-embedding.
+#
+# It must never break the boot: the whole block is backgrounded, every step is
+# `|| true`, and the gateway is exec'd regardless of what happens here.
+# Set OASIS_MEMORY_SELFHEAL=0 to disable.
+if [ "${OASIS_MEMORY_SELFHEAL:-1}" = "1" ]; then
+  (
+    # Wait for the gateway to answer before touching the shared sqlite store.
+    # Bounded: ~60s, then give up quietly rather than re-index during a boot
+    # that is already failing for some other reason.
+    _waited=0
+    while [ "$_waited" -lt 60 ]; do
+      if curl -sf -o /dev/null --max-time 2 "http://127.0.0.1:${PORT:-18789}/" 2>/dev/null; then
+        break
+      fi
+      sleep 3
+      _waited=$((_waited + 3))
+    done
+
+    _status="$(openclaw memory status --agent main 2>/dev/null || true)"
+    if printf '%s' "$_status" | grep -qi 'vector search: paused'; then
+      echo "[entrypoint] memory index: PAUSED (index scope changed) — re-indexing now."
+      echo "[entrypoint] memory index: cause is a changed .swarm path set, NOT the embedding model."
+      if openclaw memory status --index --agent main >/tmp/memory-selfheal.log 2>&1; then
+        grep -iE '^(Indexed|Dirty|Embeddings|FTS):' /tmp/memory-selfheal.log 2>/dev/null \
+          | sed 's/^/[entrypoint] memory index: /' || true
+        # Confirm the pause actually cleared; a silent partial rebuild is worse
+        # than a loud failure because memory_search keeps returning nothing.
+        if openclaw memory status --agent main 2>/dev/null | grep -qi 'vector search: paused'; then
+          echo "[entrypoint] memory index: WARN still paused after re-index — memory_search stays empty. See /tmp/memory-selfheal.log."
+        else
+          echo "[entrypoint] memory index: repaired, vector search active."
+        fi
+      else
+        echo "[entrypoint] memory index: WARN re-index failed — memory_search stays empty. See /tmp/memory-selfheal.log."
+      fi
+    fi
+  ) &
 fi
 
 exec openclaw gateway --bind "${BIND}" --port "${PORT}"
