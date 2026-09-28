@@ -274,6 +274,110 @@ semantic-index-drift-uninstall: ## unload the hourly semantic-index drift check
 semantic-reindex: ## run the semantic-index builder by hand right now (works today, no Full Disk Access needed — you already have Documents access in this terminal)
 	python3 scripts/build-semantic-index.py --corpus exp
 
+# ── CLAW-108 behavioral observatory ─────────────────────────────────────────
+# One page for the fleet at three levels: System 2 (the .swarm work), System 1
+# (follow one session live), System 3 (who each agent is: identity, memory,
+# dreams, age, reviewer record). scripts/claw-observatory.mjs holds the trust
+# model. The snapshot job has the same TCC-driven deployment shape as
+# claw-stuck-lanes above: a copy of the script in $(WATCHDOG_DIR), no Full Disk
+# Access. `observe` runs from this terminal instead, because it also reads
+# ~/Documents (.swarm boards, .claw-mail). The port proxy that makes each bot's
+# Control UI reachable is personal fleet config: `cd bots && make observatory-proxy-up`.
+SWARM_BIN  ?= $(HOME)/Documents/Runes/dot_swarm/.venv/bin/swarm
+SWARM_ROOT ?= $(abspath ..)
+OBSERVATORY_SNAPSHOT_PLIST := $(HOME)/Library/LaunchAgents/com.oasis-x.observatory-snapshot.plist
+
+.PHONY: observatory observe observe-open observe-key observatory-rotate-key swarm-dashboard control-ui fleet pair observatory-snapshot \
+        observatory-snapshot-install observatory-snapshot-status observatory-snapshot-uninstall \
+        feedback feedback-show feedback-pull feedback-set
+
+observatory: ## boot the whole observatory: the port proxy (when bots/ has its compose file), then `make observe`
+	@if [ -f bots/docker-compose.observatory.yml ]; then \
+	  $(MAKE) --no-print-directory -C bots observatory-proxy-up; \
+	else \
+	  echo "no bots/docker-compose.observatory.yml: the port proxy is not started"; \
+	fi
+	@$(MAKE) --no-print-directory observe
+
+observe: ## serve the fleet observatory on 127.0.0.1:18780 (bookmark it) and open it (Ctrl-C stops it)
+	OASIS_SWARM_BIN="$(SWARM_BIN)" OASIS_SWARM_ROOT="$(SWARM_ROOT)" node scripts/claw-observatory.mjs serve --open
+
+observe-open: ## open the running observatory and unlock this browser (after that, the bookmark http://127.0.0.1:18780/ works)
+	@node scripts/claw-observatory.mjs open observatory
+
+observe-key: ## copy the observatory access key, for a browser that `open` cannot reach (paste it into the page's unlock box)
+	@node scripts/claw-observatory.mjs key | tr -d '\n' | pbcopy && echo "observatory access key copied to the clipboard"
+
+observatory-rotate-key: ## replace the observatory access key (every browser unlocks again; restart a running observatory)
+	@node scripts/claw-observatory.mjs rotate-key
+
+# The dot_swarm dashboard is the place to claim, finish, block and comment on
+# items. It listens on 127.0.0.1. Docker Desktop forwards host.docker.internal
+# to this loopback, so the port is still reachable from Nimbus and Hello
+# World, but dot_swarm's 2026-09-28 fix closed what that reachability used to
+# buy: every route now requires a per-run token (X-Swarm-Token), a write also
+# requires this server's own Origin, and a request with an unexpected Host
+# header is refused (measured exposure was CLAW-108 section 8 item 15, now
+# closed). The token is never in the page; `swarm gui` prints it in a URL
+# fragment (.../#t=...), which a browser never sends to a server. Use the
+# printed URL, not a bare port number typed by hand.
+swarm-dashboard: ## start the dot_swarm dashboard on 127.0.0.1:18781 for claims and comments (Ctrl-C stops it)
+	@echo "dot_swarm dashboard starting — open the URL it prints below; the token after # is never sent over the network."
+	"$(SWARM_BIN)" --path "$(SWARM_ROOT)" gui --port 18781
+
+control-ui: ## open one bot's Control UI; a proxied bot first unlocks the port proxy for this browser (BOT=<key>, see: make fleet)
+	@test -n "$(BOT)" || { echo "BOT=<key> required (see: make fleet)"; exit 2; }
+	@node scripts/claw-observatory.mjs open $(BOT)
+
+fleet: ## list every bot: state, Control UI address, .swarm board
+	@node scripts/claw-observatory.mjs list
+
+pair: ## list pending Control UI pairings for one bot (BOT=<key>); add ID=<requestId> to approve one
+	@test -n "$(BOT)" || { echo "BOT=<key> required (see: make fleet)"; exit 2; }
+	@node scripts/claw-observatory.mjs pair $(BOT) $(if $(ID),--approve $(ID),)
+
+observatory-snapshot: ## copy every running bot's identity/memory/dream files into the history repo now
+	@node scripts/claw-observatory.mjs snapshot
+
+observatory-snapshot-install: ## (re)deploy + load the nightly worldview snapshot (23:55) — re-run after editing the script
+	@mkdir -p "$(WATCHDOG_DIR)"
+	@cp scripts/claw-observatory.mjs "$(WATCHDOG_DIR)/claw-observatory.mjs"
+	@cp scripts/com.oasis-x.observatory-snapshot.plist "$(OBSERVATORY_SNAPSHOT_PLIST)"
+	@plutil -lint "$(OBSERVATORY_SNAPSHOT_PLIST)" >/dev/null
+	@launchctl bootout gui/$$(id -u)/com.oasis-x.observatory-snapshot 2>/dev/null || true
+	@launchctl bootstrap gui/$$(id -u) "$(OBSERVATORY_SNAPSHOT_PLIST)"
+	@echo "snapshot job installed — verify with: make observatory-snapshot-status"
+
+observatory-snapshot-status: ## last exit code + log tail (1 = a bot failed to snapshot; 126 = TCC-blocked)
+	@launchctl print gui/$$(id -u)/com.oasis-x.observatory-snapshot 2>/dev/null \
+	  | grep -E "state =|last exit code" || echo "not loaded"
+	@tail -10 "$(HOME)/Library/Logs/observatory-snapshot.stdout.log" 2>/dev/null || true
+	@tail -5 "$(HOME)/Library/Logs/observatory-snapshot.stderr.log" 2>/dev/null || true
+
+observatory-snapshot-uninstall: ## unload the nightly worldview snapshot (the history repo is kept)
+	@launchctl bootout gui/$$(id -u)/com.oasis-x.observatory-snapshot 2>/dev/null || true
+	@echo "observatory snapshot job unloaded"
+
+# Change requests written in the observatory's feedback drawer. The database and
+# the screenshots stay in ~/Library/Application Support/oasis-x/observatory/feedback
+# (no bot mounts it); `feedback-pull` copies only the text to .swarm/feedback/.
+# The recipes read REF, STATUS and NOTE from the environment (make exports
+# command-line variables), so a quote in NOTE cannot break the command. make
+# still reads a `$` in NOTE as a make variable: write `$$` for a dollar sign.
+feedback: ## list change requests from the observatory page (STATUS=new,queued to filter)
+	@node scripts/claw-observatory.mjs feedback list $${STATUS:+--status "$$STATUS"}
+
+feedback-show: ## show one change request and the paths of its screenshots (REF=FB-XXXXXXXX)
+	@test -n "$$REF" || { echo "REF=FB-XXXXXXXX required (see: make feedback)"; exit 2; }
+	@node scripts/claw-observatory.mjs feedback show "$$REF"
+
+feedback-pull: ## write each new change request to .swarm/feedback/<ref>.md and mark it queued
+	@node scripts/claw-observatory.mjs feedback pull
+
+feedback-set: ## triage a change request (REF=FB-XXXXXXXX STATUS=queued|in_progress|done|declined, optional NOTE="...")
+	@test -n "$$REF" && test -n "$$STATUS" || { echo "REF=FB-XXXXXXXX and STATUS=<status> required"; exit 2; }
+	@node scripts/claw-observatory.mjs feedback set "$$REF" "$$STATUS" $${NOTE:+--note "$$NOTE"}
+
 # ── egress partitioning health ───────────────────────────────────────────────
 egress-check: ## verify client.map still matches live bot IPs (CLAW-050 isolation)
 	@python3 ./scripts/claw-egress-sync --check

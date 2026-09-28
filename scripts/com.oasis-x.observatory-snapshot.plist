@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  observatory-snapshot: nightly copy of every running bot's identity, memory
+  and dream files into a local git repository (CLAW-108, System 3).
+
+  WHY NIGHTLY, AND WHY IT HAD TO START FIRST: memory-core's dream step rewrites
+  MEMORY.md and DREAMS.md in place (22:20 to 22:50 America/New_York across the
+  fleet). Nothing kept an earlier copy, so the worldview history from before
+  this job's first run does not exist. Each night without a snapshot loses one
+  more day of it. The git history of the snapshot repository IS the record of
+  how each bot's worldview changes.
+
+  SAME TCC SHAPE AS claw-stuck-lanes: launchd cannot exec a script that lives
+  inside ~/Documents, so `make observatory-snapshot-install` copies the script
+  to ~/Library/Application Support/oasis-x/. The job needs only `docker`, `git`
+  and that directory. It needs no Full Disk Access.
+
+  WHERE THE HISTORY LIVES: ~/Library/Application Support/oasis-x/observatory/
+  snapshots. That path is outside every bot mount. Yes Man mounts
+  ~/Documents/Runes read-write, so a store under ~/Documents would be readable
+  and writable by a bot. Note that Yes Man also mounts ~/Library/LaunchAgents
+  read-write (CLAW-051), which covers this plist exactly as it covers every
+  other plist there.
+
+  WHAT IT COPIES: the bootstrap files (AGENTS, SOUL, TOOLS, IDENTITY, USER,
+  HEARTBEAT, BOOTSTRAP, MEMORY, DREAMS), memory/*.md and
+  memory/dreaming/{light,rem,deep}/*.md, plus a meta.json with name, birth time
+  and model. Never identity/device.json (it holds the device private key),
+  never openclaw.json, never a transcript. Only running bot containers are
+  read, and any container whose name matches OASIS_OBSERVATORY_EXCLUDE
+  (default: kaizen|pasa, the corporate deployment) is skipped.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.oasis-x.observatory-snapshot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/node</string>
+        <string>/Users/Michaellee/Library/Application Support/oasis-x/claw-observatory.mjs</string>
+        <string>snapshot</string>
+    </array>
+
+    <!-- 23:55 local: after the last dream run of the night (Kolmogorov 22:50),
+         so a commit's date is the date of the dream it records. A Mac asleep
+         at 23:55 runs the job once on wake. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>23</integer>
+        <key>Minute</key>
+        <integer>55</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/Michaellee</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/Michaellee/Library/Logs/observatory-snapshot.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/Michaellee/Library/Logs/observatory-snapshot.stderr.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
