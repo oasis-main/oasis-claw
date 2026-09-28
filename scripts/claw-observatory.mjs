@@ -12,8 +12,10 @@
 // COMMANDS
 //   list [--json]                      every bot: state, Control UI address, board
 //   open <bot>|observatory|board       open an address in the default browser
-//   serve [--port N] [--open]          serve the observatory page on 127.0.0.1
-//                                      (a stable address: bookmark it)
+//   serve [--port N] [--open] [--no-dashboard]
+//                                      serve the observatory page on 127.0.0.1
+//                                      (a stable address: bookmark it), and
+//                                      start the dot_swarm dashboard beside it
 //   snapshot [--dir PATH] [--no-commit]
 //                                      copy each bot's self files into the
 //                                      history repository and commit
@@ -41,6 +43,13 @@
 //      write needs the token AND this page's Origin. The requests and their
 //      screenshots stay in the state folder, which no bot mounts: a screenshot
 //      can show any agent's memory.
+//   6. `serve` also starts the dot_swarm dashboard (`swarm gui`, 18781), where
+//      the human claims, finishes, blocks and comments on items. A bot can
+//      reach that port too, so the observatory starts it only after it proves
+//      the fixed behavior (dot_swarm 2026-09-28): the page carries no token,
+//      and a read without the token is refused. An older dot_swarm is not
+//      started. The dashboard token is fresh for each run and reaches the
+//      browser only in a URL fragment, from this token-gated API.
 //
 // DEPLOYMENT NOTE: `make observatory-snapshot-install` copies THIS FILE ALONE
 // to ~/Library/Application Support/oasis-x/ for launchd (TCC blocks launchd
@@ -1546,12 +1555,8 @@ const pickItem = (i) => ({
 
 // ── the colony: every .swarm division under the dot_swarm root ──────────────
 // Read by calling dot_swarm's own get_colony_summary() with the dot_swarm
-// venv's Python, NOT from a running `swarm gui`. That dashboard listens on
-// 127.0.0.1 with no key on its reads, and its page hands out its write token
-// to any caller; Docker Desktop forwards host.docker.internal to the Mac's
-// loopback, so while it runs Nimbus and Hello World can read every board and
-// write to it as the human (measured 2026-09-22). The observatory therefore
-// no longer starts it; `make swarm-dashboard` does, on request.
+// venv's Python, not through the dashboard's HTTP API: the page must show the
+// colony even when the dashboard is not running.
 
 const COLONY_SNIPPET = [
   "import json, sys",
@@ -1568,6 +1573,116 @@ export function swarmPython(env = process.env) {
 
 export async function readColony(root, python = swarmPython()) {
   return JSON.parse(await run(python, ["-c", COLONY_SNIPPET, root], { timeoutMs: 120_000 }));
+}
+
+// ── the dot_swarm dashboard, started beside the observatory ────────────────
+// History: until dot_swarm's 2026-09-28 fix, `swarm gui` served its write
+// token inside GET /, needed no token for a read, and accepted a write with no
+// Origin. Docker Desktop forwards host.docker.internal to the Mac's loopback,
+// so Nimbus and Hello World could read every board and write to it as the
+// human (measured 2026-09-22, CLAW-108 §5 item 6). The fixed dashboard needs
+// its token on every /api/ route, and takes the token from SWARM_GUI_TOKEN.
+// verifySwarmDashboard() proves that fixed behavior before the page links to
+// the dashboard; an older dot_swarm is stopped at once.
+
+/** GET a loopback URL; resolve { status, body } or null if unreachable. */
+function httpGet(url, headers = {}, timeoutMs = 3000) {
+  return new Promise((resolve) => {
+    const req = http.get(url, { headers, timeout: timeoutMs }, (res) => {
+      const chunks = [];
+      let size = 0;
+      res.on("data", (c) => {
+        size += c.length;
+        if (size <= 4 * 1024 * 1024) chunks.push(c);
+      });
+      res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString("utf8") }));
+      res.on("error", () => resolve(null));
+    });
+    req.on("timeout", () => req.destroy());
+    req.on("error", () => resolve(null));
+  });
+}
+
+/** Resolve null when the dashboard at `url` has the fixed token behavior,
+ *  or a reason string when it does not. */
+export async function verifySwarmDashboard(url, token) {
+  const page = await httpGet(url);
+  if (!page || page.status !== 200) return `GET / answered ${page ? page.status : "nothing"}`;
+  if (page.body.includes(token)) return "GET / hands out the session token (dot_swarm older than the 2026-09-28 fix)";
+  const anon = await httpGet(new URL("/api/state.json", url).href);
+  if (!anon || anon.status !== 401) {
+    return `GET /api/state.json without the token answered ${anon ? anon.status : "nothing"}, not 401 (dot_swarm older than the 2026-09-28 fix)`;
+  }
+  const authed = await httpGet(new URL("/api/state.json", url).href, { "X-Swarm-Token": token }, 120_000);
+  if (!authed || authed.status !== 200) return `GET /api/state.json with the token answered ${authed ? authed.status : "nothing"}`;
+  return null;
+}
+
+/**
+ * Start `swarm gui` on 127.0.0.1:port with a fresh token, and verify it.
+ * Resolves one of:
+ *   { state: "managed", url, openUrl, stop() }   started and verified
+ *   { state: "foreign", url }                    the port already answers; not ours
+ *   { state: "failed",  url, reason }            not started, or stopped again
+ */
+export async function startSwarmDashboard({
+  bin,
+  root,
+  port = SWARM_PORT,
+  token = crypto.randomBytes(32).toString("base64url"),
+  env = process.env,
+  timeoutMs = 20_000,
+} = {}) {
+  const url = `http://127.0.0.1:${port}/`;
+  if (await httpReachable(url)) return { state: "foreign", url };
+
+  let child;
+  try {
+    child = spawn(bin, ["--path", root, "gui", "--port", String(port)], {
+      env: { ...env, SWARM_GUI_TOKEN: token },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (err) {
+    return { state: "failed", url, reason: `cannot start ${bin}: ${err.message}` };
+  }
+  // Keep only the last lines, for an error report. The dashboard prints its
+  // own token URL; this process never echoes it.
+  const tail = [];
+  const keep = (chunk) => {
+    for (const line of String(chunk).split("\n")) {
+      if (line.trim() && !line.includes(token)) tail.push(line.trim());
+    }
+    tail.splice(0, Math.max(0, tail.length - 5));
+  };
+  child.stdout.on("data", keep);
+  child.stderr.on("data", keep);
+  let exited = null;
+  child.on("exit", (code, signal) => {
+    exited = signal ?? `exit ${code}`;
+  });
+  child.on("error", (err) => {
+    exited = err.message;
+  });
+
+  const stop = () => {
+    if (exited === null) child.kill("SIGTERM");
+  };
+  const fail = (reason) => {
+    stop();
+    return { state: "failed", url, reason: tail.length ? `${reason} — ${tail.join(" | ")}` : reason };
+  };
+
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (exited !== null) return fail(`${bin} stopped (${exited})`);
+    const page = await httpGet(url, {}, 1000);
+    if (page?.status === 200) break;
+    if (Date.now() > deadline) return fail(`no answer on ${url} after ${timeoutMs / 1000} s`);
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  const refused = await verifySwarmDashboard(url, token);
+  if (refused) return fail(`not linked: ${refused}`);
+  return { state: "managed", url, openUrl: `${url}#t=${token}`, stop, child };
 }
 
 async function lastSnapshotCommit(dir) {
@@ -1905,7 +2020,17 @@ async function cmdOpen(target) {
     return;
   }
   if (target === "board") {
-    openInBrowser(`http://127.0.0.1:${SWARM_PORT}/`);
+    const serve = readServeFile();
+    if (!serve?.swarmOpenUrl) {
+      throw new Error(
+        "the observatory is not running a swarm dashboard; start it with `make observatory`, " +
+          "or run `make swarm-dashboard` and open the URL it prints",
+      );
+    }
+    // The token is in the fragment, which the browser never sends; the
+    // dashboard page moves it into sessionStorage and clears the address bar.
+    openInBrowser(serve.swarmOpenUrl);
+    console.log(`opened ${new URL(serve.swarmOpenUrl).origin}/ (swarm dashboard)`);
     return;
   }
   const fleet = await discoverFleet();
@@ -1981,7 +2106,32 @@ async function cmdServe(flags) {
     port: SWARM_PORT,
     url: `http://127.0.0.1:${SWARM_PORT}/`,
     root: process.env.OASIS_SWARM_ROOT || path.resolve(SCRIPT_DIR, "..", ".."),
+    managed: false,
+    openUrl: null,
+    note: flags.noDashboard ? "not started (--no-dashboard)" : null,
   };
+  let dashboard = null;
+  if (!flags.noDashboard) {
+    dashboard = await startSwarmDashboard({
+      bin: process.env.OASIS_SWARM_BIN || "swarm",
+      root: swarm.root,
+      port: SWARM_PORT,
+    });
+    if (dashboard.state === "managed") {
+      swarm.managed = true;
+      swarm.openUrl = dashboard.openUrl;
+      dashboard.child.on("exit", (code, signal) => {
+        swarm.openUrl = null;
+        swarm.managed = false;
+        swarm.note = `stopped (${signal ?? `exit ${code}`}); restart the observatory`;
+        console.error(`swarm dashboard: ${swarm.note}`);
+      });
+    } else if (dashboard.state === "foreign") {
+      swarm.note = "started outside the observatory: open the URL that its own terminal printed";
+    } else {
+      swarm.note = dashboard.reason;
+    }
+  }
   const ctx = {
     port,
     token,
@@ -1998,12 +2148,20 @@ async function cmdServe(flags) {
     server.listen(port, "127.0.0.1", resolve);
   });
   fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(SERVE_FILE, JSON.stringify({ port, pid: process.pid, startedAt: new Date().toISOString() }), { mode: 0o600 });
+  // serve.json is 0600 in a 0700 folder that no bot mounts; it carries the
+  // dashboard URL with its token so that `open board` can open it.
+  fs.writeFileSync(
+    SERVE_FILE,
+    JSON.stringify({ port, pid: process.pid, startedAt: new Date().toISOString(), swarmOpenUrl: swarm.openUrl }),
+    { mode: 0o600 },
+  );
   console.log(`observatory: http://127.0.0.1:${port}/   (bookmark this address; \`make observe-open\` unlocks a new browser; Ctrl-C stops it)`);
   console.log(`colony: read from ${swarm.root} with ${swarmPython()} (no dashboard needed)`);
-  if (await httpReachable(swarm.url)) {
-    console.log(`swarm dashboard: running on ${swarm.url} — while it runs, Nimbus and Hello World can read and write every board`);
-  }
+  console.log(
+    swarm.managed
+      ? `swarm dashboard: ${swarm.url} (started with the observatory; link on the Work page, or \`make swarm-open\`)`
+      : `swarm dashboard: ${swarm.note}`,
+  );
   console.log(`feedback: ${DEFAULT_FEEDBACK_DIR} (\`make feedback\` lists requests, \`make feedback-pull\` queues them)`);
   const proxy = await proxyState();
   console.log(
@@ -2026,6 +2184,7 @@ async function cmdServe(flags) {
     } catch {
       // already gone
     }
+    if (dashboard?.state === "managed") dashboard.stop();
     server.close();
     setTimeout(() => process.exit(0), 300).unref();
   };
@@ -2115,6 +2274,7 @@ export function parseFlags(argv) {
     else if (a === "--out") flags.out = argv[++i];
     else if (a === "--note") flags.note = argv[++i];
     else if (a === "--dry-run") flags.dryRun = true;
+    else if (a === "--no-dashboard") flags.noDashboard = true;
     else if (a.startsWith("--")) throw new Error(`unknown option ${a}`);
     else flags._.push(a);
   }
@@ -2128,8 +2288,9 @@ const USAGE = `usage: claw-observatory.mjs <command>
 
   list [--json]                     every bot: state, Control UI address, .swarm board
   open <bot>|observatory|board      open an address in the default browser
-  serve [--port N] [--open] [--dir PATH]
-                                    serve the observatory on 127.0.0.1 (default ${DEFAULT_PORT})
+  serve [--port N] [--open] [--dir PATH] [--no-dashboard]
+                                    serve the observatory on 127.0.0.1 (default ${DEFAULT_PORT}),
+                                    and start the swarm dashboard on ${SWARM_PORT}
   snapshot [--dir PATH] [--no-commit]
                                     copy each running bot's identity, memory and dream
                                     files into the history repository and commit

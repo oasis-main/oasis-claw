@@ -287,7 +287,7 @@ SWARM_BIN  ?= $(HOME)/Documents/Runes/dot_swarm/.venv/bin/swarm
 SWARM_ROOT ?= $(abspath ..)
 OBSERVATORY_SNAPSHOT_PLIST := $(HOME)/Library/LaunchAgents/com.oasis-x.observatory-snapshot.plist
 
-.PHONY: observatory observe observe-open observe-key observatory-rotate-key swarm-dashboard control-ui fleet pair observatory-snapshot \
+.PHONY: observatory observe observe-open observe-key observatory-rotate-key swarm-open swarm-dashboard control-ui fleet pair observatory-snapshot \
         observatory-snapshot-install observatory-snapshot-status observatory-snapshot-uninstall \
         feedback feedback-show feedback-pull feedback-set
 
@@ -299,7 +299,7 @@ observatory: ## boot the whole observatory: the port proxy (when bots/ has its c
 	fi
 	@$(MAKE) --no-print-directory observe
 
-observe: ## serve the fleet observatory on 127.0.0.1:18780 (bookmark it) and open it (Ctrl-C stops it)
+observe: ## serve the fleet observatory on 127.0.0.1:18780 (bookmark it) with the swarm dashboard on 18781, and open it (Ctrl-C stops both)
 	OASIS_SWARM_BIN="$(SWARM_BIN)" OASIS_SWARM_ROOT="$(SWARM_ROOT)" node scripts/claw-observatory.mjs serve --open
 
 observe-open: ## open the running observatory and unlock this browser (after that, the bookmark http://127.0.0.1:18780/ works)
@@ -312,17 +312,21 @@ observatory-rotate-key: ## replace the observatory access key (every browser unl
 	@node scripts/claw-observatory.mjs rotate-key
 
 # The dot_swarm dashboard is the place to claim, finish, block and comment on
-# items. It listens on 127.0.0.1. Docker Desktop forwards host.docker.internal
-# to this loopback, so the port is still reachable from Nimbus and Hello
-# World, but dot_swarm's 2026-09-28 fix closed what that reachability used to
-# buy: every route now requires a per-run token (X-Swarm-Token), a write also
-# requires this server's own Origin, and a request with an unexpected Host
-# header is refused (measured exposure was CLAW-108 section 8 item 15, now
-# closed). The token is never in the page; `swarm gui` prints it in a URL
-# fragment (.../#t=...), which a browser never sends to a server. Use the
-# printed URL, not a bare port number typed by hand.
-swarm-dashboard: ## start the dot_swarm dashboard on 127.0.0.1:18781 for claims and comments (Ctrl-C stops it)
-	@echo "dot_swarm dashboard starting — open the URL it prints below; the token after # is never sent over the network."
+# items. `make observe` starts it on 127.0.0.1:18781 and stops it on exit, and
+# the observatory's Work page links to it. Docker Desktop forwards
+# host.docker.internal to this loopback, so Nimbus and Hello World can reach
+# the port. dot_swarm's 2026-09-28 fix makes that reach useless without the
+# token: every /api/ route needs the per-run token (X-Swarm-Token), a write
+# also needs the dashboard's own Origin, and an unexpected Host header is
+# refused. The page never contains the token; it arrives in a URL fragment
+# (.../#t=...), which a browser never sends to a server. The observatory
+# checks that behavior before it links, and does not start an older dot_swarm
+# (CLAW-108 §5 item 6).
+swarm-open: ## open the swarm dashboard that `make observe` started (claims, finish, block, comments)
+	@node scripts/claw-observatory.mjs open board
+
+swarm-dashboard: ## start the dot_swarm dashboard alone on 127.0.0.1:18781, without the observatory (Ctrl-C stops it)
+	@echo "dot_swarm dashboard: open the URL printed below. The token after # stays in the browser."
 	"$(SWARM_BIN)" --path "$(SWARM_ROOT)" gui --port 18781
 
 control-ui: ## open one bot's Control UI; a proxied bot first unlocks the port proxy for this browser (BOT=<key>, see: make fleet)

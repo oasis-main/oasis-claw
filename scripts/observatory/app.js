@@ -69,7 +69,10 @@ async function api(url, { method = "GET", type, body: payload } = {}) {
   return body;
 }
 
-const LOOPBACK_HREF = /^http:\/\/(127\.0\.0\.1|localhost):\d{2,5}\/(?:__claw-proxy\/unlock#k=[A-Za-z0-9_-]{32,256})?$/;
+// Allowed fragments: the port proxy's unlock key (#k=) and the swarm
+// dashboard's session token (#t=). A fragment never leaves the browser.
+const LOOPBACK_HREF =
+  /^http:\/\/(127\.0\.0\.1|localhost):\d{2,5}\/(?:__claw-proxy\/unlock#k=[A-Za-z0-9_-]{32,256}|#t=[A-Za-z0-9_-]{32,256})?$/;
 
 function h(tag, props, ...children) {
   const el = document.createElement(tag);
@@ -389,6 +392,19 @@ function renderTabs() {
   );
 }
 
+/** The status-bar chip for the dot_swarm dashboard. */
+function swarmChip(swarm) {
+  if (swarm.running && swarm.openUrl) return externalLink(swarm.openUrl, "swarm dashboard ↗", "chip link ok");
+  if (swarm.running) {
+    const c = chip("swarm dashboard: started elsewhere", "warn");
+    c.title = swarm.note ?? "";
+    return c;
+  }
+  const c = chip("swarm dashboard off", "warn");
+  c.title = swarm.note ?? "";
+  return c;
+}
+
 function renderFleetStatus() {
   const f = app.fleet;
   const running = f.bots.filter((b) => b.running).length;
@@ -397,7 +413,7 @@ function renderFleetStatus() {
     ...[
       chip(`${running} of ${f.bots.length} bots running`, running === f.bots.length ? "ok" : "warn"),
       chip(proxyText, f.proxy?.state === "running" ? "ok" : "warn"),
-      f.swarm.running ? externalLink(f.swarm.url, "swarm dashboard ↗ (open to bots)", "chip link warn") : null,
+      swarmChip(f.swarm),
       chip(f.snapshot.last ? `last snapshot ${ago(f.snapshot.last.date)}` : "no snapshot yet", f.snapshot.last ? "" : "warn"),
     ].filter(Boolean),
   );
@@ -621,15 +637,19 @@ function renderWork() {
     }),
     stateBar,
   );
-  const dashboardNote = app.fleet.swarm.running
-    ? h(
-        "p",
-        { class: "muted" },
-        "Claim, finish, block and comment on an item in the ",
-        externalLink(app.fleet.swarm.url, "swarm dashboard ↗", "inline-link"),
-        ". Stop it when you are done: while it runs, Nimbus and Hello World can read and change every board.",
-      )
-    : h("p", { class: "muted", text: "To claim, finish, block or comment on an item, run `make swarm-dashboard` in another terminal, and stop it when you are done (it is open to Nimbus and Hello World while it runs)." });
+  const sw = app.fleet.swarm;
+  const dashboardNote =
+    sw.running && sw.openUrl
+      ? h(
+          "p",
+          { class: "muted" },
+          "Claim, finish, block and comment on an item in the ",
+          externalLink(sw.openUrl, "swarm dashboard ↗", "inline-link"),
+          ". The observatory started it and stops it on exit. Every read and write there needs this run's token, which the link carries in its fragment.",
+        )
+      : sw.running
+        ? h("p", { class: "muted", text: `A swarm dashboard started outside the observatory runs on ${sw.url}. Open the URL that its own terminal printed (it ends with #t=…).` })
+        : h("p", { class: "muted", text: `The swarm dashboard is not running${sw.note ? ` (${sw.note})` : ""}. Restart the observatory, or run \`make swarm-dashboard\` and open the URL it prints.` });
   mainEl.append(
     toolbar,
     section("Bot boards", "The .swarm board that each bot reads and writes (OASIS_SWARM_DIR). The bot bar above chooses the bots.", boards),
