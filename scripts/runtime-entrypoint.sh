@@ -824,6 +824,50 @@ role_profile = os.environ.get("OASIS_TOOLS_PROFILE", "").strip()
 if role_profile:
     tools_cfg["profile"] = role_profile
 
+# ---- mcp.servers from role.yaml (CLAW-117) ---------------------------------
+# role.yaml `mcp.servers`, compiled to OASIS_MCP_SERVERS (JSON; remote servers
+# only — compile-role.py refuses stdio), is the one source of this bot's MCP
+# servers. openclaw.json persists on the volume, so a server dropped from
+# role.yaml must be REMOVED here, not just left unwritten. A side marker
+# records which names this block owns; the marker cannot live in openclaw.json
+# (strict schema). Servers an operator added by hand are left alone.
+# The `coding` tool profile already admits MCP tools (plugin id "bundle-mcp",
+# verified in the 7.1-2 dist), so no tools.alsoAllow entry is needed.
+mcp_marker = config_path.parent / ".oasis-mcp-managed.json"
+try:
+    mcp_prev = set(json.loads(mcp_marker.read_text()))
+except (OSError, ValueError, TypeError):
+    mcp_prev = set()
+try:
+    mcp_declared = json.loads(os.environ.get("OASIS_MCP_SERVERS", "") or "{}")
+    if not isinstance(mcp_declared, dict):
+        raise ValueError("not an object")
+except ValueError as exc:
+    print(f"[entrypoint] WARN: OASIS_MCP_SERVERS unusable ({exc}); no MCP servers wired", file=sys.stderr)
+    mcp_declared = {}
+mcp_cfg = config.get("mcp") if isinstance(config.get("mcp"), dict) else {}
+mcp_servers = mcp_cfg.get("servers") if isinstance(mcp_cfg.get("servers"), dict) else {}
+for _name in mcp_prev - set(mcp_declared):
+    mcp_servers.pop(_name, None)
+mcp_servers.update(mcp_declared)
+if mcp_servers:
+    mcp_cfg["servers"] = mcp_servers
+    config["mcp"] = mcp_cfg
+else:
+    mcp_cfg.pop("servers", None)
+    if mcp_cfg:
+        config["mcp"] = mcp_cfg
+    else:
+        config.pop("mcp", None)
+try:
+    mcp_marker.write_text(json.dumps(sorted(mcp_declared)))
+except OSError as exc:
+    print(f"[entrypoint] WARN: could not write {mcp_marker}: {exc}", file=sys.stderr)
+if mcp_declared:
+    print(f"[entrypoint] mcp servers (role.yaml): {', '.join(sorted(mcp_declared))}")
+if os.environ.get("_ROLE_MCP_SKIPPED"):
+    print(f"[entrypoint] WARN: role.yaml mcp servers skipped: {os.environ['_ROLE_MCP_SKIPPED']}", file=sys.stderr)
+
 # ---- web_fetch through the egress proxy (CLAW-073 / reach-parity) --------
 # The bots run in an `internal:true` sandbox with NO DNS resolver — all egress
 # goes through the fail-closed egress-proxy (HTTPS_PROXY=http://egress-proxy:3128).
@@ -1855,6 +1899,8 @@ if oasis_gen_token:
         # `claude-opus-5`. Routing it through oasis-generation puts every bot on
         # one metered path. Must stay in sync with the gateway's catalog.py.
         _gen_model("claude-opus-5", "Claude Opus 5 (Bedrock)", 200000, ["text", "image"]),
+        _gen_model("claude-opus-5-5", "Claude Opus 5.5 (Bedrock)", 200000, ["text", "image"]),
+        _gen_model("gpt-6-astra", "GPT-6 Astra (Bedrock)", 272000, ["text", "image"]),
         _gen_model("claude-sonnet-5", "Claude Sonnet 5 (Bedrock)", 200000, ["text", "image"]),
         _gen_model("gpt-5.6-sol", "GPT-5.6-sol (Bedrock)", 272000, ["text", "image"]),
         _gen_model("glm-5", "GLM-5 (Bedrock)", 131072),
