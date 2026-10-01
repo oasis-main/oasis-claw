@@ -1,0 +1,14 @@
+{
+  "name": "@oasis-claw/oasis-brave-search",
+  "version": "0.1.0",
+  "description": "openclaw plugin: register the Brave Search web_search provider that openclaw ships but never registers",
+  "type": "module",
+  "devDependencies": {
+    "openclaw": "workspace:*"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

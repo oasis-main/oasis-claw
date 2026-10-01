@@ -1,0 +1,40 @@
+{
+  "id": "brave",
+  "name": "Brave Search",
+  "description": "Registers the Brave Search web_search provider. openclaw 2026.7.1-2 SHIPS a complete Brave provider (dist/brave-web-search-provider-*.js, built from its own extensions/brave/src) but does NOT ship a plugin that registers it, so web_search could only ever use DuckDuckGo. This plugin is that missing registration and nothing more — it reuses openclaw's implementation rather than reimplementing the Brave API client.",
+  "activation": {
+    "onStartup": false
+  },
+  "contracts": {
+    "_doc": "REQUIRED. A registerWebSearchProvider'd provider materializes ONLY if declared here, the same gate contracts.tools applies to registerTool (CLAW-082). The id must match buildBraveWebSearchProviderBase's id.",
+    "webSearchProviders": [
+      "brave"
+    ]
+  },
+  "configSchema": {
+    "_doc": "REQUIRED by openclaw: a manifest without configSchema fails config validation and `plugins install --link` refuses it with 'plugin manifest requires configSchema' (measured 2026-09-08). Mirrors the config path openclaw's own Brave provider reads, plugins.entries.brave.config.webSearch.*, per docs/tools/brave-search.md. The API KEY IS DELIBERATELY NOT SET HERE — the provider declares envVars ['BRAVE_API_KEY'] and every container already carries it, so the secret stays out of a file the agent can read. The property is declared only so a hand-set key still validates.",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "webSearch": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "apiKey": {
+            "type": "string",
+            "description": "Prefer the BRAVE_API_KEY environment variable instead."
+          },
+          "mode": {
+            "type": "string",
+            "enum": ["web", "llm-context"],
+            "description": "Brave transport: normal web results, or the LLM Context API."
+          },
+          "baseUrl": {
+            "type": "string",
+            "description": "Override the Brave API base URL (proxy or compatible gateway)."
+          }
+        }
+      }
+    }
+  }
+}
