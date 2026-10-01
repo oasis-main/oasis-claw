@@ -1374,9 +1374,15 @@ if (os.environ.get("OASIS_SESSION_MEMORY", "").strip() or "1") == "1":
 # holds two 69-file NEAR-COPIES of oasis-x/.swarm — indexing them puts three
 # slightly different versions of the same brief in the index, which is the
 # stale-brief failure at scale.
+#
+# 2026-10-01: `bot-work` (bots' private clones, e.g. bot-work/kolmogorov/
+# oasis-cloud) and `oasis-cloud-worktrees` (git worktrees of oasis-cloud) are
+# the same near-copy problem under names the "worktrees" entry does not match:
+# House and Yes Man were indexing oasis-cloud's .swarm up to five times.
 SWARM_CORPUS_EXCLUDE = (
     "node_modules", ".git", ".venv", "venv", "vendor", "forks", "worktrees",
     ".claude", "External Reference Repos", "dist", "build", ".next", "__pycache__",
+    "bot-work", "oasis-cloud-worktrees",
 )
 SWARM_CORPUS_MAX_DIRS = 200
 SWARM_CORPUS_MAX_DEPTH = 6
