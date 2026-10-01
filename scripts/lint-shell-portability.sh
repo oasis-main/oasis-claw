@@ -35,12 +35,21 @@
 
 set -euo pipefail
 
+# Resolve file arguments against the CALLER's directory before the cd below.
+# Without this, a relative path given from anywhere but the repo root named a
+# file that did not exist after the cd, and `bash -n` on it reported
+# "does not parse": a false failure for a file that parses cleanly.
+files=()
+for a in "$@"; do
+  case "$a" in
+    /*) files+=("$a") ;;
+    *)  files+=("$PWD/$a") ;;
+  esac
+done
+
 cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
 
-files=()
-if [ "$#" -gt 0 ]; then
-  files=("$@")
-else
+if [ "$#" -eq 0 ]; then
   while IFS= read -r f; do
     [ -f "$f" ] || continue
     case "$f" in
@@ -51,6 +60,13 @@ else
       *) head -1 "$f" 2>/dev/null | grep -qE '^#!.*(ba)?sh' && files+=("$f") || true ;;
     esac
   done < <(git ls-files)
+fi
+
+# bash 3.2 treats "${files[@]}" on an empty array as unbound under set -u, so
+# an empty list (no arguments, outside a git checkout) aborted with an error.
+if [ "${#files[@]}" -eq 0 ]; then
+  echo "shell portability: no shell files to check"
+  exit 0
 fi
 
 fail=0
