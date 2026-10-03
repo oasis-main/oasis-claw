@@ -39,6 +39,23 @@ export interface HardPolicy {
   compoundExec: Verdict; // benign pipes/redirects/&&/|| (substitution handled separately)
   substitutionExec: Verdict; // $( ) ` <( )  — eval vector
   destructiveExec: Verdict;
+  // Verdict for reading a file that matches denyReadGlobs. "deny" is the
+  // original behaviour and the default. A bot may set "escalate" (per bot only)
+  // to route such a read to an approval prompt instead of refusing it.
+  secretRead: Verdict;
+  // True when the bot set secretRead explicitly. The same check then also
+  // covers an exec command that would otherwise pass as an inert read-only
+  // pipeline (`cat .env`, `head id_rsa`), which skips every per-bot rule.
+  // Opt-in, so a bot that never set secretRead keeps its exact behaviour.
+  secretReadExec: boolean;
+  // Verdict for a shell interpreter started by SEQUENCING: `a && bash x.sh`,
+  // `a; sh x.sh`, `a || bash y.sh`. "deny" (the default) keeps the original
+  // download-execute rule, which treated these like a pipe into a shell.
+  // "allow" abstains: the command continues through the remaining rules, the
+  // same as a script run on its own (`bash x.sh`), which was never blocked. A
+  // PIPE into a shell (`curl … | sh`, `base64 -d | bash`) and `eval` stay
+  // denied whatever this says: they hand the interpreter text no rule can read.
+  sequencedShellExec: Verdict;
   // per-bot write scoping
   allowWriteRoots: string[]; // [] = no scoping (fleet-broad)
   escalateWriteRoots: string[];
@@ -111,6 +128,9 @@ export const DEFAULT_HARD_POLICY: HardPolicy = {
   compoundExec: "escalate",
   substitutionExec: "escalate",
   destructiveExec: "deny",
+  secretRead: "deny",
+  secretReadExec: false,
+  sequencedShellExec: "deny",
   allowWriteRoots: [],
   escalateWriteRoots: [],
   denyWriteOutsideAllow: false,
@@ -148,12 +168,16 @@ const CRON_MUTATE_ACTIONS = new Set(["add", "update", "remove"]);
 // hard:infra-ledger-miss (CLAW-116): an infrastructure change that no approval-
 // ledger entry covers. A mail-woken run is unattended, and a peer's request is
 // not Mike's consent, so it must fail closed rather than inherit any.
+// hard:secret-read is a protected-file read that a bot routed to approval
+// (secretRead: "escalate") instead of the default deny. Unattended, nobody can
+// approve it, so it fails closed: the same deny the bot would get by default.
 export const NEVER_DOWNGRADE = new Set([
   "hard:self-runtime",
   "hard:cron-mutation",
   "hard:operator-consent-required",
   "hard:infra-ledger-miss",
   "hard:infra-ledger-review",
+  "hard:secret-read",
 ]);
 
 // CLAW-116 (2026-09-22): the escalations Mike decides with an approval card,
@@ -238,7 +262,18 @@ const SUBSTITUTION_RETRY_HINT =
 // Download/decode → shell execution (obfuscated RCE): fetched or decoded content
 // piped/chained INTO a shell interpreter. Hard-deny even on a reviewer-gated bot
 // (a legit install is done in inspectable steps, or by Mike).
-const DOWNLOAD_EXEC = /(?:\||&&|;)\s*(?:sudo\s+)?(?:sh|bash|zsh|dash|ksh)\b|(?:^|\s|;|&|\|)eval\s+\S/i;
+//
+// Two classes, matched separately so a bot can open the second one
+// (sequencedShellExec) without opening the first. Together they match exactly
+// what the single original pattern matched.
+//   PIPE_INTO_SHELL  a single `|` into an interpreter, or `eval`. The bytes the
+//                    shell runs never appear in the command text, so no other
+//                    rule can read them. Always denied.
+//   SEQUENCED_SHELL  an interpreter started after `&&`, `||` or `;`. The script
+//                    it runs is named in the command, exactly as in `bash x.sh`
+//                    on its own, which was never blocked.
+const PIPE_INTO_SHELL = /(?<!\|)\|(?!\|)\s*(?:sudo\s+)?(?:sh|bash|zsh|dash|ksh)\b|(?:^|\s|;|&|\|)eval\s+\S/i;
+const SEQUENCED_SHELL = /(?:&&|\|\||;)\s*(?:sudo\s+)?(?:sh|bash|zsh|dash|ksh)\b/i;
 // Command / process substitution = an eval vector that evades static inspection —
 // route to a human even on a reviewer-gated bot.
 const SUBSTITUTION = /\$\(|`|<\(/;
@@ -823,10 +858,20 @@ function leadingArgvToken(stage: string): string {
 // it restores the authored rules' ability to see the command at all.
 const SENSITIVE_READ_TARGET = /\/proc\/(?:\d+|self|thread-self)\/(?:environ|cmdline)\b/;
 
+// Same reasoning for a shell variable whose NAME marks it as a credential:
+// `echo $GH_TOKEN` and `printf %s "${API_KEY}"` are built only from inert tools,
+// so they skipped every per-bot rule, and a rule that names the variable never
+// saw them. Upper-case only, the environment-variable convention, so an
+// ordinary `$next_token` in a loop is untouched. Like the /proc targets above,
+// this adds no denial by itself; it lets the authored rules see the command.
+const CREDENTIAL_VAR_EXPANSION =
+  /\$\{?[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|CREDENTIALS?)[A-Z0-9_]*\b/;
+
 export function isInertReadOnlyPipeline(cmd: string): boolean {
   const stages = splitUnquotedStages(cmd);
   if (stages.length === 0) return false;
   if (SENSITIVE_READ_TARGET.test(cmd)) return false;
+  if (CREDENTIAL_VAR_EXPANSION.test(cmd)) return false;
   return stages.every((s) => {
     if (s.trim().length === 0) return false;
     if (READ_ONLY_ARGV_TOOLS.has(leadingArgvToken(s))) return true;
@@ -849,6 +894,7 @@ export function isInertReadOnlyPipelineForL2Backstop(cmd: string): boolean {
   // the right tightening" — which would otherwise force an ALLOW on exactly the
   // credential read the judge should be free to stop.
   if (SENSITIVE_READ_TARGET.test(cmd)) return false;
+  if (CREDENTIAL_VAR_EXPANSION.test(cmd)) return false;
   return stages.every((s) => {
     if (s.trim().length === 0) return false;
     if (READ_ONLY_ARGV_TOOLS.has(leadingArgvToken(s))) return true;
@@ -905,6 +951,13 @@ interface PolicyFile {
         // approve without reading. A bot that sets this to "allow" must scope
         // destruction with its own escalateExtra regex (see the VDI overrides).
         destructiveExec?: Verdict;
+        // Per-bot verdict for a read of a denyReadGlobs file (default "deny").
+        // Setting it also extends the check to inert read-only exec commands;
+        // see HardPolicy.secretRead / secretReadExec.
+        secretRead?: Verdict;
+        // Per-bot verdict for an interpreter started after && || ; (default
+        // "deny"); see HardPolicy.sequencedShellExec.
+        sequencedShellExec?: Verdict;
         allowWriteRoots?: string[];
         escalateWriteRoots?: string[];
         denyWriteOutsideAllow?: boolean;
@@ -1030,6 +1083,9 @@ export function resolveHardPolicy(policy: PolicyFile | null, botKey: string): Ha
     compoundExec: f.compoundExec ?? "escalate",
     substitutionExec: f.substitutionExec ?? "escalate",
     destructiveExec: b.destructiveExec ?? f.destructiveExec ?? "deny",
+    secretRead: b.secretRead ?? "deny",
+    secretReadExec: b.secretRead !== undefined,
+    sequencedShellExec: b.sequencedShellExec ?? "deny",
     allowWriteRoots: b.allowWriteRoots ?? [],
     escalateWriteRoots: b.escalateWriteRoots ?? [],
     denyWriteOutsideAllow: b.denyWriteOutsideAllow === true,
@@ -1067,6 +1123,31 @@ function underRoot(absPath: string, root: string): boolean {
   return a === r || a.startsWith(r + "/");
 }
 /** Resolve a possibly-relative path against a cwd hint (RELATIVE PATHS principle). */
+/**
+ * The first word of an exec command whose file name matches a protected-file
+ * glob, or "" if none does. Words split on whitespace, quotes and shell
+ * punctuation; only the last path segment is matched, the same as the read-tool
+ * check. No filesystem lookup: the reviewer's working directory is not the
+ * agent's, so a relative path cannot be resolved reliably.
+ */
+export function protectedFileNamedIn(cmd: string, globs: readonly string[]): string {
+  for (const word of cmd.split(/[\s|;&<>()'"`=,]+/)) {
+    if (!word) continue;
+    const name = basename(word);
+    if (name && globs.some((g) => globMatch(g, name))) return word;
+  }
+  return "";
+}
+
+/** The Decision for a protected-file read under a bot's secretRead verdict. */
+function secretReadDecision(verdict: Verdict, target: string): Decision | null {
+  if (verdict === "allow") return null;
+  if (verdict === "deny") {
+    return { verdict: "deny", principle: "hard:deny-read-secret", reason: `read of a protected file denied: ${target}` };
+  }
+  return { verdict, principle: "hard:secret-read", reason: `read of a protected file needs Mike's approval: ${target}` };
+}
+
 export function resolveTarget(p: string, cwd: string | undefined): string {
   if (!p) return p;
   if (isAbsolute(p)) return p;
@@ -1198,9 +1279,18 @@ export function evaluateHard(input: EvalInput, policy: HardPolicy = DEFAULT_HARD
           break;
         }
       }
-      if (DOWNLOAD_EXEC.test(cmd)) {
+      if (PIPE_INTO_SHELL.test(cmd)) {
         return {
           verdict: "deny",
+          principle: "hard:download-execute",
+          reason: `refusing pipe/decode into a shell (obfuscated RCE): ${cmd.slice(0, 120)}`,
+          retryHint: DOWNLOAD_EXEC_RETRY_HINT,
+        };
+      }
+      const sequencedShell = policy.sequencedShellExec ?? "deny";
+      if (sequencedShell !== "allow" && SEQUENCED_SHELL.test(cmd)) {
+        return {
+          verdict: sequencedShell,
           principle: "hard:download-execute",
           reason: `refusing pipe/decode into a shell (obfuscated RCE): ${cmd.slice(0, 120)}`,
           retryHint: DOWNLOAD_EXEC_RETRY_HINT,
@@ -1215,6 +1305,15 @@ export function evaluateHard(input: EvalInput, policy: HardPolicy = DEFAULT_HARD
       // (already evaluated above) or SUBSTITUTION (still evaluated below).
       const inertReadOnly = isInertReadOnlyPipeline(cmd);
       let infraLedgerHit: LedgerEntry | null = null;
+      // A bot that set secretRead explicitly: an inert read command that names a
+      // protected file (`cat .env`) gets the same verdict as the read tool would.
+      // Without this, the carve-out above waved it through while the read tool
+      // refused the same file.
+      if (inertReadOnly && policy.secretReadExec) {
+        const target = protectedFileNamedIn(cmd, policy.denyReadGlobs);
+        const d = target ? secretReadDecision(policy.secretRead ?? "deny", target) : null;
+        if (d) return d;
+      }
       // Per-bot hard floor. Deliberately ahead of BOTH escalate loops below: an
       // overlapping escalate pattern must not be able to open an approval path
       // around a rule whose whole point is that approval does not apply.
@@ -1310,8 +1409,9 @@ export function evaluateHard(input: EvalInput, policy: HardPolicy = DEFAULT_HARD
       }
       if (isRead) {
         const name = basename(p);
-        for (const g of policy.denyReadGlobs) {
-          if (globMatch(g, name)) return { verdict: "deny", principle: "hard:deny-read-secret", reason: `read of a protected file denied: ${p}` };
+        if (policy.denyReadGlobs.some((g) => globMatch(g, name))) {
+          const d = secretReadDecision(policy.secretRead ?? "deny", p);
+          if (d) return d;
         }
       }
     }
