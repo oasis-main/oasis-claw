@@ -51,6 +51,17 @@
         <!-- 60s poll (Mike 2026-08-03). Override here if needed. -->
         <key>CLAW_WAKER_POLL_MS</key>
         <string>60000</string>
+        <!-- Isolated wake-turn ceiling (Mike 2026-08-17). WAS the code default of
+             180s, too short for a multi-step task (several exec calls, each with
+             model latency + Layer-2 reviewer latency) — observed live: Kolmogorov's
+             foamfn tryout was killed by `embedded run timeout` at exactly 180000ms
+             mid-checklist, after materializing a test case but before it could
+             reply. 600s gives a several-step task real room. Tradeoff: inFlight
+             blocks a bot's OWN mailbox from re-waking until its current wake ends,
+             so a genuinely stuck run now stalls that bot's mail for up to 10min
+             instead of 3 — accepted since a hang is rarer than starving real work. -->
+        <key>CLAW_WAKER_TIMEOUT_S</key>
+        <string>600</string>
     </dict>
 
     <key>StandardOutPath</key>
