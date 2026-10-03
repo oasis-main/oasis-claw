@@ -151,15 +151,38 @@ def dexec(container, argv, check=False):
                           capture_output=True, text=True, check=check)
 
 
+def live_compose_files(container):
+    """The compose files the running container was actually created from.
+
+    2026-09-16: the static stack below only knew Van Helsing was sandboxed, so
+    recreating House, Kolmogorov, ButterBolt or Yes Man dropped their sandbox and
+    reach overlays (no proxy, no /reach mounts, no reviewer settings). The
+    container's own compose label is the ground truth for its stack.
+    """
+    r = subprocess.run(
+        ["docker", "inspect", "-f",
+         '{{index .Config.Labels "com.docker.compose.project.config_files"}}', container],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    files = [Path(f) for f in r.stdout.strip().split(",") if f]
+    if not files or not all(f.exists() for f in files):
+        return None
+    return files
+
+
 def recreate(display, service, container):
     """Recreate a bot to pick up its .env — with the correct per-bot stack."""
-    if service in SANDBOX_BOTS:
+    files = live_compose_files(container)
+    if files:
+        pass
+    elif service in SANDBOX_BOTS:
         files = [RUNTIME_COMPOSE, SANDBOX_COMPOSE, BOTS_COMPOSE, VH_REACH_COMPOSE]
     elif service == "openclaw":
         files = [RUNTIME_COMPOSE]
     else:
         files = [RUNTIME_COMPOSE, BOTS_COMPOSE]
-    cmd = ["docker", "compose"]
+    cmd = ["docker", "compose", "-p", "oasis-claw"]
     for f in files:
         cmd += ["-f", str(f)]
     cmd += ["--project-directory", str(REPO_ROOT),

@@ -12,8 +12,9 @@ you the bottleneck.
 TWO FLOWS (deliberately separate — conflating them is where safety breaks):
 
   1. AUTO-VET-AND-LEARN  (`run` / `drain` / `watch`)
-     "Is this unknown domain safe to REACH?" — answered by an Opus-tier safety
-     classifier, then a HONEYPOT META-EVAL (a second, fresh-context pass that
+     "Is this unknown domain safe to REACH?" — answered by a safety classifier
+     (Sonnet 5 via oasis-generation, 2026-09-15 — CLAW-115, matching the fleet's
+     L2 reviewer model), then a HONEYPOT META-EVAL (a second, fresh-context pass that
      checks whether the classifier itself was manipulated by adversarial
      metadata). A clean pass auto-writes the host into the learned allowlist;
      the proxy hot-reloads it (no restart) and the bot's retry succeeds. No human
@@ -61,9 +62,14 @@ gateway (openai-completions API).
   claw-vet <cmd> --json                # machine-readable output where applicable
 
 Env:
-  OASIS_GENERATION_URL     default http://localhost:8800/v1
-  OASIS_GENERATION_TOKEN   service token (required for live vetting; same token the bots use)
-  OASIS_VET_MODEL          default claude-opus-4-8
+  OASIS_GENERATION_URL     default http://localhost:8800/v1 (host-side address; always
+                           this default unless you export a different one — CLAW-115)
+  OASIS_GENERATION_TOKEN   service token (required for live vetting; same token the bots
+                           use). Falls back to the repo root .env when unset in the shell
+                           (CLAW-115) — export a value yourself to override that default.
+  OASIS_VET_MODEL          default claude-sonnet-5, routed through oasis-generation like
+                           everything else (Mike, 2026-09-15: match the fleet's L2
+                           reviewer model — see OASIS_REVIEWER_MODEL on each bot)
   OASIS_EGRESS_PROXY       proxy container name (default oasis-egress-proxy)
   OASIS_EGRESS_LEARNED_DIR host dir of the learned store (default <repo>/sandbox/egress-proxy/learned)
 """
@@ -90,9 +96,46 @@ LEARNED_DIR = Path(
 ALLOWLIST_FILE = LEARNED_DIR / "allowlist.txt"   # plain hostnames the proxy reads
 DECISION_LOG = LEARNED_DIR / "learned.jsonl"     # provenance + full decision audit
 
+def _repo_env_token_fallback():
+    """OASIS_GENERATION_TOKEN fallback, read from the repo's root .env.
+
+    claw-vet runs on the host, outside any bot container, so it has no compose
+    layer to hand it a token — it depends on the operator's shell already
+    having one exported. That silently broke (CLAW-115): the shell kept an
+    old, single-shared token from before ADM-050 split the fleet onto per-bot
+    named tokens (bots/<bot>/.env), the gateway stopped accepting it, and every
+    live vet failed with HTTP 401 while bot inference — which reads its own
+    bots/<bot>/.env at deploy time — kept working the whole time.
+    Root .env's OASIS_GENERATION_TOKEN is that same fleet-default credential
+    (currently the value bots/nimbus's deploy also resolves to), so it is the
+    same token already proven live by real inference traffic. Only used when
+    the environment does not already supply one, so an operator can still
+    export a different token to override this.
+
+    URL is deliberately NOT pulled from .env: that file's OASIS_GENERATION_URL
+    is `host.docker.internal:8800`, the address a *container* uses to reach
+    back out to the host-run gateway. claw-vet already runs ON the host, where
+    that name does not resolve — the http://localhost:8800/v1 default below is
+    the correct address for this process and must not be overridden by it.
+    """
+    if os.environ.get("OASIS_GENERATION_TOKEN", "").strip():
+        return ""
+    env_path = REPO / ".env"
+    if not env_path.is_file():
+        return ""
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        if key.strip() == "OASIS_GENERATION_TOKEN":
+            return val.strip()
+    return ""
+
+
 GEN_URL = os.environ.get("OASIS_GENERATION_URL", "").strip() or "http://localhost:8800/v1"
-GEN_TOKEN = os.environ.get("OASIS_GENERATION_TOKEN", "").strip()
-VET_MODEL = os.environ.get("OASIS_VET_MODEL", "").strip() or "claude-opus-4-8"
+GEN_TOKEN = os.environ.get("OASIS_GENERATION_TOKEN", "").strip() or _repo_env_token_fallback()
+VET_MODEL = os.environ.get("OASIS_VET_MODEL", "").strip() or "claude-sonnet-5"
 PROXY_CONTAINER = os.environ.get("OASIS_EGRESS_PROXY", "").strip() or "oasis-egress-proxy"
 
 # Where to read the proxy's decision stream from. Two sources, same JSONL:

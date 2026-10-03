@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  docker-autostart — start Docker Desktop at login so the bot fleet comes back
+  by itself after a reboot.
+
+  WHY THIS EXISTS (2026-09-02): the Mac rebooted at 21:54 on 2026-09-01 and
+  Docker Desktop did not start. The whole fleet was down for 12 hours. Every
+  container already carries `restart: unless-stopped`, so the ONLY missing link
+  was the Docker daemon itself — once it started, all 7 bots came back with no
+  other action.
+
+  Docker Desktop's own "AutoStart" setting is ALSO now true in
+  ~/Library/Group Containers/group.com.docker/settings-store.json. This agent is
+  the belt-and-braces half: that setting registers a login item through macOS
+  background-task management, which Docker only refreshes on its own restart, so
+  it could not be verified at the time it was set. `open -g -a Docker` is a
+  no-op when Docker is already running, so the two mechanisms cannot conflict.
+
+  TCC NOTE: this agent deliberately touches NOTHING under ~/Documents. macOS TCC
+  blocks a launchd agent from reading that tree, which is what silently killed
+  the retired nimbus-watchdog agent (exit 126 on every fire — see
+  com.oasis-x.nimbus-watchdog.plist). `open` needs no such access.
+
+  -g keeps the Docker window in the background so it does not steal focus at
+  login.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.oasis-x.docker-autostart</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/open</string>
+        <string>-g</string>
+        <string>-a</string>
+        <string>Docker</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/Michaellee/Library/Logs/oasis-docker-autostart.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/Michaellee/Library/Logs/oasis-docker-autostart.log</string>
+</dict>
+</plist>

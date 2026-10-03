@@ -136,7 +136,7 @@ services:
       # cannot classify and would just audit classifier-errors forever.
       OASIS_GENERATION_URL: "${OASIS_GENERATION_URL:?set OASIS_GENERATION_URL in .env}"
       OASIS_GENERATION_TOKEN: "${OASIS_GENERATION_TOKEN:?set OASIS_GENERATION_TOKEN in .env}"
-      OASIS_VET_MODEL: "${OASIS_VET_MODEL:-claude-opus-4-8}"
+      OASIS_VET_MODEL: "${OASIS_VET_MODEL:-claude-sonnet-5}"
     volumes:
       # The tool and the policy it enforces — both RO. A vetter that could write
       # role.yaml could widen its own gate.

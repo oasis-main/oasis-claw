@@ -39,9 +39,25 @@ ARG OPENCLAW_VERSION=2026.7.1-2
 # awscli (v1, Debian pkg) for House's cloud work — reviewer-gated exec, creds
 # supplied per-bot via a RO ~/.aws mount (2026-07-30). It honors HTTPS_PROXY, so
 # it works from a sandboxed bot where openclaw's pinned-DNS web tools do not.
+# poppler-utils (Mike, 2026-09-15): `pdftotext` for Kolmogorov (and any other
+# bot) to actually read a fetched PDF. curl/wget already land the bytes on
+# disk, but nothing in the image could turn them into text (ripgrep and
+# xmllint do not parse PDF). pdftotext needs no network and no interpreter.
+# ripgrep, libxml2-utils (Mike, 2026-09-15): `rg` and `xmllint` are already in
+# several bots' exec.allow (house, kolmogorov, butterbolt, hello-world,
+# vanhelsing, yesman role.yaml) but were never actually installed here — the
+# binaries were silently missing from every container.
+# python3-pip + python3-venv (Mike, 2026-09-15): several bots' role.yaml
+# (house, kolmogorov, butterbolt, hello-world, vanhelsing) trust pypi.org so
+# they can build a dedicated per-project venv and install real dependencies
+# into it. python3-pip alone only gives a system-wide pip; `python3 -m venv`
+# still fails with "ensurepip is not available" without python3-venv too, so
+# a per-project venv needs both packages together to actually get a working
+# pip inside it.
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      ca-certificates curl git openssl python3 python3-yaml procps lsof jq awscli && \
+      ca-certificates curl git openssl python3 python3-yaml python3-pip python3-venv \
+      procps lsof jq awscli poppler-utils ripgrep libxml2-utils && \
     rm -rf /var/lib/apt/lists/*
 
 # gog CLI for Gmail/Calendar/Drive (https://github.com/steipete/gogcli).
