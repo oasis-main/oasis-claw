@@ -949,7 +949,8 @@ interface PolicyFile {
         // Electron work she is being given. Denying it would just teach her to
         // route around the rule; escalating it every time would teach Mike to
         // approve without reading. A bot that sets this to "allow" must scope
-        // destruction with its own escalateExtra regex (see the VDI overrides).
+        // destruction with its own escalateExtra regex (in that deployment's
+        // policy overrides).
         destructiveExec?: Verdict;
         // Per-bot verdict for a read of a denyReadGlobs file (default "deny").
         // Setting it also extends the check to inert read-only exec commands;
@@ -1022,7 +1023,7 @@ export function constitutionalReviewRequired(policy: PolicyFile | null, botKey: 
  *
  * These maps are `{name: regexSource}` and EVERY value is compiled, so a prose
  * note stored as a member silently becomes a live rule. That was already latent
- * in kaizen's escalateExtra._note (a harmless escalate that never matches); it
+ * in one bot's escalateExtra._note (a harmless escalate that never matches); it
  * would be considerably worse in a denyExtra, where the same mistake creates an
  * un-appealable deny. Author notes belong in a SIBLING `<field>_note` key — this
  * skip makes the convention enforced rather than merely documented.
