@@ -39,6 +39,7 @@ afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
   delete process.env.OASIS_REVIEWER_LOOP_GUARD;
   delete process.env.OASIS_REVIEWER_LOOP_GUARD_THRESHOLD;
+  delete process.env.OASIS_REVIEWER_LOOP_GUARD_TRANSIENT_THRESHOLD;
 });
 
 function readAuditRows(): Record<string, unknown>[] {
@@ -185,5 +186,115 @@ describe("loop guard — enforce mode", () => {
     expect(handler({ sessionId, lastAssistantMessage: "" }, {})).toBeUndefined();
     expect(handler({ sessionId, lastAssistantMessage: "   " }, {})).toBeUndefined();
     expect(readAuditRows().filter((r) => r.phase === "loop_guard")).toHaveLength(0);
+  });
+});
+
+// ── CLAW-089: near-identical matching + transient-retry tolerance ────────────
+// The guard used to hash normalized text and compare it for EXACT equality, so
+// any changed character read as a brand-new reply. The 2026-08-13 incident was
+// "near-identical" replies, which that guard would very likely never have caught.
+describe("loop guard — near-identical replies (CLAW-089)", () => {
+  const enforce = (threshold: string) => {
+    process.env.OASIS_REVIEWER_LOOP_GUARD = "enforce";
+    process.env.OASIS_REVIEWER_LOOP_GUARD_THRESHOLD = threshold;
+    const { api, handlers } = makeApi();
+    registerReviewer(api, { auditDir, mode: "shadow" });
+    return handlers.get("before_agent_finalize")!;
+  };
+
+  it("catches a retry that only changes the attempt number", () => {
+    const handler = enforce("3");
+    const sessionId = "near-attempt";
+    for (const n of [1, 2]) {
+      expect(handler({ sessionId, lastAssistantMessage: `Retrying the deploy (attempt ${n}). Still waiting on the build.` }, {})).toBeUndefined();
+    }
+    const third = handler({ sessionId, lastAssistantMessage: "Retrying the deploy (attempt 3). Still waiting on the build." }, {}) as { action?: string } | undefined;
+    expect(third?.action).toBe("finalize");
+  });
+
+  it("catches a retry that only restamps the time", () => {
+    const handler = enforce("2");
+    const sessionId = "near-ts";
+    expect(handler({ sessionId, lastAssistantMessage: "Checked at 2026-09-01T10:00:00Z — nothing new to report." }, {})).toBeUndefined();
+    const second = handler({ sessionId, lastAssistantMessage: "Checked at 2026-09-01T10:05:31Z — nothing new to report." }, {}) as { action?: string } | undefined;
+    expect(second?.action).toBe("finalize");
+  });
+
+  it("does NOT fire on genuine progress, even when the replies share a lot of wording", () => {
+    const handler = enforce("2");
+    const sessionId = "progress";
+    expect(handler({ sessionId, lastAssistantMessage: "The build failed on the lint step. I am going to read the lint config now." }, {})).toBeUndefined();
+    const second = handler(
+      { sessionId, lastAssistantMessage: "The lint config sets no-floating-promises. I am adding an await in reach-send.ts and rerunning." },
+      {},
+    ) as { action?: string } | undefined;
+    expect(second?.action).toBeUndefined();
+  });
+});
+
+describe("loop guard — transient-retry tolerance (CLAW-089)", () => {
+  // Mike, 2026-09-01: repeating yourself while the network or the model API is
+  // flapping is CORRECT behaviour. It gets a HIGHER threshold, not an exemption —
+  // past that point the cause is a blocker to report, not something to retry.
+  const enforce = (threshold: string, transientThreshold: string) => {
+    process.env.OASIS_REVIEWER_LOOP_GUARD = "enforce";
+    process.env.OASIS_REVIEWER_LOOP_GUARD_THRESHOLD = threshold;
+    process.env.OASIS_REVIEWER_LOOP_GUARD_TRANSIENT_THRESHOLD = transientThreshold;
+    const { api, handlers } = makeApi();
+    registerReviewer(api, { auditDir, mode: "shadow" });
+    return handlers.get("before_agent_finalize")!;
+  };
+
+  const NET = "Connection reset by peer while calling the API. Retrying.";
+
+  it("tolerates a transient-cause repeat past the ordinary threshold", () => {
+    const handler = enforce("2", "5");
+    const sessionId = "transient-rope";
+    // Ordinary threshold is 2; these would have stopped at the 2nd without tolerance.
+    for (let i = 0; i < 4; i++) {
+      expect(handler({ sessionId, lastAssistantMessage: NET }, {}), `attempt ${i + 1}`).toBeUndefined();
+    }
+  });
+
+  it("still stops once the transient threshold is reached — rope, not an exemption", () => {
+    const handler = enforce("2", "5");
+    const sessionId = "transient-stops";
+    for (let i = 0; i < 4; i++) handler({ sessionId, lastAssistantMessage: NET }, {});
+    const fifth = handler({ sessionId, lastAssistantMessage: NET }, {}) as { action?: string; reason?: string } | undefined;
+    expect(fifth?.action).toBe("finalize");
+    expect(fifth?.reason).toContain("blocker");
+  });
+
+  it("records both thresholds in the audit so shadow mode explains the tolerance", () => {
+    const handler = enforce("2", "5");
+    const sessionId = "transient-audit";
+    for (let i = 0; i < 5; i++) handler({ sessionId, lastAssistantMessage: NET }, {});
+    const rows = readAuditRows().filter((r) => r.phase === "loop_guard");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ streak: 5, threshold: 5, ordinaryThreshold: 2, transient: true });
+  });
+
+  it("cannot buy extra rope by naming a transient cause only AFTER the streak started", () => {
+    // The streak is transient only if EVERY reply in it names a transient cause,
+    // including the first. Otherwise a stuck bot could unlock the longer
+    // threshold mid-loop just by mentioning a timeout.
+    const handler = enforce("2", "9");
+    const sessionId = "transient-late-claim";
+    handler({ sessionId, lastAssistantMessage: "Still working on the same step. Nothing to report yet." }, {});
+    const second = handler(
+      { sessionId, lastAssistantMessage: "Still working on the same step. Nothing to report yet. Connection reset." },
+      {},
+    ) as { action?: string } | undefined;
+    expect(second?.action).toBe("finalize");
+  });
+
+  it("never lets the transient threshold be configured BELOW the ordinary one", () => {
+    const handler = enforce("4", "2"); // transient deliberately lower than ordinary
+    const sessionId = "transient-floor";
+    for (let i = 0; i < 3; i++) {
+      expect(handler({ sessionId, lastAssistantMessage: NET }, {}), `attempt ${i + 1}`).toBeUndefined();
+    }
+    const fourth = handler({ sessionId, lastAssistantMessage: NET }, {}) as { action?: string } | undefined;
+    expect(fourth?.action).toBe("finalize");
   });
 });

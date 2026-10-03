@@ -62,6 +62,34 @@ services:
       # persistent .openclaw volume.
       XDG_CONFIG_HOME: /home/node/.openclaw/config
       XDG_STATE_HOME: /home/node/.openclaw/state
+      # ── Reviewer loop guard (CLAW-089) ──
+      # Built after the 2026-08-13 House incident: 14 minutes of near-identical
+      # repeated replies with no automatic stop. It shipped OFF by default and
+      # was never switched on for any bot.
+      #
+      # The guard now matches NEAR-identical replies (Dice similarity over word
+      # bigrams, after masking timestamps/ids/counters), so a reworded or
+      # renumbered repeat counts. Before 2026-09-01 it compared an exact hash and
+      # would very likely never have caught the incident it was built for.
+      #
+      # ENFORCE since 2026-09-01 (Mike: "Enforce now. I'll tell you what
+      # happens."). Promoted straight from shadow without waiting for audit rows
+      # — shadow had recorded none on any bot, because the guard needs 3
+      # near-identical replies inside ONE session and the fleet had only been on
+      # the new build for minutes. Mike accepted that trade deliberately.
+      #
+      # When it fires it ends the turn; it never blocks a tool call and never
+      # touches mail. To roll back, set this to `shadow` HERE AND in
+      # bots/docker-compose.bots.yml, then recreate the bots.
+      #
+      # TRANSIENT_THRESHOLD is the rope for a retry that names a network or model
+      # failure: repeating yourself through a flapping link is correct behaviour,
+      # so those streaks are measured against 6 instead of 3. It is more rope and
+      # NOT an exemption — past it the cause is a blocker to report, not retry.
+      # Override any of these per bot in that bot's own compose overlay.
+      OASIS_REVIEWER_LOOP_GUARD: ${OASIS_REVIEWER_LOOP_GUARD:-enforce}
+      OASIS_REVIEWER_LOOP_GUARD_THRESHOLD: ${OASIS_REVIEWER_LOOP_GUARD_THRESHOLD:-3}
+      OASIS_REVIEWER_LOOP_GUARD_TRANSIENT_THRESHOLD: ${OASIS_REVIEWER_LOOP_GUARD_TRANSIENT_THRESHOLD:-6}
 
     # Host-side mapping is loopback-only. Other devices on your Wi-Fi
     # cannot reach this port through your Mac's LAN IP.

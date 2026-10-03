@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve as resolvePath } from "node:path";
+import { INFRA_LEDGER_RETRY_HINT, loadLedger, matchLedger, type LedgerEntry } from "./infra-ledger.js";
 
 // ── Layer 1: HARD CONSTRAINTS (§6a of .swarm/UNIFIED_REVIEWER.md) ──────────────
 // Deterministic, no model call. Loads the authored policy (reviewer-policy.json:
@@ -24,6 +25,10 @@ export interface Decision {
   // action that is forbidden for a structural reason, and inventing one
   // would be actively misleading.
   retryHint?: string;
+  // CLAW-116: the approval-ledger entry that covers this call (set only on
+  // hard:infra-ledger-match). reviewer.ts hands it to Layer 2 as a TRUSTED
+  // fact, so the judge does not try to re-derive coverage from the trajectory.
+  ledgerEntry?: LedgerEntry;
 }
 
 // Resolved per-bot policy = fleet ∪ per_bot[botKey], flattened for evaluation.
@@ -65,6 +70,38 @@ export interface HardPolicy {
   // 2026-07-29 cron incident; (2) unattended runs may auto-downgrade ordinary
   // escalations, and this one must NEVER be downgraded (see NEVER_DOWNGRADE).
   selfRuntimeExecRegex: RegExp[];
+  // ── Infrastructure approval ledger (CLAW-116, 2026-09-16) ──
+  // exec commands matching any of these regexes change infrastructure. They run
+  // only when an active entry in the host-written ledger at infraLedgerPath
+  // covers them (see infra-ledger.ts); otherwise they escalate under
+  // hard:infra-ledger-miss, which is never auto-downgraded.
+  infraGateExecRegex: RegExp[];
+  infraLedgerPath: string | null;
+  // CLAW-116 (Mike, 2026-09-22): "reply NEEDS MIKE with an approval card if I
+  // am needed in the loop". When true, an INFRA_CARD_PRINCIPLES escalation in
+  // an UNATTENDED (mail-woken) run is sent to Mike as an approval card instead
+  // of failing closed. Needs approvals.plugin forwarding to a fixed Telegram
+  // target, because a mail-woken session has no origin chat of its own.
+  infraApprovalCard: boolean;
+  // ── Outbound peer mail discipline (CLAW-089) ──
+  // Mike, 2026-09-01: collaboration over inter-bot mail carries more friction
+  // than expected. Measured across 66 envelopes: 62% carry no thread_id, 61% no
+  // work reference, and 14 of 17 `kind:"broadcast"` messages have exactly ONE
+  // recipient. These are STRUCTURAL defects a deterministic rule can catch, so
+  // they are handled here and not by the Layer 2 model judge.
+  //
+  // The verdicts are DENY, not escalate, on purpose. Escalating an unthreaded
+  // message routes the friction to Mike, which is the opposite of the goal; a
+  // deny with a precise reason is corrected by the model in the same turn with
+  // no human involved. Only fleet-wide fan-out escalates, because that one
+  // genuinely interrupts other bots.
+  mailRequireThreadOrWork: boolean;
+  // Send reach_send to the Layer 2 model judge even on a bot that is NOT
+  // constitutionalReviewRequired. This is what lets House and Yes Man get the
+  // thread-relevance judgement without paying a model call on every tool call.
+  reviewOutboundMail: boolean;
+  mailDenyMislabelledBroadcast: boolean;
+  maxBroadcastRecipients: number; // 0 disables the fan-out escalation
 }
 
 export const DEFAULT_HARD_POLICY: HardPolicy = {
@@ -81,6 +118,13 @@ export const DEFAULT_HARD_POLICY: HardPolicy = {
   consentRequiredExecRegex: [],
   escalateExecRegex: [],
   selfRuntimeExecRegex: [],
+  infraGateExecRegex: [],
+  infraLedgerPath: null,
+  infraApprovalCard: false,
+  mailRequireThreadOrWork: true,
+  reviewOutboundMail: true,
+  mailDenyMislabelledBroadcast: true,
+  maxBroadcastRecipients: 3,
 };
 
 // Cron job MUTATION actions on openclaw's native `cron` agent tool
@@ -101,7 +145,23 @@ const CRON_MUTATE_ACTIONS = new Set(["add", "update", "remove"]);
 // (House's trade execution, 2026-08-08). Same reasoning as the two above: the
 // grant is "discretionary trade execution WITH Mike's approval", so a run with no
 // Mike must fail closed rather than inherit authoring-time consent.
-export const NEVER_DOWNGRADE = new Set(["hard:self-runtime", "hard:cron-mutation", "hard:operator-consent-required"]);
+// hard:infra-ledger-miss (CLAW-116): an infrastructure change that no approval-
+// ledger entry covers. A mail-woken run is unattended, and a peer's request is
+// not Mike's consent, so it must fail closed rather than inherit any.
+export const NEVER_DOWNGRADE = new Set([
+  "hard:self-runtime",
+  "hard:cron-mutation",
+  "hard:operator-consent-required",
+  "hard:infra-ledger-miss",
+  "hard:infra-ledger-review",
+]);
+
+// CLAW-116 (2026-09-22): the escalations Mike decides with an approval card,
+// even in an unattended run, on a bot with infraApprovalCard. Both stay in
+// NEVER_DOWNGRADE, so without a card route they still fail closed.
+//   hard:infra-ledger-miss    no active ledger entry covers the change
+//   hard:infra-ledger-review  an entry covers it, but Layer 2 objected
+export const INFRA_CARD_PRINCIPLES = new Set(["hard:infra-ledger-miss", "hard:infra-ledger-review"]);
 
 // Escalations that in-conversation operator consent can satisfy (CLAW-079).
 // These rules exist to make Mike approve an action; if he asked for it in the same
@@ -820,6 +880,12 @@ interface PolicyFile {
       gitignoredWrite?: Verdict;
       escalateExecPatterns?: Record<string, string>;
       escalateExecAlways?: Record<string, string>; // fleet-always (no per-bot opt-in)
+      // Outbound peer mail discipline (CLAW-089). Fleet defaults; a bot may
+      // override any of the three under hard.per_bot.
+      mailRequireThreadOrWork?: boolean;
+      mailDenyMislabelledBroadcast?: boolean;
+      maxBroadcastRecipients?: number;
+      reviewOutboundMail?: boolean;
     };
     per_bot?: Record<
       string,
@@ -852,7 +918,18 @@ interface PolicyFile {
         // (see HardPolicy.consentRequiredExecRegex). "Only with Mike's approval"
         // belongs here; "gate this when convenient" belongs in escalateExtra.
         consentRequiredExtra?: Record<string, string>;
+        // CLAW-116: container path of the host-written approval ledger, and the
+        // exec regexes that count as infrastructure changes gated by it.
+        infraLedger?: string;
+        infraGateExtra?: Record<string, string>;
+        infraApprovalCard?: boolean;
         constitutionalReviewRequired?: boolean;
+        // Outbound peer mail discipline (CLAW-089). Per-bot override of the
+        // fleet setting; omit to inherit.
+        mailRequireThreadOrWork?: boolean;
+        mailDenyMislabelledBroadcast?: boolean;
+        maxBroadcastRecipients?: number;
+        reviewOutboundMail?: boolean;
       }
     >;
   };
@@ -960,6 +1037,15 @@ export function resolveHardPolicy(policy: PolicyFile | null, botKey: string): Ha
     consentRequiredExecRegex: consentRegex,
     escalateExecRegex: regex,
     selfRuntimeExecRegex: selfRuntime,
+    infraGateExecRegex: compileRegexMap(b.infraGateExtra),
+    infraLedgerPath: typeof b.infraLedger === "string" && b.infraLedger ? b.infraLedger : null,
+    infraApprovalCard: b.infraApprovalCard === true,
+    // CLAW-089. Per-bot wins over fleet, fleet over the built-in default, so a
+    // single bot can be loosened without weakening the fleet posture.
+    mailRequireThreadOrWork: b.mailRequireThreadOrWork ?? f.mailRequireThreadOrWork ?? DEFAULT_HARD_POLICY.mailRequireThreadOrWork,
+    mailDenyMislabelledBroadcast: b.mailDenyMislabelledBroadcast ?? f.mailDenyMislabelledBroadcast ?? DEFAULT_HARD_POLICY.mailDenyMislabelledBroadcast,
+    maxBroadcastRecipients: b.maxBroadcastRecipients ?? f.maxBroadcastRecipients ?? DEFAULT_HARD_POLICY.maxBroadcastRecipients,
+    reviewOutboundMail: b.reviewOutboundMail ?? f.reviewOutboundMail ?? DEFAULT_HARD_POLICY.reviewOutboundMail,
   };
 }
 
@@ -1018,7 +1104,11 @@ export interface EvalInput {
 
 export function evaluateHard(input: EvalInput, policy: HardPolicy = DEFAULT_HARD_POLICY): Decision {
   const params = input.params ?? {};
-  const cwd = firstString(params, "cwd", "workingDir", "dir") || undefined;
+  // `workdir` is the name openclaw's exec tool actually uses
+  // (vendor/openclaw/src/agents/bash-tools.schemas.ts). It was missing here
+  // until 2026-09-16; nothing read cwd for exec calls before then, but the
+  // infra-ledger check (CLAW-116) must know which directory a command runs in.
+  const cwd = firstString(params, "cwd", "workdir", "workingDir", "dir") || undefined;
 
   // ── Cron authoring is the consent point (CLAW-078) ──
   // Gate MUTATIONS of the schedule itself (add/update/remove on openclaw's native
@@ -1035,6 +1125,52 @@ export function evaluateHard(input: EvalInput, policy: HardPolicy = DEFAULT_HARD
       };
     }
     return ALLOW; // status | list | runs | run | wake
+  }
+
+  // ── Outbound peer mail discipline (CLAW-089) ──
+  // Checked before the family dispatch for the same reason `cron` is: reach_send
+  // classifies as "other", and this is a named-tool rule, not a family rule.
+  // Structural only — whether the message actually SERVES the thread is a
+  // judgement, and belongs to Layer 2.
+  if (input.toolName === "reach_send") {
+    const to = Array.isArray(params.to) ? (params.to as unknown[]).filter((x) => typeof x === "string") : [];
+    const kind = firstString(params, "kind") || "dm";
+    const threadId = firstString(params, "thread_id").trim();
+    const workItems = Array.isArray(params.work_items) ? (params.work_items as unknown[]).filter((x) => typeof x === "string") : [];
+    const workRepos = Array.isArray(params.work_repos) ? (params.work_repos as unknown[]).filter((x) => typeof x === "string") : [];
+
+    // A "broadcast" to one recipient is a DM wearing the wrong label. 14 of 17
+    // broadcasts on disk were this. The label drives how a recipient weighs the
+    // message, so a wrong one is not cosmetic.
+    if (policy.mailDenyMislabelledBroadcast && kind === "broadcast" && to.length === 1) {
+      return {
+        verdict: "deny",
+        principle: "hard:mail-mislabelled-broadcast",
+        reason: `kind:"broadcast" addressed to a single recipient (${to[0]}) — resend with kind:"dm"`,
+      };
+    }
+
+    // Every message must be locatable in the collaboration. A NEW conversation
+    // has no thread to join yet, but it can always name the work item — so the
+    // rule is satisfiable in every legitimate case: carry EITHER.
+    if (policy.mailRequireThreadOrWork && !threadId && workItems.length === 0 && workRepos.length === 0) {
+      return {
+        verdict: "deny",
+        principle: "hard:mail-no-thread-identity",
+        reason: "outbound mail carries neither a thread_id nor a work reference — set thread_id to continue an existing exchange, or work_items/work_repos to open a new one",
+      };
+    }
+
+    // Fan-out to most of the fleet interrupts every recipient. One approval.
+    if (policy.maxBroadcastRecipients > 0 && to.length > policy.maxBroadcastRecipients) {
+      return {
+        verdict: "escalate",
+        principle: "hard:mail-fleet-broadcast",
+        reason: `addressed to ${to.length} bots (limit ${policy.maxBroadcastRecipients}) — a fleet-wide interrupt needs Mike's approval`,
+      };
+    }
+
+    return ALLOW;
   }
 
   if (input.family === "exec") {
@@ -1078,6 +1214,7 @@ export function evaluateHard(input: EvalInput, policy: HardPolicy = DEFAULT_HARD
       // once; only skips those three per-bot loops, never DESTRUCTIVE/DOWNLOAD_EXEC
       // (already evaluated above) or SUBSTITUTION (still evaluated below).
       const inertReadOnly = isInertReadOnlyPipeline(cmd);
+      let infraLedgerHit: LedgerEntry | null = null;
       // Per-bot hard floor. Deliberately ahead of BOTH escalate loops below: an
       // overlapping escalate pattern must not be able to open an approval path
       // around a rule whose whole point is that approval does not apply.
@@ -1101,6 +1238,21 @@ export function evaluateHard(input: EvalInput, policy: HardPolicy = DEFAULT_HARD
         for (const re of policy.consentRequiredExecRegex) {
           if (re.test(cmd)) return { verdict: "escalate", principle: "hard:operator-consent-required", reason: `needs Mike's explicit approval and is never auto-allowed unattended: ${cmd.slice(0, 120)}` };
         }
+        if (policy.infraGateExecRegex.some((re) => re.test(cmd))) {
+          const ledger = policy.infraLedgerPath
+            ? loadLedger(policy.infraLedgerPath)
+            : { entries: [], error: "no approval ledger configured for this bot" };
+          const hit = matchLedger(cmd, cwd, ledger.entries);
+          if (!hit) {
+            return {
+              verdict: "escalate",
+              principle: "hard:infra-ledger-miss",
+              reason: `infrastructure change not covered by an active approval-ledger entry${ledger.error ? ` (${ledger.error})` : ""} — needs Mike: ${cmd.slice(0, 120)}`,
+              retryHint: INFRA_LEDGER_RETRY_HINT,
+            };
+          }
+          infraLedgerHit = hit;
+        }
         for (const re of policy.escalateExecRegex) {
           if (re.test(cmd)) return { verdict: "escalate", principle: "hard:operator-consent-action", reason: `action needs Mike's slash-command approval: ${cmd.slice(0, 120)}` };
         }
@@ -1112,6 +1264,12 @@ export function evaluateHard(input: EvalInput, policy: HardPolicy = DEFAULT_HARD
           reason: `command/process substitution routed to human: ${cmd.slice(0, 120)}`,
           retryHint: SUBSTITUTION_RETRY_HINT,
         };
+      }
+      // A ledger hit is a single command or `cd <dir> && <command>` (the ledger
+      // matcher refuses anything else), so the && it may carry is the approved
+      // shape, not a compound to route by compoundExec.
+      if (infraLedgerHit) {
+        return { verdict: "allow", principle: "hard:infra-ledger-match", reason: `covered by approval-ledger entry ${infraLedgerHit.id}`, ledgerEntry: infraLedgerHit };
       }
       if (BENIGN_COMPOUND.test(cmd)) return { verdict: policy.compoundExec, principle: "hard:compound-exec", reason: `compound/redirect: ${cmd.slice(0, 120)}` };
     }

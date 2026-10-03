@@ -803,3 +803,105 @@ describe("isInertReadOnlyPipeline — sensitive read targets (CLAW-105)", () => 
     expect(evaluateHard(exec("cat /proc/meminfo"), withEnvDump).verdict).toBe("allow");
   });
 });
+
+// ── Outbound peer mail discipline (CLAW-089) ─────────────────────────────────
+// Structural rules only. Whether a message actually SERVES its thread is a
+// judgement and belongs to Layer 2 — these assertions deliberately do not test
+// message quality, only that the message is locatable in the collaboration.
+const send = (params: Record<string, unknown>): EvalInput => ({
+  family: "other",
+  toolName: "reach_send",
+  params,
+  derivedPaths: undefined,
+});
+
+describe("evaluateHard — reach_send (CLAW-089)", () => {
+  const ok = { to: ["house"], kind: "dm", thread_id: "t-1" };
+
+  it("allows a threaded dm", () => {
+    expect(evaluateHard(send(ok), P).verdict).toBe("allow");
+  });
+
+  it("allows a new conversation that names its work item instead of a thread", () => {
+    // A first message has no thread to join. Naming the work keeps it locatable,
+    // so the rule stays satisfiable in every legitimate case.
+    expect(evaluateHard(send({ to: ["house"], kind: "dm", work_items: ["CLAW-089"] }), P).verdict).toBe("allow");
+    expect(evaluateHard(send({ to: ["house"], kind: "dm", work_repos: ["oasis-claw"] }), P).verdict).toBe("allow");
+  });
+
+  it("denies a message with neither a thread nor a work reference", () => {
+    expect(evaluateHard(send({ to: ["house"], kind: "dm" }), P)).toMatchObject({
+      verdict: "deny",
+      principle: "hard:mail-no-thread-identity",
+    });
+  });
+
+  it("treats a whitespace-only thread_id as absent", () => {
+    expect(evaluateHard(send({ to: ["house"], kind: "dm", thread_id: "   " }), P).verdict).toBe("deny");
+  });
+
+  it("denies a broadcast addressed to exactly one recipient", () => {
+    // 14 of 17 broadcasts on disk were this. The label drives how a recipient
+    // weighs the message, so a wrong label is not cosmetic.
+    expect(evaluateHard(send({ ...ok, kind: "broadcast" }), P)).toMatchObject({
+      verdict: "deny",
+      principle: "hard:mail-mislabelled-broadcast",
+    });
+  });
+
+  it("escalates fan-out beyond the recipient limit", () => {
+    expect(evaluateHard(send({ to: ["a", "b", "c", "d"], kind: "broadcast", thread_id: "t-1" }), P)).toMatchObject({
+      verdict: "escalate",
+      principle: "hard:mail-fleet-broadcast",
+    });
+  });
+
+  it("allows fan-out at exactly the limit", () => {
+    expect(evaluateHard(send({ to: ["a", "b", "c"], kind: "broadcast", thread_id: "t-1" }), P).verdict).toBe("allow");
+  });
+
+  it("checks the mislabel before the fan-out limit, so the reason names the real defect", () => {
+    const d = evaluateHard(send({ to: ["only"], kind: "broadcast", thread_id: "t-1" }), P);
+    expect(d.principle).toBe("hard:mail-mislabelled-broadcast");
+    expect(d.reason).toContain("only");
+  });
+
+  it("each rule can be disabled independently by policy", () => {
+    const loose = { ...P, mailRequireThreadOrWork: false, mailDenyMislabelledBroadcast: false, maxBroadcastRecipients: 0 };
+    expect(evaluateHard(send({ to: ["house"], kind: "dm" }), loose).verdict).toBe("allow");
+    expect(evaluateHard(send({ to: ["house"], kind: "broadcast", thread_id: "t" }), loose).verdict).toBe("allow");
+    expect(evaluateHard(send({ to: ["a", "b", "c", "d", "e", "f"], kind: "broadcast", thread_id: "t" }), loose).verdict).toBe("allow");
+  });
+});
+
+describe("resolveHardPolicy — mail knobs (CLAW-089)", () => {
+  it("defaults are on, so a deployment gets the discipline without opting in", () => {
+    const r = resolveHardPolicy({}, "house");
+    expect(r.mailRequireThreadOrWork).toBe(true);
+    expect(r.mailDenyMislabelledBroadcast).toBe(true);
+    expect(r.maxBroadcastRecipients).toBe(3);
+    expect(r.reviewOutboundMail).toBe(true);
+  });
+
+  it("a fleet setting applies to every bot", () => {
+    const r = resolveHardPolicy({ hard: { fleet: { maxBroadcastRecipients: 6, reviewOutboundMail: false } } }, "house");
+    expect(r.maxBroadcastRecipients).toBe(6);
+    expect(r.reviewOutboundMail).toBe(false);
+  });
+
+  it("a per-bot setting wins over the fleet, so one bot can be loosened alone", () => {
+    const file = {
+      hard: {
+        fleet: { maxBroadcastRecipients: 3, mailRequireThreadOrWork: true },
+        per_bot: { yesman: { maxBroadcastRecipients: 8, mailRequireThreadOrWork: false } },
+      },
+    };
+    const loose = resolveHardPolicy(file, "yesman");
+    expect(loose.maxBroadcastRecipients).toBe(8);
+    expect(loose.mailRequireThreadOrWork).toBe(false);
+    // ...and the fleet posture is unchanged for everyone else.
+    const strict = resolveHardPolicy(file, "house");
+    expect(strict.maxBroadcastRecipients).toBe(3);
+    expect(strict.mailRequireThreadOrWork).toBe(true);
+  });
+});

@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""
+claw-approvals — Mike's infrastructure approval ledger (CLAW-116).
+
+Yes Man applies infrastructure changes for the fleet. The oasis-reviewer lets
+an infrastructure-changing command run only when an ACTIVE entry in this ledger
+covers it (extensions/oasis-reviewer/src/infra-ledger.ts). The ledger lives
+outside every bot mount and is mounted READ-ONLY into Yes Man, so no bot can
+approve its own work and no peer can approve it by mail. Only this host tool
+writes it.
+
+  claw-approvals list [--all]            # active + proposed (--all adds revoked)
+  claw-approvals show <ID>
+  claw-approvals add --title T --dir D [--dir D2] --pattern RE [--pattern RE2]
+                     [--requester BOT] [--limit TEXT] [--expires 2026-12-31]
+                     [--source TEXT] [--proposed]
+  claw-approvals confirm <ID>            # proposed -> active
+  claw-approvals revoke <ID> [--reason TEXT]
+  claw-approvals test <ID> --workdir D --cmd 'terraform apply k.tfplan'   # would it match?
+
+Directories are CONTAINER paths as Yes Man sees them. Yes Man applies from a
+clean export of the requester's pinned commit at /work/apply/<repo>@<sha>/, so a
+directory normally uses `*` for the commit, for example
+/work/apply/oasis-cloud-admin@*/terraform/oasis-public/aws/environments/dev
+(`*` matches inside one path component only).
+
+Patterns are regexes over the single command, anchored with ^ automatically.
+Keep them narrow: prefer `terraform apply \\S+\\.tfplan$` (a reviewed saved plan)
+over `terraform apply`.
+
+Every change is also appended to infra-ledger.history.jsonl beside the ledger.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+LEDGER_DIR = Path(os.environ.get(
+    "OASIS_APPROVALS_DIR",
+    str(Path.home() / "Library" / "Application Support" / "oasis-x" / "approvals"),
+))
+LEDGER = LEDGER_DIR / "infra-ledger.json"
+HISTORY = LEDGER_DIR / "infra-ledger.history.jsonl"
+
+
+def now_iso():
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def load():
+    if not LEDGER.exists():
+        return {"version": 1, "entries": []}
+    return json.loads(LEDGER.read_text())
+
+
+def save(data, event):
+    LEDGER_DIR.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=LEDGER_DIR, prefix=".infra-ledger.", suffix=".tmp")
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, LEDGER)
+    with HISTORY.open("a") as f:
+        f.write(json.dumps({"ts": now_iso(), **event}) + "\n")
+
+
+def find(data, entry_id):
+    for e in data["entries"]:
+        if e["id"] == entry_id:
+            return e
+    sys.exit(f"no entry {entry_id}")
+
+
+def next_id(data):
+    nums = [int(m.group(1)) for e in data["entries"] if (m := re.match(r"INFRA-(\d+)$", e["id"]))]
+    return f"INFRA-{(max(nums) + 1) if nums else 1:04d}"
+
+
+def anchor(p):
+    return p if p.startswith("^") else "^" + p
+
+
+def show_entry(e):
+    exp = e.get("expires") or "never"
+    print(f"{e['id']}  [{e['status']}]  {e.get('title', '')}")
+    print(f"  dirs     : {', '.join(e['dir_prefixes'])}")
+    for p in e["command_patterns"]:
+        print(f"  pattern  : {p}")
+    if e.get("requesters"):
+        print(f"  for      : {', '.join(e['requesters'])}")
+    for lim in e.get("limits") or []:
+        print(f"  limit    : {lim}")
+    print(f"  expires  : {exp}    approved: {e.get('approved_at') or '-'}")
+    if e.get("source"):
+        print(f"  source   : {e['source']}")
+
+
+def cmd_list(args):
+    data = load()
+    shown = [e for e in data["entries"] if args.all or e["status"] != "revoked"]
+    if not shown:
+        print(f"(no entries) — ledger: {LEDGER}")
+    for e in shown:
+        show_entry(e)
+        print()
+
+
+def cmd_show(args):
+    show_entry(find(load(), args.id))
+
+
+def cmd_add(args):
+    data = load()
+    for d in args.dir:
+        if not d.startswith("/"):
+            sys.exit(f"--dir must be an absolute container path: {d}")
+    patterns = [anchor(p) for p in args.pattern]
+    for p in patterns:
+        try:
+            re.compile(p)
+        except re.error as e:
+            sys.exit(f"bad --pattern {p!r}: {e}")
+    if args.expires:
+        try:
+            datetime.fromisoformat(args.expires)
+        except ValueError:
+            sys.exit(f"--expires must be an ISO date: {args.expires}")
+    status = "proposed" if args.proposed else "active"
+    e = {
+        "id": next_id(data),
+        "status": status,
+        "title": args.title,
+        "dir_prefixes": [d.rstrip("/") for d in args.dir],
+        "command_patterns": patterns,
+        "requesters": args.requester or [],
+        "limits": args.limit or [],
+        "expires": args.expires,
+        "approved_at": None if args.proposed else now_iso(),
+        "source": args.source or "",
+    }
+    data["entries"].append(e)
+    save(data, {"op": "add", "entry": e})
+    show_entry(e)
+
+
+def cmd_confirm(args):
+    data = load()
+    e = find(data, args.id)
+    if e["status"] != "proposed":
+        sys.exit(f"{args.id} is {e['status']}, not proposed")
+    e["status"] = "active"
+    e["approved_at"] = now_iso()
+    save(data, {"op": "confirm", "id": args.id})
+    show_entry(e)
+
+
+def cmd_revoke(args):
+    data = load()
+    e = find(data, args.id)
+    e["status"] = "revoked"
+    e["revoked_at"] = now_iso()
+    if args.reason:
+        e["revoked_reason"] = args.reason
+    save(data, {"op": "revoke", "id": args.id, "reason": args.reason or ""})
+    show_entry(e)
+
+
+# Mirrors infra-ledger.ts effectiveCommand(); the reviewer is the authority.
+SHELL_META = re.compile(r"[;&|`$<>()\\\n\r]")
+
+
+def cmd_test(args):
+    e = find(load(), args.id)
+    cmd = args.cmd.strip()
+    wd = os.path.normpath(args.workdir) if args.workdir else None
+    m = re.match(r"^cd\s+(\S+)\s*&&\s*(.*)$", cmd, re.S)
+    if m:
+        wd = os.path.normpath(os.path.join(wd or "/", m.group(1).strip("'\"")))
+        cmd = m.group(2).strip()
+    if SHELL_META.search(cmd) or cmd.startswith("cd "):
+        print("NO MATCH — not a single simple command")
+        return
+    c = re.search(r"(?:^|\s)-chdir=(?:\"([^\"]+)\"|'([^']+)'|(\S+))", cmd)
+    if c:
+        wd = os.path.normpath(os.path.join(wd or "/", c.group(1) or c.group(2) or c.group(3)))
+    simple = re.sub(r"\s+", " ", cmd)
+    def under(path, prefix):
+        body = "[^/]*".join(re.escape(part) for part in prefix.rstrip("/").split("*"))
+        return re.match(f"^{body}(?:/|$)", path) is not None
+    in_dir = wd is not None and any(under(wd, d) for d in e["dir_prefixes"])
+    hit = any(re.search(p, simple) for p in e["command_patterns"])
+    print(f"dir={wd}  in_dir={in_dir}  pattern={hit}  status={e['status']}")
+    print("MATCH" if in_dir and hit and e["status"] == "active" else "NO MATCH")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="claw-approvals", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("list")
+    s.add_argument("--all", action="store_true")
+    s.set_defaults(func=cmd_list)
+    s = sub.add_parser("show")
+    s.add_argument("id")
+    s.set_defaults(func=cmd_show)
+    s = sub.add_parser("add")
+    s.add_argument("--title", required=True)
+    s.add_argument("--dir", action="append", required=True)
+    s.add_argument("--pattern", action="append", required=True)
+    s.add_argument("--requester", action="append")
+    s.add_argument("--limit", action="append")
+    s.add_argument("--expires")
+    s.add_argument("--source")
+    s.add_argument("--proposed", action="store_true", help="record for review; the reviewer ignores it until confirmed")
+    s.set_defaults(func=cmd_add)
+    s = sub.add_parser("confirm")
+    s.add_argument("id")
+    s.set_defaults(func=cmd_confirm)
+    s = sub.add_parser("revoke")
+    s.add_argument("id")
+    s.add_argument("--reason")
+    s.set_defaults(func=cmd_revoke)
+    s = sub.add_parser("test")
+    s.add_argument("id")
+    s.add_argument("--workdir")
+    s.add_argument("--cmd", required=True, help="the exact exec command string")
+    s.set_defaults(func=cmd_test)
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

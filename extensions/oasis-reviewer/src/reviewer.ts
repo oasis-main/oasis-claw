@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
@@ -10,6 +9,7 @@ import {
   DEFAULT_HARD_POLICY,
   evaluateHard,
   execCommandOf,
+  INFRA_CARD_PRINCIPLES,
   isInertReadOnlyPipelineForL2Backstop,
   isInertReadOnlyToolCall,
   loadPolicyFile,
@@ -28,6 +28,7 @@ import {
   type Layer2Decision,
   type LlmComplete,
 } from "./layer2.js";
+import { describeLedgerEntry } from "./infra-ledger.js";
 import { sendTelegramMessage } from "./telegram.js";
 import { fallbackSessionFilePath, readSessionTranscriptSummary } from "./transcript.js";
 
@@ -198,15 +199,98 @@ function rememberRequest(runId: string, sessionId: string, prompt: string): void
 // tests) picks up the current env rather than whatever was set at first
 // import.
 const LOOP_GUARD_HISTORY_MAX = 64;
-const loopGuardHistory = new Map<string, { hash: string; streak: number }>();
+// Normalized text is kept (not just a hash) because near-identical matching needs
+// to COMPARE two replies, which a hash cannot do. Bounded per entry by
+// LOOP_GUARD_NORM_MAX and per map by LOOP_GUARD_HISTORY_MAX, so worst case is
+// 64 x 4 KB = 256 KB.
+const LOOP_GUARD_NORM_MAX = 4000;
+const loopGuardHistory = new Map<string, { norm: string; streak: number; transient: boolean }>();
 
-/** Normalizes assistant text before hashing, so a small rewording still counts as a repeat. */
+// Two replies count as "the same" at or above this Dice coefficient over word
+// bigrams. 0.9 is deliberately high: it catches a reworded or renumbered repeat
+// while still letting genuine progress ("now trying X instead") read as new.
+const LOOP_GUARD_SIMILARITY = 0.9;
+
+/**
+ * Normalizes assistant text before comparison (CLAW-089).
+ *
+ * The previous version only lowercased and collapsed whitespace, and its comment
+ * claimed "a small rewording still counts as a repeat". That was FALSE — the
+ * result was hashed and compared for EXACT equality, so a single changed
+ * character produced a different hash. The 2026-08-13 House incident was
+ * "near-identical" replies, which that guard would very likely never have
+ * matched.
+ *
+ * This version removes the parts of a reply that change on every retry while the
+ * substance does not: timestamps, ids, counters, and attempt numbers. Whatever
+ * survives is compared by similarity, not equality (see similarityForLoopGuard).
+ */
 function normalizeForLoopGuard(text: string): string {
-  return text.trim().toLowerCase().replace(/\s+/g, " ");
+  return text
+    .trim()
+    .toLowerCase()
+    // Volatile tokens first — each of these changes on a retry that is otherwise
+    // word-for-word identical, and each would defeat an equality check. The
+    // placeholders are LETTERS ONLY on purpose: the punctuation pass below would
+    // otherwise eat their brackets and leave a half-token behind.
+    .replace(/\d{4}-\d{2}-\d{2}t[\d:.]+z?/g, " tsplaceholder ") // ISO timestamps
+    .replace(/\d{1,2}:\d{2}(:\d{2})?/g, " tsplaceholder ") // clock times
+    .replace(/\b[0-9a-f]{8,}\b/g, " idplaceholder ") // hex ids, sha prefixes, message ids
+    .replace(/\b\d+(\.\d+)?(ms|s|m|h|kb|mb|gb)?\b/g, " numplaceholder ") // counters, durations, sizes
+    .replace(/[^\p{L}\p{N}\s]/gu, " ") // markdown, punctuation, everything else
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, LOOP_GUARD_NORM_MAX);
 }
 
-function hashForLoopGuard(text: string): string {
-  return createHash("sha256").update(normalizeForLoopGuard(text)).digest("hex").slice(0, 16);
+/** Word bigrams of a normalized string; falls back to unigrams for very short text. */
+function bigramsForLoopGuard(norm: string): Set<string> {
+  const words = norm.split(" ").filter(Boolean);
+  if (words.length < 2) return new Set(words);
+  const out = new Set<string>();
+  for (let i = 0; i < words.length - 1; i++) out.add(`${words[i]} ${words[i + 1]}`);
+  return out;
+}
+
+/** Dice coefficient over word bigrams: 1 = identical, 0 = nothing in common. */
+function similarityForLoopGuard(a: string, b: string): number {
+  if (a === b) return 1;
+  const A = bigramsForLoopGuard(a);
+  const B = bigramsForLoopGuard(b);
+  if (A.size === 0 && B.size === 0) return 1;
+  if (A.size === 0 || B.size === 0) return 0;
+  let shared = 0;
+  for (const g of A) if (B.has(g)) shared++;
+  return (2 * shared) / (A.size + B.size);
+}
+
+// ── Transient-failure retries deserve more rope (Mike, 2026-09-01) ────────────
+// Repeating yourself while a network link or the model API is flapping is CORRECT
+// behaviour, not a loop — so a repeat that names a transient cause is measured
+// against a higher threshold instead of the ordinary one.
+//
+// It is a higher threshold and NOT an exemption on purpose. Retrying the same
+// text forever is a loop whatever caused it; past this point the cause is no
+// longer transient, it is a blocker, and the bot's job is to REPORT it rather
+// than keep repeating. That is the "after a point" in Mike's ask: persistence is
+// allowed, but it has to start varying, or it stops.
+const LOOP_GUARD_TRANSIENT = new RegExp(
+  [
+    // network / connection
+    "econnreset|econnrefused|etimedout|enotfound|epipe|socket hang ?up",
+    "network (error|issue|problem)|connection (reset|closed|refused|lost|dropped|error)",
+    "fetch failed|request timed? ?out|timeout|temporarily unavailable",
+    "\\b(502|503|504)\\b|bad gateway|gateway time ?out|service unavailable",
+    // model / generation
+    "overloaded|rate ?limit|\\b429\\b|too many requests",
+    "generation (error|failed)|model (error|unavailable|overloaded)",
+    "stream (error|interrupted|closed)|api error|internal server error",
+  ].join("|"),
+  "i",
+);
+
+function looksTransientForLoopGuard(text: string): boolean {
+  return LOOP_GUARD_TRANSIENT.test(text);
 }
 
 // Layer 2 may only ever TIGHTEN Layer 1 — the constitution is a second lock, not a
@@ -442,6 +526,10 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
     let decision: Decision = { verdict: "allow", principle: "hard:default-allow", reason: "" };
     let toolName = "unknown";
     let needsConstitution = false;
+    // CLAW-116: true when an infra escalation in an UNATTENDED run is routed to
+    // Mike as an approval card (hardPolicy.infraApprovalCard). Read at the
+    // requireApproval return below, which sits outside the try block.
+    let infraCardUnattended = false;
     try {
       toolName = String(event.toolName ?? "unknown");
       const toolKind = event.toolKind as string | undefined;
@@ -487,7 +575,19 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         family === "file" &&
         (/write|edit|patch|create|append|mkdir|mv|cp|rm|delete|tee/i.test(toolName) ||
           (!!params && ("content" in params || "text" in params)));
-      const l2Worthwhile = l2All || alwaysConstitutional || family === "exec" || isWriteLike || family === "web";
+      // CLAW-089: outbound peer mail. `reach_send` classifies as family "other",
+      // so it fell outside every clause above and was never judged — confirmed in
+      // the live audit (every reach_send row: hard:default-allow, layer2 none).
+      // Mike asked for the judge to assess whether a message actually serves the
+      // collaboration thread; Layer 1 already covers the structural defects
+      // (hard:mail-* in policy.ts), and this covers the judgement.
+      //
+      // The judge sees the OUTBOUND params only — the bot's own text. It is
+      // deliberately NOT given the peer thread: feeding peer-authored bodies to
+      // the reviewer would import untrusted text straight into the security
+      // component, which buildJudgePrompt is explicitly built to keep out.
+      const isOutboundMail = hardPolicy.reviewOutboundMail && toolName === "reach_send";
+      const l2Worthwhile = l2All || alwaysConstitutional || family === "exec" || isWriteLike || family === "web" || isOutboundMail;
       const l2Eligible = needsConstitution && l2Worthwhile && !!l2Complete && l2Mode !== "off";
 
       // ── Context depth (2026-08-24) — apply the configured tier ──
@@ -560,6 +660,11 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
             lastAssistantMessage: effectiveLastAssistantMessage,
             sessionTranscript: sessionTranscript || undefined,
             sessionTranscriptTruncated,
+            // CLAW-116: trusted, host-written — see Layer2Input.verifiedLedger.
+            verifiedLedger:
+              l1.principle === "hard:infra-ledger-match" && l1.ledgerEntry
+                ? describeLedgerEntry(l1.ledgerEntry)
+                : undefined,
           },
           { model: l2Model, timeoutMs: l2TimeoutMs, thinkingLevel: l2Thinking, maxTokens: l2MaxTokens },
         );
@@ -635,6 +740,17 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         const inertReadKept = !!combined && combined.verdict === "escalate" && l1.verdict === "allow" && inertRead;
         if (inertReadKept) {
           decision = l1;
+        } else if (combined && l1.principle === "hard:infra-ledger-match" && combined.verdict === "escalate") {
+          // CLAW-116 (Mike, 2026-09-22): an active ledger entry covers the
+          // command, but the judge says the change breaks one of its limits.
+          // Mike decides: a card, never an unattended auto-allow — the
+          // principle is in NEVER_DOWNGRADE. A judge DENY (injection,
+          // exfiltration) is not converted and stays a deny.
+          decision = {
+            verdict: "escalate",
+            principle: "hard:infra-ledger-review",
+            reason: `${l1.ledgerEntry?.id ?? "ledger entry"} covers this command, but the judge objected: ${combined.reason}`,
+          };
         } else if (combined) {
           decision = combined;
         } else if (alwaysConstitutional) {
@@ -708,7 +824,14 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
       // escalations move, because unattended they are unanswerable.
       let downgraded = false;
       if (unattended && decision.verdict === "escalate") {
-        if (NEVER_DOWNGRADE.has(decision.principle)) {
+        if (hardPolicy.infraApprovalCard && INFRA_CARD_PRINCIPLES.has(decision.principle)) {
+          // CLAW-116 (Mike, 2026-09-22): "reply NEEDS MIKE with an approval
+          // card if I am needed in the loop". Keep the escalate: openclaw's
+          // approvals.plugin forwarding (mode "targets") delivers the card to
+          // Mike's Telegram chat, which a mail-woken session has no route to
+          // by itself. No answer before the timeout → deny, as before.
+          infraCardUnattended = true;
+        } else if (NEVER_DOWNGRADE.has(decision.principle)) {
           decision = {
             verdict: "deny",
             principle: decision.principle,
@@ -738,6 +861,8 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         sessionKey: sessionKey || null,
         unattended,
         downgraded,
+        // CLAW-116: an unattended infra escalation sent to Mike as a card.
+        infraCardUnattended: infraCardUnattended || undefined,
         agentId: ctx?.agentId ?? null,
         toolCallId: event.toolCallId ?? null,
         toolName,
@@ -951,6 +1076,43 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
       const retrySuffix = decision.retryHint ? ` — safer retry: ${decision.retryHint}` : "";
       return { block: true, blockReason: `reviewer: ${decision.reason}${retrySuffix}` };
     }
+    if (decision.verdict === "escalate" && INFRA_CARD_PRINCIPLES.has(decision.principle)) {
+      // CLAW-116 infra card. The Gateway caps the description at 256 chars, so
+      // it carries only what Mike needs to decide: the command, the directory
+      // (which names the repo@commit export), and why he is asked. No
+      // allow-always: approval is per change; a standing grant is a ledger
+      // entry, written on the host with claw-approvals.
+      const p = (event.params ?? {}) as Record<string, unknown>;
+      const cmd = String(execCommandOf(p) ?? "").replace(/\s+/g, " ").trim();
+      const dir = typeof p.workdir === "string" ? p.workdir : "";
+      const why =
+        decision.principle === "hard:infra-ledger-review"
+          ? decision.reason.slice(0, 110)
+          : "no active ledger entry covers this change";
+      const description = [
+        `$ ${cmd.slice(0, 110)}`,
+        dir ? `in ${dir.length > 70 ? "…" + dir.slice(-69) : dir}` : "",
+        why,
+      ]
+        .filter(Boolean)
+        .join("\n")
+        .slice(0, 256);
+      return {
+        requireApproval: {
+          title: `NEEDS MIKE: infrastructure change (${botKey})`.slice(0, 80),
+          description,
+          severity: "warning" as const,
+          // Unattended: the mail waker ends the turn at CLAW_WAKER_TIMEOUT_S
+          // (600 s), and the export + plan already used part of it, so the card
+          // must expire first; the bot then replies NEEDS MIKE to the requester.
+          timeoutMs: infraCardUnattended
+            ? Number(process.env.OASIS_REVIEWER_INFRA_CARD_TIMEOUT_MS ?? "420000") || 420_000
+            : 600_000,
+          timeoutBehavior: "deny" as const,
+          allowedDecisions: ["allow-once", "deny"] as const,
+        },
+      };
+    }
     if (decision.verdict === "escalate") {
       const retrySuffix = decision.retryHint
         ? `\nIf you'd rather retry now instead of waiting on approval: ${decision.retryHint}`
@@ -971,6 +1133,8 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
           // This CANNOT hang an unattended run: the unattended adjustment above
           // resolves every escalate to allow/deny before this path is reached,
           // so requireApproval is only ever issued in an attended session.
+          // (The one exception, CLAW-116 infra cards, returns above with its
+          // own shorter timeout.)
           // Security posture is unchanged — timeoutBehavior stays "deny".
           timeoutMs: 600_000,
           timeoutBehavior: "deny" as const,
@@ -992,6 +1156,13 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
   // and still gated on loopGuardMode, same as before.
   const loopGuardMode = (process.env.OASIS_REVIEWER_LOOP_GUARD ?? "off").toLowerCase();
   const loopGuardThreshold = Number(process.env.OASIS_REVIEWER_LOOP_GUARD_THRESHOLD ?? "3") || 3;
+  // Rope for a retry that names a transient cause (network / model). Must be >=
+  // the ordinary threshold, or configuring it lower would make transient retries
+  // STRICTER than ordinary ones — the opposite of the intent.
+  const loopGuardTransientThreshold = Math.max(
+    loopGuardThreshold,
+    Number(process.env.OASIS_REVIEWER_LOOP_GUARD_TRANSIENT_THRESHOLD ?? "6") || 6,
+  );
   api.on("before_agent_finalize", (event: Record<string, unknown>, ctx: Record<string, unknown>) => {
     // Capture first, unconditionally. Own try/catch, never returns a value —
     // a bug here must never suppress or alter the loop guard below.
@@ -1009,17 +1180,25 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
       const text = String(event?.lastAssistantMessage ?? "");
       if (!text.trim()) return;
 
-      const hash = hashForLoopGuard(text);
+      const norm = normalizeForLoopGuard(text);
       const prior = loopGuardHistory.get(sessionId);
-      const streak = prior && prior.hash === hash ? prior.streak + 1 : 1;
+      // Near-identical, not identical (CLAW-089): a retry that only renumbers an
+      // attempt or restamps a time is the SAME reply for loop purposes.
+      const repeated = !!prior && similarityForLoopGuard(prior.norm, norm) >= LOOP_GUARD_SIMILARITY;
+      const streak = repeated ? prior!.streak + 1 : 1;
+      // A streak stays "transient" only while EVERY reply in it names a transient
+      // cause. One repeat with no such cause drops the streak back to the ordinary
+      // threshold, so a bot cannot buy extra rope by mentioning a timeout once.
+      const transient = looksTransientForLoopGuard(text) && (!repeated || prior!.transient);
+      const effectiveThreshold = transient ? loopGuardTransientThreshold : loopGuardThreshold;
 
       if (!loopGuardHistory.has(sessionId) && loopGuardHistory.size >= LOOP_GUARD_HISTORY_MAX) {
         const oldest = loopGuardHistory.keys().next().value;
         if (oldest !== undefined) loopGuardHistory.delete(oldest);
       }
-      loopGuardHistory.set(sessionId, { hash, streak });
+      loopGuardHistory.set(sessionId, { norm, streak, transient });
 
-      if (streak < loopGuardThreshold) return;
+      if (streak < effectiveThreshold) return;
 
       write({
         ts: new Date().toISOString(),
@@ -1028,7 +1207,11 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         bot: botKey,
         sessionId,
         streak,
-        threshold: loopGuardThreshold,
+        threshold: effectiveThreshold,
+        // Both recorded so a shadow-mode audit shows WHY a streak was tolerated
+        // as long as it was, without re-deriving it from the text.
+        transient,
+        ordinaryThreshold: loopGuardThreshold,
         textPreview: text.slice(0, 200),
         enforced: loopGuardMode === "enforce",
       });
@@ -1040,7 +1223,11 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
       loopGuardHistory.delete(sessionId);
       return {
         action: "finalize" as const,
-        reason: `oasis-reviewer loop guard: the same reply repeated ${streak} times in a row for this session — forcing this turn to end instead of continuing the loop.`,
+        reason:
+          `oasis-reviewer loop guard: a near-identical reply repeated ${streak} times in a row for this session` +
+          (transient
+            ? ` while naming a transient cause (network or model). Past ${effectiveThreshold} attempts that is no longer transient — treat it as a blocker and REPORT it rather than retrying the same text.`
+            : `. Forcing this turn to end instead of continuing the loop. If you must retry, change the approach, not just the wording.`),
       };
     } catch (err) {
       write({
