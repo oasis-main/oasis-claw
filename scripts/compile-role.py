@@ -14,6 +14,7 @@ CLAW-047 — safe-auto-mode onboarding via role-manifest compiler.
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -120,6 +121,17 @@ def compile_role(role_path):
         if isinstance(wvols, list):
             exports.append(f"export _ROLE_REACH_WRITE_COUNT={len(wvols)}")
 
+    # ── mcp: outbound MCP servers (CLAW-117) ──────────────────────────
+    # role.yaml is the only source of a bot's MCP servers; the entrypoint
+    # reconciles openclaw.json `mcp.servers` to exactly this set.
+    mcp_servers, mcp_skipped = _compile_mcp(data.get("mcp"))
+    if mcp_servers:
+        exports.append(
+            f"export OASIS_MCP_SERVERS={_sq(json.dumps(mcp_servers, sort_keys=True))}"
+        )
+    if mcp_skipped:
+        exports.append(f"export _ROLE_MCP_SKIPPED={_sq('; '.join(mcp_skipped))}")
+
     # ── task_scope ────────────────────────────────────────────────────
     task_scope = data.get("task_scope")
     if task_scope and str(task_scope).strip():
@@ -128,6 +140,56 @@ def compile_role(role_path):
         )
 
     print("\n".join(exports))
+
+
+_MCP_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,29}$")
+_MCP_TRANSPORTS = ("streamable-http", "sse")
+
+
+def _compile_mcp(mcp_cfg):
+    """Validate role.yaml `mcp.servers` → ({name: openclaw server spec}, [skip reasons]).
+
+    Only REMOTE servers (url + transport) compile. A stdio server (`command`)
+    would run INSIDE the bot container as the bot's own uid, which can read the
+    gateway token and device key (.swarm/EXEC_RUNNER_SANDBOX_DESIGN.md §1), so
+    it is refused here: an MCP server with real power belongs in its own
+    container, reached over an internal network (CLAW-117 oasis-freecad).
+    Invalid entries are skipped with a reason, never compiled half-way.
+    """
+    if not isinstance(mcp_cfg, dict):
+        return {}, []
+    servers = mcp_cfg.get("servers")
+    if not isinstance(servers, dict):
+        return {}, []
+    out, skipped = {}, []
+    for name, spec in servers.items():
+        name = str(name)
+        if not _MCP_NAME_RE.match(name):
+            skipped.append(f"{name}: name must match {_MCP_NAME_RE.pattern}")
+            continue
+        if not isinstance(spec, dict):
+            skipped.append(f"{name}: spec is not a mapping")
+            continue
+        if "command" in spec:
+            skipped.append(f"{name}: stdio servers are refused (they run inside the bot container)")
+            continue
+        url = str(spec.get("url", ""))
+        if not url.startswith(("http://", "https://")):
+            skipped.append(f"{name}: url must be http(s)://")
+            continue
+        transport = str(spec.get("transport", "streamable-http"))
+        if transport not in _MCP_TRANSPORTS:
+            skipped.append(f"{name}: transport must be one of {list(_MCP_TRANSPORTS)}")
+            continue
+        entry = {"url": url, "transport": transport}
+        tool_filter = spec.get("toolFilter")
+        if isinstance(tool_filter, dict):
+            tf = {k: [str(x) for x in tool_filter[k]]
+                  for k in ("include", "exclude") if isinstance(tool_filter.get(k), list)}
+            if tf:
+                entry["toolFilter"] = tf
+        out[name] = entry
+    return out, skipped
 
 
 def _load(role_path):
