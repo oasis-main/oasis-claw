@@ -18,9 +18,6 @@ client_secret*.json
 *-client-secret.json
 service-account*.json
 
-# VDI transfer package output (multi-GB image tarballs) — never commit
-pasa-vdi-package/
-
 # Claude Code local session metadata (settings, worktree state)
 .claude/
 
@@ -44,5 +41,3 @@ bots/.runtime/
 .swarm/
 # Fleet mail routing — names every bot and which data each one holds.
 scripts/claw-mail-routes.json
-# Deployment-specific VDI transfer tooling.
-scripts/pasa-vdi-*.sh

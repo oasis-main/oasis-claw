@@ -34,6 +34,7 @@ import {
   createObservatoryServer,
   declaredPort,
   describeBot,
+  excludePattern,
   ensureKey,
   identityStore,
   hostPathFor,
@@ -275,7 +276,7 @@ test("runSnapshot commits a change, skips an unchanged night, and names what it 
   const dir = path.join(tmp("obs-snap-"), "snapshots");
   const bots = [
     { key: "house", container: "oasis-claw-house", running: true, excluded: false, state: "running" },
-    { key: "kaizen", container: "oasis-claw-kaizen", running: true, excluded: true, state: "running" },
+    { key: "corpbot", container: "oasis-claw-corpbot", running: true, excluded: true, state: "running" },
     { key: "claptrap", container: "oasis-claw-claptrap", running: false, excluded: false, state: "exited" },
   ];
   let memory = "night one\n";
@@ -290,7 +291,7 @@ test("runSnapshot commits a change, skips an unchanged night, and names what it 
   };
   const one = await runSnapshot(opts);
   assert.ok(one.committed);
-  assert.deepEqual(one.skippedBots, ["kaizen (excluded)", "claptrap (exited)"]);
+  assert.deepEqual(one.skippedBots, ["corpbot (excluded)", "claptrap (exited)"]);
   assert.equal((await runSnapshot(opts)).committed, null);
   memory = "night two\n";
   const three = await runSnapshot(opts);
@@ -350,7 +351,8 @@ test("describeBot: key from the mailbox mount, board mapped to the host, corpora
   assert.equal(nimbus.board.hostPath, "/Users/m/Documents/Nimbus/personal/.swarm");
   assert.equal(nimbus.controlUi.via, "direct");
   assert.equal(describeBot(inspect("oasis-claw-house", [], ["OASIS_AGENT_NAME=Mr. House"]), []).key, "house");
-  assert.equal(describeBot(inspect("oasis-claw-kaizen"), []).excluded, true);
+  assert.equal(describeBot(inspect("oasis-claw-corpbot"), [], /corpbot/i).excluded, true);
+  assert.equal(describeBot(inspect("oasis-claw-corpbot"), [], null).excluded, false, "no pattern excludes nothing");
   assert.equal(describeBot({ ...inspect("oasis-claw-vet"), Mounts: [] }, []), null, "a container without a bot home is not a bot");
   assert.equal(describeBot(inspect("other-container"), []), null);
 });
@@ -632,15 +634,15 @@ test("identityStore keeps entries on disk (mode 600) and skips persistence when 
   const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(32, 2)]);
   const store = identityStore(dir);
   store.set("house", { name: "Mr. House", emoji: "🎰", role: "r", creature: "c" }, { bytes: png, mime: "image/png" });
-  store.set("kaizen", { name: "Kaizen" }, null, { persist: false });
+  store.set("corpbot", { name: "Corp Bot" }, null, { persist: false });
   assert.equal((fs.statSync(path.join(dir, "house.json")).mode & 0o777), 0o600);
   assert.equal((fs.statSync(path.join(dir, "house.png")).mode & 0o777), 0o600);
-  assert.ok(!fs.existsSync(path.join(dir, "kaizen.json")), "an excluded bot never reaches disk");
+  assert.ok(!fs.existsSync(path.join(dir, "corpbot.json")), "an excluded bot never reaches disk");
   const reloaded = identityStore(dir).get("house");
   assert.equal(reloaded.name, "Mr. House");
   assert.deepEqual(reloaded.avatar.bytes, png);
   assert.equal(reloaded.avatar.version, store.get("house").avatar.version);
-  assert.equal(identityStore(dir).get("kaizen"), null);
+  assert.equal(identityStore(dir).get("corpbot"), null);
 });
 
 test("renderIcon draws a valid PNG; sniffImage knows the four types", () => {
@@ -668,7 +670,7 @@ test("planProxyRoutes: port + 100, sandboxed by name, published through the host
     { key: "helloworld", container: "oasis-claw-hello-world", declaredPort: 18796, hostPort: 18796, networks: ["oasis-claw_oasis_runtime"] },
     { key: "nimbus", container: "oasis-claw-runtime", declaredPort: 18789, hostPort: 18789, networks: ["oasis-claw_oasis_runtime"] },
     { key: "newbot", container: "oasis-claw-newbot", declaredPort: 18797, hostPort: null, networks: sandboxed },
-    { key: "kaizen", container: "oasis-claw-pasa-kaizen", declaredPort: 18799, excluded: true, networks: sandboxed },
+    { key: "corpbot", container: "oasis-claw-corp-bot", declaredPort: 18799, excluded: true, networks: sandboxed },
     { key: "island", container: "oasis-claw-island", declaredPort: 18798, hostPort: null, networks: ["other"] },
     { key: "clash", container: "oasis-claw-clash", declaredPort: 18680, hostPort: null, networks: sandboxed },
   ];
@@ -677,10 +679,22 @@ test("planProxyRoutes: port + 100, sandboxed by name, published through the host
     plan.routes.map((r) => `${r.listenPort}=${r.target}`),
     ["18891=oasis-claw-house:18789", "18896=host.docker.internal:18796", "18897=oasis-claw-newbot:18789"],
   );
-  assert.deepEqual(plan.skipped.map((x) => x.key).sort(), ["clash", "island", "kaizen"], "18780 is the observatory's own port");
+  assert.deepEqual(plan.skipped.map((x) => x.key).sort(), ["clash", "corpbot", "island"], "18780 is the observatory's own port");
   const yaml = renderProxyRoutesOverride(plan);
   assert.match(yaml, /ROUTES: "18891=oasis-claw-house:18789, 18896=host\.docker\.internal:18796, 18897=oasis-claw-newbot:18789"/);
   assert.match(yaml, /- "127\.0\.0\.1:18897:18897"/);
-  assert.match(yaml, /# no route for kaizen: excluded/);
+  assert.match(yaml, /# no route for corpbot: excluded/);
   assert.doesNotMatch(yaml, /18789:18789|18889/);
+});
+
+test("excludePattern: env first, then the state-folder file, else nothing", () => {
+  const dir = tmp("obs-exclude-");
+  assert.equal(excludePattern({}, dir), null, "no env and no file excludes nothing");
+  fs.writeFileSync(path.join(dir, "exclude"), "# hidden on this host\ncorp-a\n\ncorp-b\n");
+  const fromFile = excludePattern({}, dir);
+  assert.ok(fromFile.test("oasis-claw-corp-a") && fromFile.test("CORP-B"));
+  assert.ok(!fromFile.test("oasis-claw-house"));
+  assert.ok(!fromFile.test("hidden on this host"), "a comment line is not a pattern");
+  const fromEnv = excludePattern({ OASIS_OBSERVATORY_EXCLUDE: "other" }, dir);
+  assert.ok(fromEnv.test("other") && !fromEnv.test("corp-a"), "the env var wins over the file");
 });

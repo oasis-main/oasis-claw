@@ -90,7 +90,28 @@ const DEFAULT_PULL_DIR = path.join(SCRIPT_DIR, "..", ".swarm", "feedback");
 // Loaded only when needed; see the DEPLOYMENT NOTE above.
 const FEEDBACK_MODULE = new URL("./claw-observatory-feedback.mjs", import.meta.url);
 const MAIL_ROOT = process.env.OASIS_CLAW_MAIL_ROOT || path.join(HOME, "Documents", "Runes", ".claw-mail");
-const EXCLUDE_RE = new RegExp(process.env.OASIS_OBSERVATORY_EXCLUDE || "kaizen|pasa", "i");
+// Containers the observatory never shows, reads, or stores. The pattern comes
+// from OASIS_OBSERVATORY_EXCLUDE, else from the file `exclude` in the state
+// folder (one pattern per line, `#` starts a comment), else nothing is
+// excluded. Which deployments to hide is private to the host, so the public
+// default names none.
+export function excludePattern(env = process.env, stateDir = STATE_DIR) {
+  let src = String(env.OASIS_OBSERVATORY_EXCLUDE || "").trim();
+  if (!src) {
+    try {
+      src = fs
+        .readFileSync(path.join(stateDir, "exclude"), "utf8")
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith("#"))
+        .join("|");
+    } catch {
+      src = "";
+    }
+  }
+  return src ? new RegExp(src, "i") : null;
+}
+const EXCLUDE_RE = excludePattern();
 const ASSET_DIR = path.join(SCRIPT_DIR, "observatory");
 const ASSETS = {
   "/": ["index.html", "text/html; charset=utf-8"],
@@ -386,7 +407,7 @@ export function withOpenUrls(fleet, key) {
   };
 }
 
-export function describeBot(inspect, routes) {
+export function describeBot(inspect, routes, exclude = EXCLUDE_RE) {
   const container = String(inspect?.Name ?? "").replace(/^\//, "");
   const mounts = inspect?.Mounts ?? [];
   if (!container.startsWith(CONTAINER_PREFIX) || !mounts.some((m) => m.Destination === BOT_HOME)) {
@@ -412,7 +433,7 @@ export function describeBot(inspect, routes) {
     state: inspect?.State?.Status ?? "unknown",
     health: inspect?.State?.Health?.Status ?? null,
     running: inspect?.State?.Status === "running",
-    excluded: EXCLUDE_RE.test(container) || EXCLUDE_RE.test(key),
+    excluded: !!exclude && (exclude.test(container) || exclude.test(key)),
     networks: Object.keys(inspect?.NetworkSettings?.Networks ?? {}),
     hostPort,
     declaredPort: declaredPort(inspect, GATEWAY_PORT),
@@ -1259,7 +1280,7 @@ async function botDiff(dir, key, commit, file) {
 // Read once per 30 minutes per bot with `docker exec` (about 3.1 s for a
 // sandboxed bot), kept on disk in the state folder so the page shows every
 // face at once after a restart, including a stopped bot's. A bot matched by
-// OASIS_OBSERVATORY_EXCLUDE (the corporate deployment) stays in memory only.
+// the exclude pattern (see excludePattern) stays in memory only.
 
 const IDENTITY_TTL_MS = 30 * 60 * 1000;
 const IDENTITY_RETRY_MS = 2 * 60 * 1000;

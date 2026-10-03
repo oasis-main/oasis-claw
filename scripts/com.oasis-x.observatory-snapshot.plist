@@ -28,8 +28,9 @@
   memory/dreaming/{light,rem,deep}/*.md, plus a meta.json with name, birth time
   and model. Never identity/device.json (it holds the device private key),
   never openclaw.json, never a transcript. Only running bot containers are
-  read, and any container whose name matches OASIS_OBSERVATORY_EXCLUDE
-  (default: kaizen|pasa, the corporate deployment) is skipped.
+  read, and any container whose name matches the exclude pattern is skipped:
+  OASIS_OBSERVATORY_EXCLUDE, else the file `exclude` in the observatory state
+  folder (one pattern per line). There is no default.
 -->
 <plist version="1.0">
 <dict>
