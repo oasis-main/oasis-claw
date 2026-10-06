@@ -1120,7 +1120,10 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
       return {
         requireApproval: {
           title: "Reviewer approval required",
-          description: `${decision.reason}\n(rule: ${decision.principle}, bot: ${botKey}, tool: ${toolName})${retrySuffix}`,
+          description: capApprovalDescription(
+            decision.reason,
+            `\n(rule: ${decision.principle}, bot: ${botKey}, tool: ${toolName})${retrySuffix}`,
+          ),
           severity: "warning" as const,
           // 10 min (= MAX_PLUGIN_APPROVAL_TIMEOUT_MS, the runtime ceiling): the
           // operator copy-pastes `/approve <id> <decision>` from a Telegram DM,
@@ -1259,4 +1262,20 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         ? "off"
         : `${injectionReviewMode} (telegram=${telegramBotToken && telegramChatId ? "configured" : "not-configured"})`,
   });
+}
+
+/**
+ * The gateway rejects a plugin.approval.request whose description is longer
+ * than 512 chars ("must not have more than 512 characters"), and a rejected
+ * request blocks the tool call, so an over-long reviewer reason turned an
+ * escalate into a silent deny (House, 2026-10-06 15:34 UTC). Keep the rule /
+ * bot / tool line and the retry hint whole where possible; shorten the reason.
+ */
+export const APPROVAL_DESCRIPTION_MAX = 512;
+export function capApprovalDescription(reason: string, suffix: string, max = APPROVAL_DESCRIPTION_MAX): string {
+  const full = `${reason}${suffix}`;
+  if (full.length <= max) return full;
+  const tail = suffix.length > max / 2 ? suffix.slice(0, Math.floor(max / 2) - 1) + "…" : suffix;
+  const room = max - tail.length - 1;
+  return `${reason.slice(0, Math.max(0, room))}…${tail}`.slice(0, max);
 }
