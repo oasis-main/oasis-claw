@@ -664,6 +664,18 @@ _compaction_reserve = max(1000, _compaction_reserve)
 config["agents"]["defaults"]["compaction"]["reserveTokens"] = _compaction_reserve
 config["agents"]["defaults"]["compaction"]["reserveTokensFloor"] = _compaction_reserve
 
+# compaction timeout — openclaw's default is 180 s. On 2026-10-03 House's
+# overflow compaction of ~221K tokens timed out at exactly 180 s twice (once on
+# Opus 5, once on Sonnet 5), so the session could neither run nor shrink. The
+# summary call goes through the gateway with adaptive thinking, and with 1M
+# windows the transcript to summarise can be ~4x larger, so allow 10 minutes.
+# OASIS_COMPACTION_TIMEOUT_SECONDS overrides.
+try:
+    _compaction_timeout = int(os.environ.get("OASIS_COMPACTION_TIMEOUT_SECONDS", "").strip() or "600")
+except ValueError:
+    _compaction_timeout = 600
+config["agents"]["defaults"]["compaction"]["timeoutSeconds"] = max(60, _compaction_timeout)
+
 # ---- heartbeat cadence + active-hours (runtime efficiency) --------------
 # openclaw's DEFAULT agent self-wakes every 30m (DEFAULT_HEARTBEAT_EVERY),
 # and each wake reloads the FULL, growing session transcript and re-writes
@@ -812,6 +824,16 @@ except ValueError:
 _nap_cfg.setdefault("thresholdRatio", max(0.1, min(0.99, _nap_ratio)))
 _nap_cfg["enabled"] = (
     (os.environ.get("OASIS_CONTEXT_NAP_ENABLED", "").strip() or "1") == "1"
+)
+
+# memory tidy (2026-10-06): keep MEMORY.md under openclaw's 20,000-char
+# bootstrap limit by moving whole sections VERBATIM into memory/archive/
+# (memory_search indexes it recursively) with a one-line pointer left behind.
+# Dreaming only appends, so without this MEMORY.md grows until it is truncated
+# (House: 22,712 chars). Thresholds live in the plugin (TIDY_DEFAULTS);
+# `enabled` is force-set from OASIS_MEMORY_TIDY_ENABLED (default on).
+entries["sleep-cycle"]["config"].setdefault("memoryTidy", {})["enabled"] = (
+    (os.environ.get("OASIS_MEMORY_TIDY_ENABLED", "").strip() or "1") == "1"
 )
 
 # ---- Layer 1: tools.profile from role.yaml (CLAW-047) --------------------
@@ -1874,6 +1896,13 @@ if oasis_gen_token:
         # mantle/Responses backend translates image_url -> input_image). The
         # Converse-backed models stay text-only (that path still drops images).
         # cost=0 because metering happens at the gateway, not per-bot.
+        # compat.supportsUsageInStreaming: openclaw sends
+        # stream_options.include_usage only to endpoints it recognises, and a
+        # configured non-OpenAI baseUrl defaults to false. Without it every
+        # streamed turn recorded usage 0, so openclaw judged context size by a
+        # character estimate alone (2026-10-03: House's overflow logged
+        # observedTokens=unknown). The gateway returns OpenAI-style usage on
+        # the final chunk for both backends since oasis-generation 2026-10-03.
         return {
             "id": mid,
             "name": name,
@@ -1882,6 +1911,7 @@ if oasis_gen_token:
             "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
             "contextWindow": ctx,
             "maxTokens": 8192,
+            "compat": {"supportsUsageInStreaming": True},
         }
 
     # Display names carry only the backend tag ("(Bedrock)" / "(Local)"); the
@@ -1895,30 +1925,49 @@ if oasis_gen_token:
     # via the gateway's bedrock_mantle/Responses backend, 272K ctx). Keep in sync
     # with the gateway's catalog.py enabled entries — a model NOT enabled there
     # 404s here.
+    #
+    # Context windows (Mike, 2026-10-03: "all models should have a context
+    # window of 1M if available, 200K if not"). Values are the Bedrock model
+    # cards' INPUT limits: openclaw's prompt budget is contextWindow minus the
+    # compaction reserve, so a value above the real input limit would fail at
+    # the edge instead of compacting. Checked 2026-10-03:
+    #   - Claude Opus 4.7 / 4.8 / 5 / 5.5 and Sonnet 4.6 / 5: 1M, no beta header.
+    #     Probed through the gateway with no header: Opus 5 took 266,042 input
+    #     tokens, Sonnet 5 224,042, Sonnet 4.6 229,201, and each read to the end.
+    #   - GPT-6 Astra, GPT-5.6 sol / luna / terra: 1,050,000 total, at most
+    #     922,000 of it input. Bedrock bills a prompt above 272K at 2x input.
+    #   - Nova 2 Lite: 1M. GLM-5 and Claude Haiku 4.5: 200K.
+    #   - Under 200K, so kept at their real limit: Llama 3.3 70B and Nova Micro
+    #     (128K), and the local Gemma runner (32K).
+    # Before 2026-10-03 every Claude entry said 200000, and House wedged at
+    # 220,960 estimated tokens on a model that accepts 1M.
+    _CTX_1M = 1_000_000
+    _CTX_GPT = 922_000
+    _CTX_200K = 200_000
     gen_models = [
         _gen_model("gemma-4-12b-coder", "Gemma-4 12B Coder (Local)", 32768),
         _gen_model("gemma-4-12b-agentic", "Gemma-4 12B Agentic (Local)", 32768),
-        _gen_model("claude-opus-4-8", "Claude Opus 4.8 (Bedrock)", 200000, ["text", "image"]),
+        _gen_model("claude-opus-4-8", "Claude Opus 4.8 (Bedrock)", _CTX_1M, ["text", "image"]),
         # Opus 5 added 2026-08-24 (ADM-048). Before this, Opus 5 reached ONLY
         # Nimbus, via a direct amazon-bedrock provider on Mike's personal IAM
         # key; the other six bots had no route to it and the gateway 404'd
         # `claude-opus-5`. Routing it through oasis-generation puts every bot on
         # one metered path. Must stay in sync with the gateway's catalog.py.
-        _gen_model("claude-opus-5", "Claude Opus 5 (Bedrock)", 200000, ["text", "image"]),
-        _gen_model("claude-opus-5-5", "Claude Opus 5.5 (Bedrock)", 200000, ["text", "image"]),
-        _gen_model("gpt-6-astra", "GPT-6 Astra (Bedrock)", 272000, ["text", "image"]),
-        _gen_model("claude-sonnet-5", "Claude Sonnet 5 (Bedrock)", 200000, ["text", "image"]),
-        _gen_model("gpt-5.6-sol", "GPT-5.6-sol (Bedrock)", 272000, ["text", "image"]),
-        _gen_model("glm-5", "GLM-5 (Bedrock)", 131072),
+        _gen_model("claude-opus-5", "Claude Opus 5 (Bedrock)", _CTX_1M, ["text", "image"]),
+        _gen_model("claude-opus-5-5", "Claude Opus 5.5 (Bedrock)", _CTX_1M, ["text", "image"]),
+        _gen_model("gpt-6-astra", "GPT-6 Astra (Bedrock)", _CTX_GPT, ["text", "image"]),
+        _gen_model("claude-sonnet-5", "Claude Sonnet 5 (Bedrock)", _CTX_1M, ["text", "image"]),
+        _gen_model("gpt-5.6-sol", "GPT-5.6-sol (Bedrock)", _CTX_GPT, ["text", "image"]),
+        _gen_model("glm-5", "GLM-5 (Bedrock)", _CTX_200K),
         # Cheaper tier (ADM-052, 2026-08-28). Added because GPT-5.6-sol was
         # 87.5% of August's Bedrock spend and there was no cheap option in the
         # picker at all — every task, however mechanical, ran on a frontier
         # model. All six were probed THROUGH THE GATEWAY before landing here.
-        _gen_model("gpt-5.6-luna", "GPT-5.6-luna (Bedrock)", 272000, ["text", "image"]),
-        _gen_model("gpt-5.6-terra", "GPT-5.6-terra (Bedrock)", 272000, ["text", "image"]),
-        _gen_model("claude-haiku-4-5", "Claude Haiku 4.5 (Bedrock)", 200000, ["text", "image"]),
+        _gen_model("gpt-5.6-luna", "GPT-5.6-luna (Bedrock)", _CTX_GPT, ["text", "image"]),
+        _gen_model("gpt-5.6-terra", "GPT-5.6-terra (Bedrock)", _CTX_GPT, ["text", "image"]),
+        _gen_model("claude-haiku-4-5", "Claude Haiku 4.5 (Bedrock)", _CTX_200K, ["text", "image"]),
         _gen_model("llama3-3-70b", "Llama 3.3 70B (Bedrock)", 131072),
-        _gen_model("nova-2-lite", "Nova 2 Lite (Bedrock)", 300000),
+        _gen_model("nova-2-lite", "Nova 2 Lite (Bedrock)", _CTX_1M),
         _gen_model("nova-micro", "Nova Micro (Bedrock)", 128000),
         # ADM-055 (2026-09-09): the four DIRECT-provider entries that used to sit
         # here — gpt-5.4-mini, gpt-5.5, gemini-3.6-flash, gemini-3.1-flash-lite —
@@ -1926,16 +1975,29 @@ if oasis_gen_token:
         # so the fleet has ONE retention story instead of three. The reconcile
         # block below prunes them from every bot's allowlist on the next boot.
         # See oasis-generation/src/oasis_generation/catalog.py for the rationale.
-        _gen_model("claude-sonnet-4-6", "Claude Sonnet 4.6 (Bedrock)", 200000, ["text", "image"]),
-        _gen_model("claude-opus-4-7", "Claude Opus 4.7 (Bedrock)", 200000, ["text", "image"]),
+        _gen_model("claude-sonnet-4-6", "Claude Sonnet 4.6 (Bedrock)", _CTX_1M, ["text", "image"]),
+        _gen_model("claude-opus-4-7", "Claude Opus 4.7 (Bedrock)", _CTX_1M, ["text", "image"]),
     ]
+    # Claude with adaptive thinking streams NOTHING while it thinks: Bedrock
+    # omits the thinking text, so the gateway has no delta to forward. House's
+    # Opus 5 turns sat silent 57-73 s and two passed 120 s, which trips
+    # openclaw's implicit LLM idle watchdog ("LLM idle timeout (120s): no
+    # response from model", 2026-10-06). Provider timeoutSeconds raises that
+    # watchdog for this provider only (openclaw's own help names "Claude/Opus"
+    # for this case); it is also the total cap for one model request. The
+    # gateway's boto read_timeout (300 s) still ends a stream Bedrock stalls.
+    try:
+        _gen_timeout = int(os.environ.get("OASIS_GEN_TIMEOUT_SECONDS", "").strip() or "600")
+    except ValueError:
+        _gen_timeout = 600
     config.setdefault("models", {}).setdefault("providers", {})["oasis-generation"] = {
         "baseUrl": oasis_gen_url,
         "apiKey": oasis_gen_token,
         "api": "openai-completions",
+        "timeoutSeconds": max(120, _gen_timeout),
         "models": gen_models,
     }
-    print(f"[entrypoint] oasis-generation provider: {len(gen_models)} models @ {oasis_gen_url}")
+    print(f"[entrypoint] oasis-generation provider: {len(gen_models)} models @ {oasis_gen_url} timeout={max(120, _gen_timeout)}s")
 
     # Surface the WHOLE roster in /models. openclaw's default model picker lists
     # only the allowlist (agents.defaults.models) ∪ fallbacks ∪ default — and,
