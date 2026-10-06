@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""claw-dream-report — is dreaming doing its job, per bot? (read-only)
+
+For every running oasis-claw bot container this prints:
+  - dreams: last completed time per phase, and how many ran in the window
+  - promotions into MEMORY.md in the window (dreaming's only durable output)
+  - recall activity in the window (memory_search hits the dream ranks on)
+  - MEMORY.md size against the tidy soft cap (16,000) and openclaw's
+    bootstrap truncation limit (20,000)
+  - the last memory tidy: sections moved verbatim, over-budget flag
+  - the waking summary: date of the last staged handoff
+  - the search index: archived files indexed (proof they are searchable),
+    and how many indexed files are dream reports (search noise)
+
+Usage:
+  scripts/claw-dream-report            # all bots, 7-day window
+  scripts/claw-dream-report --days 2   # shorter window
+  scripts/claw-dream-report --json     # machine-readable
+
+Everything runs through `docker exec ... python3 -` and only READS files under
+/home/node/.openclaw. It never prints memory content, only counts, sizes,
+headings of moved sections and timestamps.
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+
+PROBE = r'''
+import json, os, sqlite3, sys, time, glob
+days = float(sys.argv[1])
+home = "/home/node/.openclaw"
+ws = home + "/workspace"
+now = time.time()
+cut = now - days * 86400
+out = {}
+
+def ts(s):
+    try:
+        return time.mktime(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
+    except Exception:
+        return 0
+
+ev = ws + "/memory/.dreams/events.jsonl"
+last_phase, dreams, promos, promo_applied, rec, skipped = {}, 0, 0, 0, 0, 0
+try:
+    for line in open(ev):
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        t = ts(r.get("timestamp", ""))
+        typ = r.get("type")
+        if typ == "memory.dream.completed":
+            last_phase[r.get("phase", "?")] = r.get("timestamp", "")[:16]
+            if t >= cut:
+                dreams += 1
+        elif t >= cut and typ == "memory.promotion.applied":
+            promos += 1
+            promo_applied += int(r.get("applied") or 0)
+        elif t >= cut and typ == "memory.recall.recorded":
+            rec += 1
+        elif t >= cut and typ == "memory.recall.skipped":
+            skipped += 1
+except FileNotFoundError:
+    pass
+out["dream_last"] = last_phase
+out["dreams_in_window"] = dreams
+out["promotion_runs"] = promos
+out["snippets_promoted"] = promo_applied
+out["recalls"] = rec
+out["recalls_skipped"] = skipped
+
+try:
+    out["memory_chars"] = len(open(ws + "/MEMORY.md", encoding="utf-8").read())
+except FileNotFoundError:
+    out["memory_chars"] = None
+
+tidy = home + "/state/sleep-cycle/memory-tidy.jsonl"
+try:
+    lines = open(tidy).read().strip().splitlines()
+    last = json.loads(lines[-1])
+    out["tidy_runs"] = len(lines)
+    out["tidy_last"] = time.strftime("%Y-%m-%d %H:%M", time.gmtime(last["ranAtMs"] / 1000))
+    out["tidy_before_after"] = [last.get("beforeChars"), last.get("afterChars")]
+    out["tidy_moved"] = [m.get("heading", "")[:70] for r in map(json.loads, lines) for m in r.get("moved", []) if r.get("ranAtMs", 0) / 1000 >= cut]
+    out["tidy_over_budget"] = bool(last.get("overBudget"))
+    out["tidy_skipped"] = last.get("skipped")
+    out["dream_reports_archived"] = sum(json.loads(l).get("dreamReportsMoved", 0) for l in lines)
+except (FileNotFoundError, IndexError, ValueError):
+    out["tidy_runs"] = 0
+
+try:
+    st = json.load(open(home + "/state/sleep-cycle/sleep-cycle-state.json"))
+    lc = st.get("lastCycle") or {}
+    out["waking_summary_last"] = lc.get("dateKey")
+    out["waking_memory_hits"] = len(lc.get("memoryHits") or [])
+except Exception:
+    out["waking_summary_last"] = None
+
+db = home + "/agents/main/agent/openclaw-agent.sqlite"
+try:
+    c = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+    paths = [r[0] for r in c.execute("select path from memory_index_sources")]
+    mem = [p for p in paths if p == "MEMORY.md" or p.startswith("memory/")]
+    out["indexed_memory_files"] = len(mem)
+    out["indexed_archive_files"] = sum(p.startswith("memory/archive/") for p in mem)
+    out["indexed_dream_reports"] = sum(p.startswith("memory/dreaming/") for p in mem)
+except Exception as e:
+    out["index_error"] = str(e)[:80]
+print(json.dumps(out))
+'''
+
+
+def bots():
+    names = subprocess.run(
+        ["docker", "ps", "--format", "{{.Names}}"], capture_output=True, text=True, check=True
+    ).stdout.split()
+    skip = {"oasis-claw-vet"}
+    return sorted(n for n in names if n.startswith("oasis-claw-") and n not in skip)
+
+
+def probe(container, days):
+    r = subprocess.run(
+        ["docker", "exec", "-i", container, "python3", "-", str(days)],
+        input=PROBE, capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return {"error": (r.stderr or r.stdout).strip()[-200:]}
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    except Exception:
+        return {"error": "unparseable probe output"}
+
+
+def truncation_warnings(container, days):
+    r = subprocess.run(
+        ["docker", "logs", "--since", f"{int(days * 24)}h", container],
+        capture_output=True, text=True,
+    )
+    return sum("MEMORY.md is" in l and "truncating" in l for l in (r.stdout + r.stderr).splitlines())
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--days", type=float, default=7)
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+    report = {}
+    for c in bots():
+        d = probe(c, a.days)
+        d["truncation_warnings"] = truncation_warnings(c, a.days)
+        report[c.replace("oasis-claw-", "").replace("runtime", "nimbus")] = d
+    if a.json:
+        print(json.dumps(report, indent=2))
+        return
+    print(f"Dream report — last {a.days:g} day(s)\n")
+    for bot, d in report.items():
+        if "error" in d:
+            print(f"{bot:12} ERROR {d['error']}")
+            continue
+        mc = d.get("memory_chars")
+        size = "none" if mc is None else f"{mc:,}" + (" OVER 20k (truncated)" if mc > 20000 else " over 16k" if mc > 16000 else "")
+        phases = " ".join(f"{p}={t[5:]}" for p, t in sorted(d.get("dream_last", {}).items())) or "never"
+        print(f"{bot}")
+        print(f"  dreams       {d.get('dreams_in_window', 0)} phase runs; last {phases} UTC")
+        print(f"  promotions   {d.get('snippets_promoted', 0)} snippet(s) in {d.get('promotion_runs', 0)} run(s); recalls {d.get('recalls', 0)} (+{d.get('recalls_skipped', 0)} skipped)")
+        print(f"  MEMORY.md    {size} chars; truncation warnings in logs: {d['truncation_warnings']}")
+        if d.get("tidy_runs"):
+            ba = d.get("tidy_before_after") or [None, None]
+            print(f"  tidy         {d['tidy_runs']} run(s); last {d.get('tidy_last')} UTC {ba[0]}->{ba[1]}"
+                  + (" STILL OVER BUDGET" if d.get("tidy_over_budget") else "")
+                  + (f" ({d['tidy_skipped']})" if d.get("tidy_skipped") else ""))
+            for h in d.get("tidy_moved", []):
+                print(f"               moved: {h}")
+            print(f"               dream reports moved out of the index so far: {d.get('dream_reports_archived', 0)}")
+        else:
+            print("  tidy         never ran")
+        print(f"  waking       last staged {d.get('waking_summary_last') or 'never'}")
+        if "index_error" in d:
+            print(f"  index        unreadable: {d['index_error']}")
+        else:
+            print(f"  index        {d.get('indexed_memory_files', 0)} memory files; archive {d.get('indexed_archive_files', 0)}; dream reports {d.get('indexed_dream_reports', 0)}")
+        print()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

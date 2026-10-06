@@ -94,44 +94,55 @@ export async function handleBeforeReset(
       return false;
     }
     const handoff = messagesToHandoff(event.messages ?? []);
-    if (!handoff) {
-      return false;
-    }
-
-    let memoryHits: MemoryHit[] = [];
-    if (deps.cfg.wakingSummary.enabled) {
-      try {
-        memoryHits = await rankMemoryHits({
-          endpoint: deps.cfg.semanticsEndpoint,
-          model: deps.cfg.semanticsModel,
-          query: handoff.slice(0, 1_500),
-          chunks: collectMemoryChunks(deps.workspaceDir),
-          topK: deps.cfg.wakingSummary.memoryHits,
-        });
-      } catch (err) {
-        log(`before_reset: memory rank failed: ${String(err)}`);
-      }
-    }
-
-    // The archive doesn't exist yet at before_reset (the rename happens after),
-    // so we point at the live transcript file; the supplement notes it as the
-    // most recent archived transcript.
-    const archives: ArchivedSessionRef[] = event.sessionFile
-      ? [{ sessionKey: "reset:" + event.reason, transcriptPath: event.sessionFile }]
-      : [];
-
-    const dateKey = dateKeyInTimeZone(deps.nowMs(), deps.cfg.timezone);
-    deps.store.save({
-      ...deps.store.state,
-      state: "light_sleep",
-      lastCycleDate: dateKey,
-      queue: deps.store.state.queue ?? [],
-      lastCycle: { dateKey, completedAtMs: deps.nowMs(), handoff, archives, memoryHits },
-    });
-    log(`before_reset: staged waking summary (${memoryHits.length} memory hit(s), reason=${event.reason})`);
-    return true;
+    return await stageWakingSummary(handoff, event.sessionFile, event.reason, deps, "before_reset");
   } catch (err) {
     log(`before_reset: capture failed (non-fatal): ${String(err)}`);
     return false;
   }
+}
+
+/**
+ * Stage the waking summary from a handoff tail: vector-rank memories, then
+ * write the sleep-cycle state the waking supplement reads. Shared by the
+ * before_reset path (manual resets) and the session_end path (openclaw's
+ * nightly rollover). Returns false when there is no handoff to stage.
+ */
+export async function stageWakingSummary(
+  handoff: string,
+  sessionFile: string | undefined,
+  reason: string,
+  deps: BeforeResetDeps,
+  source: string,
+): Promise<boolean> {
+  const log = deps.log ?? (() => {});
+  if (!handoff) {
+    return false;
+  }
+  let memoryHits: MemoryHit[] = [];
+  if (deps.cfg.wakingSummary.enabled) {
+    try {
+      memoryHits = await rankMemoryHits({
+        endpoint: deps.cfg.semanticsEndpoint,
+        model: deps.cfg.semanticsModel,
+        query: handoff.slice(0, 1_500),
+        chunks: collectMemoryChunks(deps.workspaceDir),
+        topK: deps.cfg.wakingSummary.memoryHits,
+      });
+    } catch (err) {
+      log(`${source}: memory rank failed: ${String(err)}`);
+    }
+  }
+  const archives: ArchivedSessionRef[] = sessionFile
+    ? [{ sessionKey: "reset:" + reason, transcriptPath: sessionFile }]
+    : [];
+  const dateKey = dateKeyInTimeZone(deps.nowMs(), deps.cfg.timezone);
+  deps.store.save({
+    ...deps.store.state,
+    state: "light_sleep",
+    lastCycleDate: dateKey,
+    queue: deps.store.state.queue ?? [],
+    lastCycle: { dateKey, completedAtMs: deps.nowMs(), handoff, archives, memoryHits },
+  });
+  log(`${source}: staged waking summary (${memoryHits.length} memory hit(s), reason=${reason})`);
+  return true;
 }

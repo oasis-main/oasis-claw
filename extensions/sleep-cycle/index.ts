@@ -28,6 +28,8 @@ import { type BeforeResetEvent, handleBeforeReset } from "./src/before-reset.js"
 import { type ContextNapConfig, createContextNapHooks } from "./src/context-nap.js";
 import { createSleepDeepTool, runDeepSleep, type SleepDeepConfig } from "./src/deep-tool.js";
 import { createGatewayCaller } from "./src/gateway-cli.js";
+import { applyTidy, logTidy, readLastTidy, TIDY_DEFAULTS, type TidyConfig, type TidyResult } from "./src/memory-tidy.js";
+import { handleSessionEnd, type SessionEndEvent } from "./src/session-end.js";
 import { loadState, StateStore } from "./src/state-store.js";
 import { buildWakingLines, type WakingConfig } from "./src/waking.js";
 
@@ -59,6 +61,18 @@ const configSchema = z.object({
       message: z.string().optional(),
     })
     .optional(),
+  memoryTidy: z
+    .object({
+      enabled: z.boolean().optional(),
+      softCapChars: z.number().optional(),
+      targetChars: z.number().optional(),
+      promotedMaxAgeDays: z.number().optional(),
+      datedMaxAgeDays: z.number().optional(),
+      dreamReportRetentionDays: z.number().optional(),
+      dailyNoteRetentionDays: z.number().optional(),
+      minHoursBetweenRuns: z.number().optional(),
+    })
+    .optional(),
   semanticsEndpoint: z.string().optional(),
   semanticsModel: z.string().optional(),
 });
@@ -74,6 +88,7 @@ type ResolvedConfig = {
     injectUntilHour: number;
   };
   contextNap: ContextNapConfig;
+  memoryTidy: TidyConfig;
   semanticsEndpoint: string;
   semanticsModel: string;
 };
@@ -116,9 +131,29 @@ function resolveConfig(raw: unknown): ResolvedConfig {
       // to native compaction (they're short and auto-pruned).
       sessionMatch: cfg.sessionMatch ?? ["telegram:direct"],
     },
+    memoryTidy: { ...TIDY_DEFAULTS, ...stripUndefined(cfg.memoryTidy ?? {}) },
     semanticsEndpoint: cfg.semanticsEndpoint ?? "http://oasis-semantics:8732",
     semanticsModel: cfg.semanticsModel ?? "default",
   };
+}
+
+function stripUndefined<T extends object>(obj: T): Partial<T> {
+  return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined)) as Partial<T>;
+}
+
+/** Waking-summary line asking the bot to curate MEMORY.md when tidy could not. */
+export function overBudgetLines(last: TidyResult | undefined, cfg: TidyConfig): string[] {
+  // Judge by size against the CURRENT soft cap, not the stored flag: an older
+  // run may have used a different threshold (the first House run, 2026-10-06,
+  // flagged 14,056 chars against the 14,000 target).
+  if (!last || last.skipped === "no MEMORY.md" || last.afterChars <= cfg.softCapChars) return [];
+  return [
+    `MEMORY.md is ${last.afterChars} chars, over the ${cfg.softCapChars}-char budget, and the nightly tidy found ` +
+      `no more sections it may move on its own. If a section is no longer needed in every prompt, move it ` +
+      `VERBATIM (no rewording, no summary) into memory/archive/<date>-<topic>.md and leave a one-line pointer ` +
+      `under the Archive index. Never move or edit rules, protocols, guidelines or policies; mark a section ` +
+      `<!-- pin --> to keep it. Mike's rule (2026-10-06): verbatim only.`,
+  ];
 }
 
 const plugin = {
@@ -220,15 +255,80 @@ const plugin = {
       api.on("agent_end", napHooks.onAgentEnd);
     }
 
+    // NIGHTLY ROLLOVER path (the one that actually fires): openclaw's daily/idle
+    // rollover emits session_end, not before_reset. Stage the waking summary
+    // there, then tidy MEMORY.md (the dream ran at ~22:20-22:45, the rollover
+    // comes after 23:00).
+    api.on("session_end", async (event: SessionEndEvent) => {
+      await handleSessionEnd(event, {
+        cfg: deepCfg,
+        workspaceDir,
+        store,
+        nowMs: () => Date.now(),
+        log: (m) => api.logger?.info?.(`sleep-cycle: ${m}`),
+      });
+      maybeTidy("session_end");
+    });
+
+
+    // MEMORY TIDY — keep MEMORY.md under the bootstrap budget by moving whole
+    // sections verbatim into memory/archive/ (see src/memory-tidy.ts). At most
+    // once per minHoursBetweenRuns (in-memory clock seeded from the tidy log).
+    //
+    // Trigger hooks are chosen to need NO conversation access. openclaw blocks
+    // a non-bundled plugin's agent_end / llm_output / llm_input /
+    // before_agent_* hooks unless plugins.entries.<id>.hooks.
+    // allowConversationAccess=true (registry: "typed hook ... blocked because
+    // non-bundled plugins must set ..."), and sleep-cycle does not have it, so
+    // an agent_end trigger never fired (verified 2026-10-06). session_start,
+    // session_end, message_sending and after_tool_call are not gated.
+    //
+    // Hooks only run at all because openclaw.plugin.json declares
+    // activation.onCapabilities ["hook"]. Without it the gateway starts a
+    // non-bundled plugin's hooks only if its config entry carries a hook policy
+    // (allowConversationAccess, allowPromptInjection, timeoutMs); otherwise the
+    // plugin loads only for tool discovery (sleep_deep) and NO hook ever fires
+    // (gateway-startup-plugin-ids: canStartExplicitHookPlugin). That silently
+    // disabled before_reset, session_end and context-nap from 2026-07-14.
+    let lastTidyResult: TidyResult | undefined = readLastTidy(stateDir);
+    let lastTidyRunMs = lastTidyResult?.ranAtMs ?? 0;
+    const maybeTidy = (trigger: string) => {
+      if (!cfg.memoryTidy.enabled) return;
+      try {
+        const now = Date.now();
+        if (now - lastTidyRunMs < cfg.memoryTidy.minHoursBetweenRuns * 3_600_000) return;
+        lastTidyRunMs = now;
+        const result = applyTidy(workspaceDir, cfg.memoryTidy, now);
+        logTidy(stateDir, result);
+        lastTidyResult = result;
+        api.logger?.info?.(
+          `sleep-cycle: memory tidy (${trigger}) ${result.beforeChars}->${result.afterChars} chars, ` +
+            `moved ${result.moved.length} section(s), ${result.dreamReportsMoved} dream report(s), ` +
+            `${result.dailyNotesMoved} daily note(s)` +
+            (result.overBudget ? ", STILL OVER BUDGET" : "") +
+            (result.skipped ? `, ${result.skipped}` : ""),
+        );
+      } catch (err) {
+        api.logger?.info?.(`sleep-cycle: memory tidy failed (non-fatal): ${String(err)}`);
+      }
+    };
+    api.on("gateway_start", () => maybeTidy("gateway_start"));
+    api.on("session_start", () => maybeTidy("session_start"));
+    api.on("message_sending", () => {
+      maybeTidy("message_sending");
+    });
+    api.on("after_tool_call", () => maybeTidy("after_tool_call"));
+
     // Waking summary — read fresh from the state file each time so it reflects
     // the sleep_deep tool's most recent write.
     const wakingCfg: WakingConfig = {
       timezone: cfg.timezone,
       wakingSummary: cfg.wakingSummary,
     };
-    api.registerMemoryPromptSupplement(() =>
-      buildWakingLines(loadState(stateDir), wakingCfg, Date.now()),
-    );
+    api.registerMemoryPromptSupplement(() => [
+      ...buildWakingLines(loadState(stateDir), wakingCfg, Date.now()),
+      ...overBudgetLines(lastTidyResult, cfg.memoryTidy),
+    ]);
   },
 };
 
