@@ -142,6 +142,59 @@ export async function assertBrowserNavigationAllowed(
     );
   }
 
+  // A proxy-routed browser resolves the hostname in the PROXY, not here, so a
+  // Node-side lookup cannot constrain what Chromium actually connects to — the
+  // comment directly above already says exactly that about strict mode. On a
+  // sandboxed bot the lookup is not merely uninformative, it is impossible:
+  // the network is `internal: true`, the only route out is the egress proxy,
+  // and Docker's embedded resolver answers for peer service names only. Every
+  // navigation therefore died here with "getaddrinfo EAI_AGAIN", on every
+  // host, including allowlisted ones. Measured 2026-09-04 on ButterBolt:
+  //   node dns.lookup www.ebay.com -> EAI_AGAIN   (sandboxed)
+  //   node dns.lookup www.ebay.com -> 23.48.203.137 (unsandboxed Nimbus)
+  // while Chromium itself, given --proxy-server, fetched the real page fine.
+  //
+  // Skipping the lookup here does NOT remove enforcement, it defers it to the
+  // component that can actually see the connection: the egress proxy, which
+  // allowlists by hostname at CONNECT and refuses anything unlisted (verified
+  // 2026-09-03 — an unlisted host gets HTTP 503, a listed one passes). This is
+  // the same trade openclaw already makes for web_fetch via
+  // tools.web.fetch.useTrustedEnvProxy: stop resolving locally, let the proxy
+  // resolve and gate.
+  //
+  // Deliberately NOT unconditional. Reaching this line in proxy mode requires
+  // the operator to have set browser.ssrfPolicy.dangerouslyAllowPrivateNetwork
+  // explicitly, because the guard above still throws otherwise. So both must
+  // hold: the profile is proxy-routed AND the operator opted in. A bot with no
+  // proxy keeps the full Node-side pinned resolution unchanged.
+  // The policy test is not redundant with the proxy test. browserProxyMode is
+  // threaded from the caller, and NOT every call site threads it: e.g.
+  // pw-tools-core.interactions.ts's assertSubframeNavigationAllowed calls
+  // withBrowserNavigationPolicy(ssrfPolicy) with no second argument, so the
+  // mode arrives undefined there. Measured on ButterBolt 2026-09-05 — with the
+  // proxy test alone, `navigate` got through but `snapshot` still died on
+  // "getaddrinfo EAI_AGAIN www.ebay.com" via that subframe path. Threading the
+  // mode through would touch ssrfPolicy's ~17 exported entry points in that one
+  // file; this condition covers every path at the single point that matters.
+  //
+  // It is also true on its own terms. Read resolvePinnedHostnameWithPolicy: it
+  // resolves, then runs assertAllowedResolvedAddressesOrThrow only when
+  // private addresses are NOT permitted, and the trusted-hostname assert only
+  // when isPrivateNetworkAllowedByPolicy is false. So once the operator has
+  // allowed private networks the address checks are already permissive, and
+  // the resolution's ONLY remaining effect is to throw on a name this process
+  // cannot resolve. The protocol check and the hostname allowlist checks above
+  // still run and can still reject.
+  //
+  // A bot that has NOT set dangerouslyAllowPrivateNetwork keeps the full
+  // Node-side pinned resolution, unchanged. That is every unsandboxed bot.
+  if (
+    opts.browserProxyMode === "explicit-browser-proxy" ||
+    isPrivateNetworkAllowedByPolicy(opts.ssrfPolicy)
+  ) {
+    return;
+  }
+
   await resolvePinnedHostnameWithPolicy(parsed.hostname, {
     lookupFn: opts.lookupFn,
     policy: opts.ssrfPolicy,
