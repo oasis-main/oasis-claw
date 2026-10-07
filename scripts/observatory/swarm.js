@@ -4,9 +4,14 @@
 // (the bot's role-family color from app.css). Each dot links to its nearest
 // neighbors, and three dots that all link to each other fill a faint
 // triangle, so the swarm draws a moving net (a simplicial complex). The dots
-// flock: separation, alignment and cohesion with neighbors of every color, a
+// flock: long-range separation and alignment with neighbors of every color, a
 // cruising speed so no dot stops, a soft cursor field with hard contact, and
 // an acceleration cap (the oasis-welcome homepage swarm's glide).
+//
+// The dots fill the whole page (Mike, 2026-10-07: "fill the page and be spaced
+// out more"): separation spreads them evenly, soft walls keep them on screen,
+// and there is no home point or cohesion to pull them into clumps. The count
+// follows the window area.
 //
 // The bot bar does not set the dots directly. It sends the bots in view
 // ("observatory:bots"), and each bot's dots then fly in from the screen
@@ -19,27 +24,28 @@
 (function () {
   "use strict";
 
-  const TOTAL = 180; // dots shared by the bots in view
-  const PER_BOT_MIN = 24;
-  const PER_BOT_MAX = 60;
+  const AREA_PER_DOT = 11000; // px² of window for each dot
+  const TOTAL_MIN = 70;
+  const TOTAL_MAX = 240;
+  const PER_BOT_MIN = 12;
   const SPAWN_EVERY_MS = 40; // per bot, while it is short of dots
   const LEAVE_STAGGER_MS = 900;
   const SETTLE_MS = 900; // an entering dot joins the swarm after this long on screen
 
   const DOT_R = 1.8;
-  const SEP_DIST = 24;
-  const W_SEP = 0.5;
-  const FLOCK_DIST = 70; // alignment and cohesion reach
-  const W_ALIGN = 0.05;
-  const W_ALIGN_OTHER = 0.02; // a dot also follows dots of other bots, more weakly
-  const W_COHESION = 0.0035;
-  const W_HOME = 0.00035;
-  const W_HOME_ENTER = 0.0026;
+  const SEP_DIST = 95; // long range, so the dots spread over the page
+  const W_SEP = 0.16;
+  const FLOCK_DIST = 110; // alignment reach
+  const W_ALIGN = 0.03;
+  const W_ALIGN_OTHER = 0.012; // a dot also follows dots of other bots, more weakly
+  const W_HOME_ENTER = 0.0026; // an entering dot heads for its own target point
+  const WALL_PAD = 36;
+  const W_WALL = 0.01;
   const W_WANDER = 0.06;
   const V_CRUISE = 0.75; // a dot speeds back up toward this, so the swarm never freezes
   const W_CRUISE = 0.03;
   const LINK_K = 3; // links per dot, to its nearest neighbors
-  const LINK_DIST = 95;
+  const LINK_DIST = 150;
   const MOUSE_DIST = 140;
   const MOUSE_R = 30;
   const W_MOUSE = 1.4;
@@ -115,26 +121,28 @@
     canvas.width = Math.round(W * dpr);
     canvas.height = Math.round(H * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (order.length) {
+      const want = wantPerBot();
+      for (const key of order) bots.get(key).want = want;
+      rebalance(false);
+    }
     if (reduceMotion.matches) placeStill();
+    else start();
   }
 
-  /** The swarm's centre drifts slowly over the page. */
-  function centre(t) {
+  /** A random point well inside the window: where an entering dot heads. */
+  function interior() {
     return {
-      x: W * (0.5 + 0.3 * Math.sin(t * 0.00011)),
-      y: H * (0.52 + 0.24 * Math.sin(t * 0.00017 + 1.3)),
+      x: WALL_PAD + Math.random() * Math.max(1, W - 2 * WALL_PAD),
+      y: WALL_PAD + Math.random() * Math.max(1, H - 2 * WALL_PAD),
     };
   }
 
-  /** Each bot's dots gather loosely around one point on a slow wheel around
-   *  the centre, so the colors group but still mix at the borders. */
-  function home(key, t) {
-    const c = centre(t);
-    const b = bots.get(key);
-    const n = Math.max(order.length, 1);
-    const ring = order.length > 1 ? Math.min(W, H) * 0.2 : 0;
-    const a = ((b?.slot ?? 0) / n) * TAU + t * 0.00009;
-    return { x: c.x + ring * Math.cos(a), y: c.y + ring * Math.sin(a) };
+  /** Dots for each bot in view, from the window area. */
+  function wantPerBot() {
+    if (!order.length) return 0;
+    const total = Math.max(TOTAL_MIN, Math.min(TOTAL_MAX, Math.round((W * H) / AREA_PER_DOT)));
+    return Math.max(PER_BOT_MIN, Math.round(total / order.length));
   }
 
   function edgePoint() {
@@ -171,7 +179,7 @@
       b.family = family || "other";
       bots.set(key, b);
     }
-    const want = order.length ? Math.max(PER_BOT_MIN, Math.min(PER_BOT_MAX, Math.round(TOTAL / order.length))) : 0;
+    const want = wantPerBot();
     order.forEach((key, i) => {
       const b = bots.get(key);
       b.slot = i;
@@ -193,10 +201,10 @@
       const mine = dots.filter((d) => d.key === key);
       const staying = mine.filter((d) => d.state !== "out");
       if (staying.length > b.want) {
-        // Leave with the dots farthest from home first, a few at a time.
-        const h = home(key, clock);
+        // The dots nearest an edge leave first, a few at a time.
+        const edge = (d) => Math.min(d.x, W - d.x, d.y, H - d.y);
         staying
-          .sort((p, q) => Math.hypot(q.x - h.x, q.y - h.y) - Math.hypot(p.x - h.x, p.y - h.y))
+          .sort((p, q) => edge(p) - edge(q))
           .slice(0, staying.length - b.want)
           .forEach((d) => {
             d.state = "out";
@@ -220,7 +228,7 @@
 
   function spawn(key) {
     const p = edgePoint();
-    const h = home(key, clock);
+    const h = interior();
     const dx = h.x - p.x;
     const dy = h.y - p.y;
     const d = Math.hypot(dx, dy) || 1;
@@ -237,6 +245,8 @@
       exitY: 0,
       phase: Math.random() * TAU,
       near: [],
+      tx: h.x,
+      ty: h.y,
     });
   }
 
@@ -263,7 +273,6 @@
       }
     }
 
-    const homes = new Map(order.map((key) => [key, home(key, clock)]));
     const n = dots.length;
     for (let i = 0; i < n; i++) {
       const d = dots[i];
@@ -278,11 +287,18 @@
         fx += ((ex / el) * EXIT_SPEED - d.vx) * 0.06;
         fy += ((ey / el) * EXIT_SPEED - d.vy) * 0.06;
       } else {
-        const h = homes.get(d.key) ?? centre(clock);
-        const w = d.state === "in" ? W_HOME_ENTER : W_HOME;
-        fx += (h.x - d.x) * w;
-        fy += (h.y - d.y) * w;
-        if (d.state === "in" && clock - d.born > SETTLE_MS && !offscreen(d)) d.state = "live";
+        if (d.state === "in") {
+          fx += (d.tx - d.x) * W_HOME_ENTER;
+          fy += (d.ty - d.y) * W_HOME_ENTER;
+          if (clock - d.born > SETTLE_MS && !offscreen(d)) d.state = "live";
+        }
+        // Soft walls: a live dot (or one waiting to leave) turns back before the edge.
+        if (d.state !== "in") {
+          if (d.x < WALL_PAD) fx += (WALL_PAD - d.x) * W_WALL;
+          else if (d.x > W - WALL_PAD) fx += (W - WALL_PAD - d.x) * W_WALL;
+          if (d.y < WALL_PAD) fy += (WALL_PAD - d.y) * W_WALL;
+          else if (d.y > H - WALL_PAD) fy += (H - WALL_PAD - d.y) * W_WALL;
+        }
       }
 
       // Wander: a slowly turning heading for each dot.
@@ -290,14 +306,11 @@
       fx += Math.cos(d.phase) * W_WANDER;
       fy += Math.sin(d.phase) * W_WANDER;
 
-      // Neighbors: separation from every dot; alignment and cohesion with
-      // nearby dots (own bot stronger); and the nearest LINK_K for the net.
+      // Neighbors: separation from every dot; alignment with nearby dots (own
+      // bot stronger); and the nearest LINK_K for the net.
       let ax = 0;
       let ay = 0;
       let aw = 0;
-      let cx = 0;
-      let cy = 0;
-      let cn = 0;
       const near = d.near;
       near.length = 0;
       for (let j = 0; j < n; j++) {
@@ -317,9 +330,6 @@
           ax += o.vx * w;
           ay += o.vy * w;
           aw += w;
-          cx += o.x;
-          cy += o.y;
-          cn++;
         }
         if (s2 < LINK_DIST * LINK_DIST) {
           if (near.length < LINK_K * 2) {
@@ -337,10 +347,6 @@
       if (aw) {
         fx += (ax / aw - d.vx) * W_ALIGN;
         fy += (ay / aw - d.vy) * W_ALIGN;
-      }
-      if (cn) {
-        fx += (cx / cn - d.x) * W_COHESION;
-        fy += (cy / cn - d.y) * W_COHESION;
       }
       // Cruise: speed up a slow dot, so the net keeps moving.
       if (d.state === "live") {
@@ -472,17 +478,15 @@
     ctx.globalAlpha = 1;
   }
 
-  /** Reduce motion: still dots near each bot's home, no flight. */
+  /** Reduce motion: still dots spread over the page, no flight, no net. */
   function placeStill() {
     stop();
     dots = [];
     for (const key of order) {
       const b = bots.get(key);
-      const h = home(key, 0);
       for (let k = 0; k < b.want; k++) {
-        const a = Math.random() * TAU;
-        const r = Math.sqrt(Math.random()) * Math.min(W, H) * 0.14;
-        dots.push({ key, x: h.x + r * Math.cos(a), y: h.y + r * Math.sin(a), vx: 0, vy: 0, state: "live", born: 0, leaveAt: 0, exitX: 0, exitY: 0, phase: 0, near: [] });
+        const p = interior();
+        dots.push({ key, x: p.x, y: p.y, vx: 0, vy: 0, state: "live", born: 0, leaveAt: 0, exitX: 0, exitY: 0, phase: 0, near: [], tx: p.x, ty: p.y });
       }
     }
     for (const key of [...bots.keys()]) if (!order.includes(key)) bots.delete(key);

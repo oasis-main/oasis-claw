@@ -499,3 +499,17 @@ button.button { font: inherit; cursor: pointer; }
 .fb-to { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .fb-to .bot-chip.small { padding: 2px 8px 2px 3px; font-size: 12px; }
 .fb-to .bot-chip.small .bot-icon { width: 18px; height: 18px; }
+
+/* glass panels (Mike, 2026-10-07): the swarm shows through the widgets as a
+   soft blur; light grey in light mode, dark grey in dark mode */
+:root { --glass: rgba(234, 232, 226, 0.66); --glass-blur: blur(3px); }
+@media (prefers-color-scheme: dark) {
+  :root { --glass: rgba(30, 33, 38, 0.64); }
+}
+.card, .table-wrap, .session, .transcript-pane, .doc-text, .diff-text, .fb-drawer, .cui-row {
+  background: var(--glass);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+}
+/* nested blocks inside a glass card need no second layer of tint */
+.card .doc-text, .card .diff-text, .card .table-wrap { background: transparent; -webkit-backdrop-filter: none; backdrop-filter: none; }
