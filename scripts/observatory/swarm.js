@@ -1,9 +1,12 @@
 // Fleet Observatory background swarm (Mike, 2026-10-07, R4).
 //
 // A faint swarm of dots behind the widgets, one color for each bot in view
-// (the bot's role-family color from app.css). The motion follows the
-// oasis-welcome homepage swarm: separation, a soft cursor field with hard
-// contact, damping, and an acceleration cap.
+// (the bot's role-family color from app.css). Each dot links to its nearest
+// neighbors, and three dots that all link to each other fill a faint
+// triangle, so the swarm draws a moving net (a simplicial complex). The dots
+// flock: separation, alignment and cohesion with neighbors of every color, a
+// cruising speed so no dot stops, a soft cursor field with hard contact, and
+// an acceleration cap (the oasis-welcome homepage swarm's glide).
 //
 // The bot bar does not set the dots directly. It sends the bots in view
 // ("observatory:bots"), and each bot's dots then fly in from the screen
@@ -16,29 +19,35 @@
 (function () {
   "use strict";
 
-  const TOTAL = 96; // dots shared by the bots in view
-  const PER_BOT_MIN = 10;
-  const PER_BOT_MAX = 22;
-  const SPAWN_EVERY_MS = 70; // per bot, while it is short of dots
+  const TOTAL = 180; // dots shared by the bots in view
+  const PER_BOT_MIN = 24;
+  const PER_BOT_MAX = 60;
+  const SPAWN_EVERY_MS = 40; // per bot, while it is short of dots
   const LEAVE_STAGGER_MS = 900;
   const SETTLE_MS = 900; // an entering dot joins the swarm after this long on screen
 
-  const DOT_R = 2.1;
-  const SEP_DIST = 26;
-  const W_SEP = 0.55;
-  const ALIGN_DIST = 60;
-  const W_ALIGN = 0.035;
-  const W_HOME = 0.0011;
+  const DOT_R = 1.8;
+  const SEP_DIST = 24;
+  const W_SEP = 0.5;
+  const FLOCK_DIST = 70; // alignment and cohesion reach
+  const W_ALIGN = 0.05;
+  const W_ALIGN_OTHER = 0.02; // a dot also follows dots of other bots, more weakly
+  const W_COHESION = 0.0035;
+  const W_HOME = 0.00035;
   const W_HOME_ENTER = 0.0026;
-  const W_WANDER = 0.045;
+  const W_WANDER = 0.06;
+  const V_CRUISE = 0.75; // a dot speeds back up toward this, so the swarm never freezes
+  const W_CRUISE = 0.03;
+  const LINK_K = 3; // links per dot, to its nearest neighbors
+  const LINK_DIST = 95;
   const MOUSE_DIST = 140;
   const MOUSE_R = 30;
   const W_MOUSE = 1.4;
   const CURSOR_REST = 0.25;
   const CURSOR_MIN_OUT = 0.8;
-  const DAMPING = 0.95;
+  const DAMPING = 0.985;
   const ACC_CAP = 0.22;
-  const V_CAP = 1.5;
+  const V_CAP = 1.6;
   const V_CAP_FLIGHT = 2.8;
   const EXIT_SPEED = 2.4;
   const EDGE_OUT = 14; // a dot spawns and despawns this far past the edge
@@ -112,8 +121,8 @@
   /** The swarm's centre drifts slowly over the page. */
   function centre(t) {
     return {
-      x: W * (0.5 + 0.26 * Math.sin(t * 0.000061)),
-      y: H * (0.52 + 0.2 * Math.sin(t * 0.000093 + 1.3)),
+      x: W * (0.5 + 0.3 * Math.sin(t * 0.00011)),
+      y: H * (0.52 + 0.24 * Math.sin(t * 0.00017 + 1.3)),
     };
   }
 
@@ -123,8 +132,8 @@
     const c = centre(t);
     const b = bots.get(key);
     const n = Math.max(order.length, 1);
-    const ring = order.length > 1 ? Math.min(W, H) * 0.17 : 0;
-    const a = ((b?.slot ?? 0) / n) * TAU + t * 0.000045;
+    const ring = order.length > 1 ? Math.min(W, H) * 0.2 : 0;
+    const a = ((b?.slot ?? 0) / n) * TAU + t * 0.00009;
     return { x: c.x + ring * Math.cos(a), y: c.y + ring * Math.sin(a) };
   }
 
@@ -227,6 +236,7 @@
       exitX: 0,
       exitY: 0,
       phase: Math.random() * TAU,
+      near: [],
     });
   }
 
@@ -235,6 +245,15 @@
   function step(dt) {
     clock += dt;
     const f = dt / 16.67; // the forces are tuned per 60 Hz frame
+
+    // Remove departed dots first: the neighbor indices built below must
+    // match the array that draw() reads.
+    // A dot that left the screen is gone. A dot that is "out" but still
+    // waiting to leave stays until its turn.
+    dots = dots.filter((d) => !(d.state === "out" && clock >= d.leaveAt && offscreen(d)));
+    for (const [key, b] of bots) {
+      if (!b.want && !order.includes(key) && !dots.some((d) => d.key === key)) bots.delete(key);
+    }
 
     for (const [key, b] of bots) {
       const staying = dots.reduce((n, d) => n + (d.key === key && d.state !== "out" ? 1 : 0), 0);
@@ -271,10 +290,16 @@
       fx += Math.cos(d.phase) * W_WANDER;
       fy += Math.sin(d.phase) * W_WANDER;
 
-      // Separation from every dot; alignment with dots of the same bot.
+      // Neighbors: separation from every dot; alignment and cohesion with
+      // nearby dots (own bot stronger); and the nearest LINK_K for the net.
       let ax = 0;
       let ay = 0;
-      let an = 0;
+      let aw = 0;
+      let cx = 0;
+      let cy = 0;
+      let cn = 0;
+      const near = d.near;
+      near.length = 0;
       for (let j = 0; j < n; j++) {
         if (j === i) continue;
         const o = dots[j];
@@ -287,15 +312,42 @@
           fx += (sx / s) * str * W_SEP;
           fy += (sy / s) * str * W_SEP;
         }
-        if (o.key === d.key && s2 < ALIGN_DIST * ALIGN_DIST) {
-          ax += o.vx;
-          ay += o.vy;
-          an++;
+        if (s2 < FLOCK_DIST * FLOCK_DIST) {
+          const w = o.key === d.key ? 1 : W_ALIGN_OTHER / W_ALIGN;
+          ax += o.vx * w;
+          ay += o.vy * w;
+          aw += w;
+          cx += o.x;
+          cy += o.y;
+          cn++;
+        }
+        if (s2 < LINK_DIST * LINK_DIST) {
+          if (near.length < LINK_K * 2) {
+            near.push(j, s2);
+          } else {
+            let worst = 1;
+            for (let q = 3; q < near.length; q += 2) if (near[q] > near[worst]) worst = q;
+            if (s2 < near[worst]) {
+              near[worst - 1] = j;
+              near[worst] = s2;
+            }
+          }
         }
       }
-      if (an) {
-        fx += (ax / an - d.vx) * W_ALIGN;
-        fy += (ay / an - d.vy) * W_ALIGN;
+      if (aw) {
+        fx += (ax / aw - d.vx) * W_ALIGN;
+        fy += (ay / aw - d.vy) * W_ALIGN;
+      }
+      if (cn) {
+        fx += (cx / cn - d.x) * W_COHESION;
+        fy += (cy / cn - d.y) * W_COHESION;
+      }
+      // Cruise: speed up a slow dot, so the net keeps moving.
+      if (d.state === "live") {
+        const sp0 = Math.hypot(d.vx, d.vy) || 1e-6;
+        const k = (V_CRUISE - sp0) * W_CRUISE;
+        fx += (d.vx / sp0) * k;
+        fy += (d.vy / sp0) * k;
       }
 
       // Cursor: a soft field, then a hard contact that pushes the dot out.
@@ -350,17 +402,63 @@
     mvx *= 0.5;
     mvy *= 0.5;
 
-    // A dot that left the screen is gone. A dot that is "out" but still
-    // waiting to leave stays until its turn.
-    dots = dots.filter((d) => !(d.state === "out" && clock >= d.leaveAt && offscreen(d)));
-    for (const [key, b] of bots) {
-      if (!b.want && !order.includes(key) && !dots.some((d) => d.key === key)) bots.delete(key);
+  }
+
+  /** The net: a link from each dot to its nearest neighbors (fading with
+   *  distance), and a faint triangle where three dots link to each other.
+   *  A link inside one bot's dots takes that bot's color; a link between two
+   *  bots is neutral. */
+  function drawNet(strength) {
+    const neutral = darkScheme.matches ? "rgb(200,198,190)" : "rgb(110,108,100)";
+    const linked = new Set();
+    const key = (a, b) => (a < b ? a * 65536 + b : b * 65536 + a);
+    for (let i = 0; i < dots.length; i++) {
+      const nb = dots[i].near;
+      for (let q = 0; q < nb.length; q += 2) linked.add(key(i, nb[q]));
+    }
+    // Triangles first, under the links.
+    ctx.globalAlpha = 0.035 * strength;
+    for (let i = 0; i < dots.length; i++) {
+      const nb = dots[i].near;
+      for (let p = 0; p < nb.length; p += 2) {
+        for (let q = p + 2; q < nb.length; q += 2) {
+          const j = nb[p];
+          const k = nb[q];
+          if (!(i < j && i < k) || !linked.has(key(j, k))) continue;
+          const a = dots[i];
+          const b = dots[j];
+          const c = dots[k];
+          if (!b || !c) continue;
+          ctx.fillStyle = a.key === b.key && b.key === c.key ? bots.get(a.key)?.color ?? neutral : neutral;
+          ctx.beginPath();
+          ctx.moveTo(a.x, a.y);
+          ctx.lineTo(b.x, b.y);
+          ctx.lineTo(c.x, c.y);
+          ctx.closePath();
+          ctx.fill();
+        }
+      }
+    }
+    ctx.lineWidth = 0.7;
+    for (const lk of linked) {
+      const a = dots[Math.floor(lk / 65536)];
+      const b = dots[lk % 65536];
+      if (!a || !b) continue;
+      const dist = Math.hypot(a.x - b.x, a.y - b.y);
+      ctx.globalAlpha = 0.16 * strength * Math.max(0, 1 - dist / LINK_DIST);
+      ctx.strokeStyle = a.key === b.key ? bots.get(a.key)?.color ?? neutral : neutral;
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
     }
   }
 
   function draw() {
     ctx.clearRect(0, 0, W, H);
-    ctx.globalAlpha = darkScheme.matches ? 0.42 : 0.34;
+    const strength = darkScheme.matches ? 1.25 : 1;
+    drawNet(strength);
+    ctx.globalAlpha = darkScheme.matches ? 0.3 : 0.24;
     for (const key of new Set(dots.map((d) => d.key))) {
       ctx.fillStyle = bots.get(key)?.color ?? "rgb(128,128,128)";
       ctx.beginPath();
@@ -384,7 +482,7 @@
       for (let k = 0; k < b.want; k++) {
         const a = Math.random() * TAU;
         const r = Math.sqrt(Math.random()) * Math.min(W, H) * 0.14;
-        dots.push({ key, x: h.x + r * Math.cos(a), y: h.y + r * Math.sin(a), vx: 0, vy: 0, state: "live", born: 0, leaveAt: 0, exitX: 0, exitY: 0, phase: 0 });
+        dots.push({ key, x: h.x + r * Math.cos(a), y: h.y + r * Math.sin(a), vx: 0, vy: 0, state: "live", born: 0, leaveAt: 0, exitX: 0, exitY: 0, phase: 0, near: [] });
       }
     }
     for (const key of [...bots.keys()]) if (!order.includes(key)) bots.delete(key);
@@ -455,5 +553,6 @@
         }),
       ),
     running: () => raf !== 0,
+    meanSpeed: () => (dots.length ? dots.reduce((a, d) => a + Math.hypot(d.vx, d.vy), 0) / dots.length : 0),
   };
 })();
