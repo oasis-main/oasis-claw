@@ -46,8 +46,12 @@
 //
 // WHAT IT DOES NOT DO
 //   - It adds no X-Forwarded-For / Forwarded / X-Real-IP, and it strips any a
-//     client sends. The gateway sees the proxy's own address, which is not
-//     loopback, so every browser still goes through device pairing.
+//     client sends. The gateway sees the proxy's own private address. With the
+//     loopback Host, the rewritten loopback Origin and the shared gateway
+//     token, openclaw classes the browser as "browser_container_local"
+//     (handshake-auth-helpers.ts resolvePairingLocality) and pairs it without
+//     an approval (measured 2026-10-07 on Kolmogorov and House). So the gateway
+//     token is the gate for a browser, not device pairing.
 //   - It carries no gateway token, and it removes its own cookie before
 //     forwarding. Each gateway still requires its own token.
 //   - It binds only LISTEN_HOST. The compose file pins that to the container's
@@ -228,6 +232,9 @@ function unlockPage(nonce) {
 (function () {
   var msg = document.getElementById("msg");
   var m = location.hash.match(/(?:^#|&)k=([A-Za-z0-9_-]{32,256})/);
+  // The observatory may add the bot's gateway token. It goes on to the
+  // Control UI in the fragment only (the UI reads #token= and then removes it).
+  var t = location.hash.match(/(?:^#|&)token=([A-Za-z0-9_-]{16,256})/);
   history.replaceState(null, "", location.pathname);
   if (!m) {
     msg.textContent = "This address carries no key. Open the bot from the observatory, or run: make control-ui BOT=<bot>";
@@ -235,7 +242,7 @@ function unlockPage(nonce) {
   }
   fetch(location.pathname, { method: "POST", headers: { "content-type": "text/plain" }, body: m[1], credentials: "same-origin" })
     .then(function (r) {
-      if (r.ok) { location.replace("/"); } else { msg.textContent = "The proxy refused this key (HTTP " + r.status + ")."; }
+      if (r.ok) { location.replace(t ? "/chat?session=main#token=" + t[1] : "/"); } else { msg.textContent = "The proxy refused this key (HTTP " + r.status + ")."; }
     })
     .catch(function (e) { msg.textContent = "Unlock failed: " + e.message; });
 })();

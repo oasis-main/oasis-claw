@@ -14,6 +14,7 @@ import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import vm from "node:vm";
 import { test } from "node:test";
 import {
   COOKIE_NAME,
@@ -271,4 +272,34 @@ test("an unreachable target yields 502, not a hang", async () => {
   } finally {
     server.close();
   }
+});
+
+test("unlock page: hands a gateway token on to the Control UI in the fragment only", async () => {
+  await withUpstream(async ({ port }) => {
+    const page = await request(port, { pathname: UNLOCK_PATH });
+    const script = page.data.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)[1];
+    const run = async (hash, ok = true) => {
+      const seen = { replaced: null, cleaned: null, posted: null };
+      const sandbox = {
+        location: { hash, pathname: UNLOCK_PATH, replace: (u) => (seen.replaced = u) },
+        history: { replaceState: (_s, _t, u) => (seen.cleaned = u) },
+        document: { getElementById: () => ({ textContent: "" }) },
+        fetch: async (_u, init) => {
+          seen.posted = init.body;
+          return { ok, status: ok ? 204 : 403 };
+        },
+      };
+      vm.runInNewContext(script, sandbox);
+      await new Promise((r) => setImmediate(r));
+      return seen;
+    };
+    const gw = "a1".repeat(32);
+    const withToken = await run(`#k=${KEY}&token=${gw}`);
+    assert.equal(withToken.cleaned, UNLOCK_PATH, "the address bar loses the key and the token at once");
+    assert.equal(withToken.posted, KEY, "only the key goes to the proxy");
+    assert.equal(withToken.replaced, `/chat?session=main#token=${gw}`);
+    assert.equal((await run(`#k=${KEY}`)).replaced, "/", "no token: the old landing page");
+    assert.equal((await run(`#k=${KEY}&token=bad"<x>`)).replaced, "/", "a malformed token is dropped");
+    assert.equal((await run(`#k=${KEY}&token=${gw}`, false)).replaced, null, "a refused key goes nowhere");
+  });
 });

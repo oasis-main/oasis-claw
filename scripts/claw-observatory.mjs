@@ -39,10 +39,17 @@
 //      not a regular file.
 //   4. The snapshot never copies identity/device.json (the device private
 //      key), openclaw.json, tokens, or transcripts.
-//   5. The only writes the API takes are change requests (/api/feedback). A
-//      write needs the token AND this page's Origin. The requests and their
-//      screenshots stay in the state folder, which no bot mounts: a screenshot
-//      can show any agent's memory.
+//   5. The only writes the API takes are change requests (/api/feedback) and
+//      the Control UI open and approve (item 7). A write needs the token AND
+//      this page's Origin. The requests and their screenshots stay in the
+//      state folder, which no bot mounts: a screenshot can show any agent's
+//      memory.
+//   7. Control UI (Mike, 2026-10-07, R2): on Mike's click, POST
+//      /api/control-ui/<bot>/open reads that bot's gateway token and returns
+//      it to this page in a URL fragment only, as `openclaw dashboard` does.
+//      This server keeps no copy and never logs it. The approve route pairs
+//      only a Control UI browser, never from the container's loopback, and
+//      only for a few minutes after that open (judgeControlUiRequest).
 //   6. `serve` also starts the dot_swarm dashboard (`swarm gui`, 18781), where
 //      the human claims, finishes, blocks and comments on items. A bot can
 //      reach that port too, so the observatory starts it only after it proves
@@ -118,6 +125,7 @@ const ASSETS = {
   "/index.html": ["index.html", "text/html; charset=utf-8"],
   "/app.js": ["app.js", "text/javascript; charset=utf-8"],
   "/app.css": ["app.css", "text/css; charset=utf-8"],
+  "/swarm.js": ["swarm.js", "text/javascript; charset=utf-8"],
 };
 
 // ── process helpers ──────────────────────────────────────────────────────────
@@ -407,6 +415,99 @@ export function withOpenUrls(fleet, key) {
   };
 }
 
+// ── one-click Control UI (Mike, 2026-10-07, R2) ──────────────────────────────
+// A Control UI shows the chat only after three steps: the port proxy cookie
+// (sandboxed bots), the bot's gateway token, and a paired browser device.
+// Without the token the gateway closes the socket as unauthorized, and the UI
+// reports only "Could not connect". So the page asks this server for a
+// signed-in address (POST .../open), and then pairs the browser it opened
+// (POST .../approve).
+
+export const CONTROL_UI_CLIENT = "openclaw-control-ui";
+const GATEWAY_TOKEN_RE = /^[A-Za-z0-9_-]{16,256}$/;
+const REQUEST_ID_RE = /^[A-Za-z0-9_-]{4,128}$/;
+/** How long after an open the observatory accepts a pairing for that bot. */
+export const PAIRING_WINDOW_MS = 3 * 60 * 1000;
+
+/** Collector: the gateway token that the entrypoint wrote into openclaw.json
+ *  on this boot, which is the token the gateway checks. Only the open route
+ *  calls this collector; the snapshot and every other route never do. */
+export function collectGatewayToken(fs, path, home) {
+  try {
+    const auth = (JSON.parse(fs.readFileSync(path.join(home, "openclaw.json"), "utf8")).gateway || {}).auth || {};
+    return { mode: auth.mode || null, token: typeof auth.token === "string" ? auth.token : null };
+  } catch {
+    return { mode: null, token: null };
+  }
+}
+
+/** The address that opens `bot`'s Control UI signed in. The key and the token
+ *  are in the fragment, which a browser never sends to a server. */
+export function controlUiSignedInUrl(bot, { proxyKey, gatewayToken }) {
+  const base = bot?.controlUi?.url;
+  if (!base) return null;
+  if (!GATEWAY_TOKEN_RE.test(String(gatewayToken ?? ""))) throw new Error(`${bot.key}: no usable gateway token`);
+  if (bot.controlUi.via === "proxy") {
+    return proxyKey ? `${base}__claw-proxy/unlock#k=${proxyKey}&token=${gatewayToken}` : null;
+  }
+  return `${base}chat?session=main#token=${gatewayToken}`;
+}
+
+/** May the observatory approve this pending pairing request? Only a Control UI
+ *  browser: a bot's own CLI or gateway client asking for more scopes is a
+ *  privilege grant that Mike makes by hand (`make pair`). Never a client on the
+ *  container's loopback, because the bot itself holds its own token. Only
+ *  within PAIRING_WINDOW_MS after Mike opened the UI from this page (`armedAt`).
+ *  `viaProxy` marks a request that came through the port proxy, which a
+ *  browser reaches only with the access key; the page approves those without
+ *  a second click. */
+export function judgeControlUiRequest(request, { proxyAddresses = [], armedAt = null, now = Date.now() } = {}) {
+  if (request?.clientId !== CONTROL_UI_CLIENT) return { ok: false, reason: "not a Control UI browser" };
+  const ip = String(request.remoteIp ?? "").replace(/^::ffff:/, "");
+  if (!ip || ip === "::1" || ip.startsWith("127.")) return { ok: false, reason: "made inside the bot's container" };
+  if (armedAt == null || now - armedAt > PAIRING_WINDOW_MS) {
+    return { ok: false, reason: "open the Control UI from the observatory first" };
+  }
+  return { ok: true, viaProxy: proxyAddresses.includes(ip) };
+}
+
+async function listDevices(container) {
+  const raw = await docker(["exec", container, "openclaw", "devices", "list", "--json"], { timeoutMs: 30_000 });
+  const data = JSON.parse(raw.slice(raw.indexOf("{")));
+  return { pending: data.pending ?? [], paired: data.paired ?? [] };
+}
+
+/** Collector: the pending device pairing requests, read from the gateway's
+ *  own file (devices/pending.json). Starting `openclaw devices list` takes
+ *  about 5 s; this read takes well under 1 s, so the page can poll it.
+ *  Expiry follows openclaw (pairing-files.ts pruneExpiredPending, 5 min TTL).
+ *  The public key and any other field stay inside the container. */
+export function collectPendingPairing(fs, path, home, nowArg) {
+  const TTL_MS = 5 * 60 * 1000;
+  const now = Number(nowArg) || Date.now();
+  let raw = {};
+  try {
+    raw = JSON.parse(fs.readFileSync(path.join(home, "devices", "pending.json"), "utf8")) || {};
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const r of Object.values(raw)) {
+    if (!r || typeof r !== "object" || typeof r.requestId !== "string") continue;
+    const seen = Number(r.refreshedAtMs || r.ts);
+    if (!(now - seen <= TTL_MS)) continue;
+    out.push({
+      requestId: r.requestId,
+      clientId: typeof r.clientId === "string" ? r.clientId : null,
+      platform: typeof r.platform === "string" ? r.platform : null,
+      remoteIp: typeof r.remoteIp === "string" ? r.remoteIp : null,
+      scopes: Array.isArray(r.scopes) ? r.scopes.filter((x) => typeof x === "string") : [],
+      ts: Number(r.ts) || null,
+    });
+  }
+  return out;
+}
+
 export function describeBot(inspect, routes, exclude = EXCLUDE_RE) {
   const container = String(inspect?.Name ?? "").replace(/^\//, "");
   const mounts = inspect?.Mounts ?? [];
@@ -522,7 +623,16 @@ export async function discoverFleet() {
   return {
     bots,
     proxy: proxyInspect
-      ? { state: proxyInspect.State?.Status ?? "unknown", health: proxyInspect.State?.Health?.Status ?? null, routes }
+      ? {
+          state: proxyInspect.State?.Status ?? "unknown",
+          health: proxyInspect.State?.Health?.Status ?? null,
+          routes,
+          // A gateway sees a proxied browser at one of these addresses
+          // (approveControlUiRequest uses them).
+          addresses: Object.values(proxyInspect.NetworkSettings?.Networks ?? {})
+            .map((n) => n?.IPAddress)
+            .filter(Boolean),
+        }
       : null,
   };
 }
@@ -1486,6 +1596,8 @@ const SECURITY_HEADERS = {
 
 const WRITE_METHODS = new Set(["POST", "PUT", "DELETE"]);
 const isFeedbackPath = (pathname) => pathname === "/api/feedback" || pathname.startsWith("/api/feedback/");
+const CONTROL_UI_PATH_RE = /^\/api\/control-ui\/([a-z0-9-]{1,40})\/(open|approve|pairing)$/;
+const isControlUiWrite = (pathname) => ["open", "approve"].includes(CONTROL_UI_PATH_RE.exec(pathname)?.[2]);
 
 /** Refuse anything that did not come from a page this server served on
  *  loopback. Returns null when the request may proceed. */
@@ -1501,7 +1613,8 @@ export function checkRequest(req, port) {
   if (req.method === "GET" || req.method === "HEAD") {
     return null;
   }
-  if (!WRITE_METHODS.has(req.method) || !isFeedbackPath(String(req.url ?? "").split("?")[0])) {
+  const pathname = String(req.url ?? "").split("?")[0];
+  if (!WRITE_METHODS.has(req.method) || !(isFeedbackPath(pathname) || isControlUiWrite(pathname))) {
     return { status: 405, error: "read-only" };
   }
   // A browser always sends Origin with a POST, PUT or DELETE fetch. A write
@@ -1805,6 +1918,64 @@ const publicItem = (item) => ({
   attachments: item.attachments.map(({ path: _hidden, ...rest }) => rest),
 });
 
+/** /api/control-ui/<bot>/{open,pairing,approve}. Returns [status, json].
+ *  open      POST  the signed-in address, and start the pairing window
+ *  pairing   GET   pending Control UI requests for this bot, judged
+ *  approve   POST  {requestId}: pair that browser (judged again here) */
+async function routeControlUi(req, url, ctx) {
+  const [, key, action] = CONTROL_UI_PATH_RE.exec(url.pathname) ?? [];
+  if (!key) return [404, { error: "not found" }];
+  const fleet = await cached(ctx, "fleet", 4000, ctx.discover);
+  const bot = fleet.bots.find((b) => b.key === key);
+  if (!bot) return [404, { error: `unknown bot "${key}"` }];
+  if (!bot.running) return [409, { error: `${bot.container} is ${bot.state}` }];
+  const judge = (r) => judgeControlUiRequest(r, { proxyAddresses: fleet.proxy?.addresses ?? [], armedAt: ctx.pairingArmed.get(key) ?? null });
+
+  if (action === "open" && req.method === "POST") {
+    const { mode, token } = await ctx.readGatewayToken(bot);
+    if (mode !== "token") return [409, { error: `${bot.key}: gateway auth mode is ${mode ?? "unknown"}, not token` }];
+    const openUrl = controlUiSignedInUrl(bot, { proxyKey: ctx.proxyKey(), gatewayToken: token });
+    if (!openUrl) return [409, { error: `${bot.key} has no reachable Control UI (${bot.controlUi.via})` }];
+    ctx.pairingArmed.set(key, Date.now());
+    return [200, { url: openUrl }];
+  }
+  if (action === "pairing" && req.method === "GET") {
+    const pending = await ctx.readPendingPairing(bot);
+    return [
+      200,
+      {
+        pending: pending
+          .filter((r) => r.clientId === CONTROL_UI_CLIENT)
+          .map((r) => ({
+            requestId: r.requestId,
+            platform: r.platform ?? null,
+            remoteIp: r.remoteIp ?? null,
+            scopes: r.scopes ?? [],
+            ts: r.ts ?? null,
+            ...judge(r),
+          })),
+      },
+    ];
+  }
+  if (action === "approve" && req.method === "POST") {
+    let requestId;
+    try {
+      requestId = JSON.parse((await readBody(req, 1024)).toString("utf8")).requestId;
+    } catch (err) {
+      if (err.status) throw err;
+      return [400, { error: "the body is not valid JSON" }];
+    }
+    if (!REQUEST_ID_RE.test(String(requestId ?? ""))) return [400, { error: "invalid request id" }];
+    const request = (await ctx.readPendingPairing(bot)).find((r) => r.requestId === requestId);
+    if (!request) return [404, { error: "no such pending request" }];
+    const verdict = judge(request);
+    if (!verdict.ok) return [403, { error: verdict.reason }];
+    await ctx.approveDevice(bot.container, requestId);
+    return [200, { approved: requestId }];
+  }
+  return [405, { error: "method not allowed here" }];
+}
+
 async function routeApi(url, ctx) {
   const parts = url.pathname.split("/").filter(Boolean);
   const fleet = () => cached(ctx, "fleet", 4000, ctx.discover);
@@ -1913,6 +2084,11 @@ export function createObservatoryServer(ctx) {
   ctx.mailRoot ??= MAIL_ROOT;
   ctx.snapshotDir ??= DEFAULT_SNAPSHOT_DIR;
   ctx.proxyKey ??= () => ensureProxyKey();
+  ctx.pairingArmed ??= new Map();
+  ctx.readGatewayToken ??= (bot) => collect(bot.container, collectGatewayToken);
+  ctx.readPendingPairing ??= (bot) => collect(bot.container, collectPendingPairing);
+  ctx.approveDevice ??= (container, requestId) =>
+    docker(["exec", container, "openclaw", "devices", "approve", requestId, "--json"], { timeoutMs: 30_000 });
   ctx.feedbackStore ??= lazyFeedbackStore();
   ctx.identities ??= identityStore(IDENTITY_DIR);
   ctx.identityRefreshing ??= new Set();
@@ -1978,6 +2154,13 @@ export function createObservatoryServer(ctx) {
           if (err.status === 413) res.once("finish", () => req.destroy());
           sendJson(res, err.status ?? 500, { error: err.message });
         },
+      );
+      return;
+    }
+    if (CONTROL_UI_PATH_RE.test(url.pathname)) {
+      routeControlUi(req, url, ctx).then(
+        ([status, body]) => sendJson(res, status, body),
+        (err) => sendJson(res, err.status ?? 502, { error: err.message }),
       );
       return;
     }
@@ -2075,10 +2258,7 @@ async function cmdPair(target, flags) {
     console.log(out.trim());
     return;
   }
-  const raw = await docker(["exec", bot.container, "openclaw", "devices", "list", "--json"], { timeoutMs: 30_000 });
-  const data = JSON.parse(raw.slice(raw.indexOf("{")));
-  const pending = data.pending ?? [];
-  const paired = data.paired ?? [];
+  const { pending, paired } = await listDevices(bot.container);
   console.log(`${bot.key}: ${paired.length} paired (${paired.map((d) => d.clientId ?? "?").join(", ") || "none"}), ${pending.length} pending`);
   for (const p of pending) {
     const fields = ["requestId", "clientId", "clientMode", "platform", "displayName", "remoteIp"]

@@ -29,8 +29,12 @@ import {
   collectSessions,
   collectSnapshot,
   collectTranscript,
+  collectGatewayToken,
+  collectPendingPairing,
   collectorScript,
+  CONTROL_UI_CLIENT,
   controlUiFor,
+  controlUiSignedInUrl,
   createObservatoryServer,
   declaredPort,
   describeBot,
@@ -39,6 +43,8 @@ import {
   identityStore,
   hostPathFor,
   isSnapshotPath,
+  judgeControlUiRequest,
+  PAIRING_WINDOW_MS,
   mailSummary,
   parseFlags,
   parseHealth,
@@ -531,6 +537,10 @@ test("server: page carries CSP, API needs the token, hostile requests are refuse
     assert.equal(page.status, 200);
     assert.match(page.headers["content-security-policy"], /script-src 'self'/);
     assert.match(page.body, /Fleet Observatory/);
+    assert.match(page.body, /<script src="\/swarm\.js" defer><\/script>\s*<script src="\/app\.js" defer>/, "swarm.js loads first, so it hears the first bot-bar event");
+    const swarm = await call("/swarm.js");
+    assert.equal(swarm.status, 200);
+    assert.match(swarm.headers["content-type"], /text\/javascript/);
     assert.equal((await call("/api/fleet")).status, 401);
     const fleet = await call("/api/fleet", { headers: auth });
     assert.equal(fleet.status, 200);
@@ -697,4 +707,171 @@ test("excludePattern: env first, then the state-folder file, else nothing", () =
   assert.ok(!fromFile.test("hidden on this host"), "a comment line is not a pattern");
   const fromEnv = excludePattern({ OASIS_OBSERVATORY_EXCLUDE: "other" }, dir);
   assert.ok(fromEnv.test("other") && !fromEnv.test("corp-a"), "the env var wins over the file");
+});
+
+// ── one-click Control UI (R2, 2026-10-07) ─────────────────────────────────────
+
+const GW = "a1".repeat(32);
+
+test("controlUiSignedInUrl puts the key and the gateway token in the fragment only", () => {
+  const proxied = { key: "kolmogorov", controlUi: { url: "http://127.0.0.1:18890/", via: "proxy" } };
+  const direct = { key: "nimbus", controlUi: { url: "http://127.0.0.1:18789/", via: "direct" } };
+  const key = "k".repeat(43);
+  assert.equal(
+    controlUiSignedInUrl(proxied, { proxyKey: key, gatewayToken: GW }),
+    `http://127.0.0.1:18890/__claw-proxy/unlock#k=${key}&token=${GW}`,
+  );
+  assert.equal(controlUiSignedInUrl(direct, { proxyKey: key, gatewayToken: GW }), `http://127.0.0.1:18789/chat?session=main#token=${GW}`);
+  for (const url of [controlUiSignedInUrl(proxied, { proxyKey: key, gatewayToken: GW }), controlUiSignedInUrl(direct, { gatewayToken: GW })]) {
+    assert.ok(!new URL(url).search.includes(GW) && !new URL(url).pathname.includes(GW), "the token is never in the path or query");
+  }
+  assert.equal(controlUiSignedInUrl(proxied, { proxyKey: null, gatewayToken: GW }), null);
+  assert.equal(controlUiSignedInUrl({ key: "x", controlUi: { url: null, via: "unpublished" } }, { gatewayToken: GW }), null);
+  assert.throws(() => controlUiSignedInUrl(direct, { gatewayToken: null }), /no usable gateway token/);
+  assert.throws(() => controlUiSignedInUrl(direct, { gatewayToken: "abc&k=evil#x" }), /no usable gateway token/);
+});
+
+test("collectGatewayToken is self-contained and reads only gateway.auth", () => {
+  const home = tmp("obs-gw-");
+  fs.writeFileSync(path.join(home, "openclaw.json"), JSON.stringify({ gateway: { auth: { mode: "token", token: GW } }, models: { secret: "x" } }));
+  assert.deepEqual(collectGatewayToken(fs, path, home), { mode: "token", token: GW });
+  const out = execFileSync(process.execPath, ["-e", collectorScript(collectGatewayToken, home)], { encoding: "utf8" });
+  assert.deepEqual(JSON.parse(out), { mode: "token", token: GW });
+  assert.deepEqual(collectGatewayToken(fs, path, tmp("obs-gw-none-")), { mode: null, token: null });
+});
+
+test("judgeControlUiRequest: a Control UI browser, not from loopback, inside the window after an open", () => {
+  const now = 1_000_000_000;
+  const opts = { proxyAddresses: ["172.30.0.3"], armedAt: now - 10_000, now };
+  const req = (over = {}) => ({ requestId: "r1", clientId: CONTROL_UI_CLIENT, remoteIp: "172.30.0.3", ts: now - 1000, ...over });
+  assert.deepEqual(judgeControlUiRequest(req(), opts), { ok: true, viaProxy: true });
+  assert.deepEqual(judgeControlUiRequest(req({ remoteIp: "::ffff:172.30.0.3" }), opts), { ok: true, viaProxy: true });
+  assert.deepEqual(judgeControlUiRequest(req({ remoteIp: "192.168.65.1" }), opts), { ok: true, viaProxy: false });
+  assert.equal(judgeControlUiRequest(req({ clientId: "cli" }), opts).ok, false, "a bot's own CLI scope upgrade is Mike's call");
+  assert.equal(judgeControlUiRequest(req({ clientId: "gateway-client" }), opts).ok, false);
+  for (const ip of ["127.0.0.1", "::1", "::ffff:127.0.0.1", "", undefined]) {
+    assert.equal(judgeControlUiRequest(req({ remoteIp: ip }), opts).ok, false, `loopback or unknown ${ip}`);
+  }
+  assert.equal(judgeControlUiRequest(req(), { ...opts, armedAt: null }).ok, false, "no open from the observatory");
+  assert.equal(judgeControlUiRequest(req(), { ...opts, armedAt: now - PAIRING_WINDOW_MS - 1 }).ok, false, "window closed");
+});
+
+test("checkRequest admits POST only to the Control UI open and approve routes", () => {
+  const own = { host: "127.0.0.1:18780", origin: "http://127.0.0.1:18780" };
+  const r = (method, url, headers = own) => ({ method, url, headers });
+  assert.equal(checkRequest(r("POST", "/api/control-ui/house/open"), 18780), null);
+  assert.equal(checkRequest(r("POST", "/api/control-ui/house/approve"), 18780), null);
+  assert.equal(checkRequest(r("POST", "/api/control-ui/house/pairing"), 18780).status, 405);
+  assert.equal(checkRequest(r("POST", "/api/control-ui/house/open/x"), 18780).status, 405);
+  assert.equal(checkRequest(r("POST", "/api/control-ui/House/open"), 18780).status, 405);
+  assert.equal(checkRequest(r("POST", "/api/control-ui/house/open", { host: own.host }), 18780).status, 403, "a write needs Origin");
+  assert.equal(checkRequest(r("POST", "/api/control-ui/house/open", { ...own, origin: "http://127.0.0.1:18890" }), 18780).status, 403);
+});
+
+test("server: Control UI open returns the signed-in address; approve pairs only a judged request", async () => {
+  const pending = [];
+  const approved = [];
+  const ctx = {
+    port: 0,
+    token: "t".repeat(43),
+    discover: async () => ({
+      bots: [
+        { key: "kolmogorov", container: "oasis-claw-kolmogorov", running: true, state: "running", controlUi: { url: "http://127.0.0.1:18890/", via: "proxy" }, board: null },
+        { key: "down", container: "oasis-claw-down", running: false, state: "exited", controlUi: { url: "http://127.0.0.1:18899/", via: "proxy" }, board: null },
+      ],
+      proxy: { state: "running", routes: [], addresses: ["172.30.0.3", "172.29.186.2"] },
+    }),
+    swarm: { port: 1, url: "http://127.0.0.1:1/" },
+    snapshotDir: tmp("obs-empty-"),
+    mailRoot: tmp("obs-mail-empty-"),
+    proxyKey: () => "k".repeat(43),
+    identities: identityStore(tmp("obs-ident-")),
+    readIdentity: async () => ({ name: "Kolmogorov", role: null, avatar: null }),
+    readGatewayToken: async () => ({ mode: "token", token: GW }),
+    readPendingPairing: async () => pending,
+    approveDevice: async (container, id) => approved.push([container, id]),
+  };
+  const server = createObservatoryServer(ctx);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  ctx.port = server.address().port;
+  const own = `http://127.0.0.1:${ctx.port}`;
+  const call = (pathname, { method = "GET", body, origin = own, token = ctx.token } = {}) =>
+    new Promise((resolve, reject) => {
+      const headers = { host: `127.0.0.1:${ctx.port}`, "x-observatory-token": token };
+      if (method !== "GET") headers.origin = origin;
+      if (body) headers["content-type"] = "application/json";
+      const req = http.request({ host: "127.0.0.1", port: ctx.port, path: pathname, method, headers, agent: false }, (res) => {
+        let text = "";
+        res.on("data", (c) => (text += c));
+        res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, json: JSON.parse(text || "null") }));
+      });
+      req.on("error", reject);
+      req.end(body);
+    });
+  const browser = { requestId: "req-browser", clientId: CONTROL_UI_CLIENT, remoteIp: "172.30.0.3", platform: "MacIntel", scopes: ["operator.admin"], ts: Date.now() };
+  const selfPair = { requestId: "req-self", clientId: CONTROL_UI_CLIENT, remoteIp: "127.0.0.1", ts: Date.now() };
+  const cliUpgrade = { requestId: "req-cli", clientId: "cli", remoteIp: "172.30.0.3", ts: Date.now() };
+  try {
+    assert.equal((await call("/api/control-ui/kolmogorov/open", { method: "POST", token: "x" })).status, 401);
+    pending.push(browser);
+    const early = await call("/api/control-ui/kolmogorov/approve", { method: "POST", body: JSON.stringify({ requestId: "req-browser" }) });
+    assert.equal(early.status, 403, "no approve before an open from this page");
+    assert.match(early.json.error, /open the Control UI/);
+
+    const open = await call("/api/control-ui/kolmogorov/open", { method: "POST" });
+    assert.equal(open.status, 200);
+    assert.equal(open.headers["cache-control"], "no-store");
+    assert.equal(open.json.url, `http://127.0.0.1:18890/__claw-proxy/unlock#k=${"k".repeat(43)}&token=${GW}`);
+    assert.equal((await call("/api/control-ui/down/open", { method: "POST" })).status, 409);
+    assert.equal((await call("/api/control-ui/nobody/open", { method: "POST" })).status, 404);
+    assert.equal((await call("/api/control-ui/kolmogorov/open")).status, 405, "the token is never served on GET");
+
+    pending.push(selfPair, cliUpgrade);
+    const listed = await call("/api/control-ui/kolmogorov/pairing");
+    assert.equal(listed.status, 200);
+    assert.deepEqual(
+      listed.json.pending.map((r) => [r.requestId, r.ok, r.viaProxy ?? null]),
+      [["req-browser", true, true], ["req-self", false, null]],
+      "only Control UI requests are listed; the CLI upgrade is not offered",
+    );
+    assert.ok(!JSON.stringify(listed.json).includes(GW));
+
+    for (const id of ["req-self", "req-cli"]) {
+      assert.equal((await call("/api/control-ui/kolmogorov/approve", { method: "POST", body: JSON.stringify({ requestId: id }) })).status, 403, id);
+    }
+    assert.equal((await call("/api/control-ui/kolmogorov/approve", { method: "POST", body: JSON.stringify({ requestId: "nope" }) })).status, 404);
+    assert.equal((await call("/api/control-ui/kolmogorov/approve", { method: "POST", body: JSON.stringify({ requestId: "a b" }) })).status, 400);
+    assert.equal((await call("/api/control-ui/kolmogorov/approve", { method: "POST", body: "{", origin: own })).status, 400);
+    assert.equal(
+      (await call("/api/control-ui/kolmogorov/approve", { method: "POST", body: JSON.stringify({ requestId: "req-browser" }), origin: "http://127.0.0.1:18890" })).status,
+      403,
+      "a foreign Origin cannot approve",
+    );
+    assert.deepEqual(approved, []);
+    const ok = await call("/api/control-ui/kolmogorov/approve", { method: "POST", body: JSON.stringify({ requestId: "req-browser" }) });
+    assert.equal(ok.status, 200);
+    assert.deepEqual(approved, [["oasis-claw-kolmogorov", "req-browser"]]);
+  } finally {
+    server.close();
+  }
+});
+
+test("collectPendingPairing keeps live requests and only the safe fields", () => {
+  const home = tmp("obs-pair-");
+  const now = 2_000_000_000_000;
+  fs.mkdirSync(path.join(home, "devices"));
+  fs.writeFileSync(
+    path.join(home, "devices", "pending.json"),
+    JSON.stringify({
+      a: { requestId: "a", deviceId: "d", publicKey: "PUBLIC-KEY", clientId: CONTROL_UI_CLIENT, platform: "MacIntel", remoteIp: "172.30.0.3", scopes: ["operator.admin", 7], ts: now - 1000 },
+      old: { requestId: "old", clientId: CONTROL_UI_CLIENT, ts: now - 6 * 60_000 },
+      kept: { requestId: "kept", clientId: "cli", ts: now - 10 * 60_000, refreshedAtMs: now - 60_000 },
+      junk: "x",
+    }),
+  );
+  const out = JSON.parse(execFileSync(process.execPath, ["-e", collectorScript(collectPendingPairing, home), String(now)], { encoding: "utf8" }));
+  assert.deepEqual(out.map((r) => r.requestId), ["a", "kept"], "expiry counts from the last refresh");
+  assert.deepEqual(out[0], { requestId: "a", clientId: CONTROL_UI_CLIENT, platform: "MacIntel", remoteIp: "172.30.0.3", scopes: ["operator.admin"], ts: now - 1000 });
+  assert.ok(!JSON.stringify(out).includes("PUBLIC-KEY"));
+  assert.deepEqual(collectPendingPairing(fs, path, tmp("obs-pair-none-")), []);
 });
