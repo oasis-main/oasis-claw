@@ -29,6 +29,15 @@ import {
   type LlmComplete,
 } from "./layer2.js";
 import { describeLedgerEntry } from "./infra-ledger.js";
+import {
+  decide,
+  deciderModeFrom,
+  injectionState,
+  INJECTION_QUESTIONS,
+  summarize,
+  toolCallState,
+  TOOL_CALL_QUESTIONS,
+} from "./decider.js";
 import { sendTelegramMessage } from "./telegram.js";
 import { fallbackSessionFilePath, readSessionTranscriptSummary } from "./transcript.js";
 
@@ -450,6 +459,14 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
   // alert lands in the SAME chat as the agent's self-report alert.
   const telegramBotToken = process.env.OASIS_TELEGRAM_BOT_TOKEN;
   const telegramChatId = process.env.OASIS_TELEGRAM_CHAT_ID;
+  // ── Decision-model shadow (CLAW-118) — see decider.ts. off | shadow only:
+  // there is deliberately no enforce mode, so no env value can make this
+  // model's answer change a verdict.
+  const deciderMode = deciderModeFrom(process.env.OASIS_REVIEWER_DECIDER);
+  const deciderUrl = process.env.OASIS_REVIEWER_DECIDER_URL || "http://oasis-decider:8790";
+  const deciderTimeoutMs = Number(process.env.OASIS_REVIEWER_DECIDER_TIMEOUT_MS ?? "8000") || 8_000;
+  let deciderInFlight = 0;
+  const DECIDER_MAX_INFLIGHT = 4;
   const runtime = (
     api as unknown as {
       runtime?: {
@@ -911,6 +928,64 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         enforced: mode === "enforce" && decision.verdict !== "allow",
       });
 
+      // ── Decision-model SHADOW (CLAW-118): fire-and-forget, never awaited ──
+      // Asked on the calls Layer 2 judges (so every row has a judge verdict to
+      // compare against) and on every report_injection self-report. Runs after
+      // the verdict is final and written, so it cannot change it or delay the
+      // tool call. Concurrency-capped like the Layer 2 shadow: a dropped
+      // question costs one comparison row, nothing else.
+      const deciderKind = toolName === "report_injection" ? "injection_report" : l2Eligible ? "tool_call" : null;
+      if (deciderMode === "shadow" && deciderKind && deciderInFlight < DECIDER_MAX_INFLIGHT) {
+        deciderInFlight++;
+        const ra = (params ?? {}) as { incident_type?: string; detail?: string; suspicious_content?: string };
+        const [state, questions] =
+          deciderKind === "injection_report"
+            ? [
+                injectionState({
+                  botKey,
+                  incidentType: String(ra.incident_type ?? "other"),
+                  detail: String(ra.detail ?? ""),
+                  suspiciousContent: String(ra.suspicious_content ?? ""),
+                  operatorRequest,
+                }),
+                INJECTION_QUESTIONS,
+              ]
+            : [toolCallState({ botKey, toolName, family, subject, params: paramsJson, operatorRequest }), TOOL_CALL_QUESTIONS];
+        const finalVerdict = decision.verdict;
+        const l2Verdict = (l2Row?.l2Verdict as string | null | undefined) ?? null;
+        const toolCallIdForDecider = event.toolCallId ?? null;
+        void decide(deciderUrl, state, questions, deciderTimeoutMs)
+          .then((r) => {
+            const s = summarize(r.answers);
+            write({
+              ts: new Date().toISOString(),
+              phase: "decider_shadow",
+              kind: deciderKind,
+              bot: botKey,
+              sessionId,
+              toolCallId: toolCallIdForDecider,
+              toolName,
+              family,
+              finalVerdict,
+              l2Verdict,
+              ...s,
+              // Quick-grep agreement with the judge. null when either side has
+              // no verdict (judge timed out, decider unreachable).
+              decAgreesWithL2: s.decVerdict && l2Verdict ? s.decVerdict === l2Verdict : null,
+              decModelMs: r.modelMs ?? null,
+              decMs: r.ms,
+              decModel: r.model ?? null,
+              decRevision: r.revision ? r.revision.slice(0, 12) : null,
+              decError: r.error ?? null,
+              decTimedOut: r.timedOut || undefined,
+              enforced: false,
+            });
+          })
+          .finally(() => {
+            deciderInFlight--;
+          });
+      }
+
       // ── Layer 2 SHADOW: fire-and-forget ──
       // Non-blocking: the hook returns the Layer 1 verdict immediately and the model
       // judgment lands later as a separate `phase:"layer2"` row, recording what the
@@ -1257,6 +1332,7 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
     // "Sound | Full Trajectory" — see the contextDepth block comment above.
     contextDepth: `${contextDepth} (maxChars=${contextMaxChars}, sessionFilePathSource=${resolveSessionFilePath ? "runtime" : "fallback"})`,
     loopGuard: loopGuardMode === "off" ? "off" : `${loopGuardMode} (threshold=${loopGuardThreshold})`,
+    decider: deciderMode === "off" ? "off" : `${deciderMode} (url=${deciderUrl}, timeout=${deciderTimeoutMs}ms)`,
     injectionReview:
       injectionReviewMode === "off"
         ? "off"

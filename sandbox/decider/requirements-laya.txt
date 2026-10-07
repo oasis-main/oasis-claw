@@ -1,0 +1,4 @@
+# Inference code for the Laya decision model, pinned by version AND wheel hash.
+# Installed with --no-deps; its runtime deps are pinned in the Dockerfile.
+# Read the source diff before changing this line (see the Dockerfile header).
+laya==0.4.0 --hash=sha256:c004d3f7cddcbc515ee2706920c6a4833d2267c1077dc2eff6d46d8d0a1465f3

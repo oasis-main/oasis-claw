@@ -173,6 +173,53 @@ services:
       - oasis_runtime
       - oasis_sandboxed
 
+  # ─── oasis-decider (CLAW-118, SHADOW) ──────────────────────────────────
+  # Typed-decision model (Laya, 421M, CPU) that the reviewer asks for a second
+  # opinion on Layer 2-judged calls. Shadow only: no answer from it changes a
+  # verdict (extensions/oasis-reviewer/src/decider.ts). Build + design:
+  # sandbox/decider/Dockerfile, oasis-x/.swarm/GENERATIVE_PLAN.md §10.
+  #
+  # Declared ONLY in this overlay, never in docker-compose.runtime.yml, so a
+  # stack without this file cannot recreate it and strip oasis_sandboxed (the
+  # voice/semantics dual-homing trap). Start it with `make -C bots decider-up`.
+  #
+  # Networks: NO oasis_runtime, so no direct internet. oasis_sandboxed reaches
+  # the five sandboxed bots; oasis_decider (internal, declared in runtime.yml)
+  # reaches Nimbus and Hello World. Through oasis_sandboxed it can reach the
+  # egress proxy, which gives an unmapped address only the base allowlist:
+  # the same exposure oasis-voice and oasis-semantics already have.
+  oasis-decider:
+    build:
+      context: ./sandbox/decider
+    image: oasis-decider:local
+    container_name: oasis-decider
+    init: true
+    restart: unless-stopped
+    networks:
+      - oasis_sandboxed
+      - oasis_decider
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    # Measured 2026-10-07: 2.4 GiB resident after load + first requests (fp32).
+    # 4 GB is the ceiling so a runaway request kills this container, not the
+    # fleet.
+    mem_limit: 4g
+    memswap_limit: 4g
+    # torch's thread count MUST match the CPU quota. With the default (one
+    # thread per VM core, 11) under a 2-CPU quota, the threads fought for the
+    # quota and a 5-question call took ~5.5 s.
+    cpus: ${OASIS_DECIDER_CPUS:-4}
+    environment:
+      OMP_NUM_THREADS: ${OASIS_DECIDER_CPUS:-4}
+      MKL_NUM_THREADS: ${OASIS_DECIDER_CPUS:-4}
+    pids_limit: 256
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
 networks:
   # The sandboxed network — internal:true, no route to the internet. Sandboxed
   # bots and the egress-proxy are the only things attached (plus voice+semantics

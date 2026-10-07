@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""claw-decider-report — how the decision-model shadow (CLAW-118) compares
+with the Layer 2 judge, per bot, from each bot's reviewer-audit.jsonl.
+
+Reads phase:"decider_shadow" rows only. Read-only: `docker exec ... cat`.
+
+  scripts/claw-decider-report                 # last 24 h, every running bot
+  scripts/claw-decider-report --hours 168 --bot house
+  scripts/claw-decider-report --json          # machine-readable, for the plan
+
+What the numbers mean:
+  agree        decider verdict == judge verdict, over rows where both exist
+  confusion    judge verdict -> decider verdict counts
+  by-conf      agreement inside decider-confidence bands; a usable fast path
+               needs high agreement in the top band, not a high average
+  errors       decider unreachable / timed out / bad answer
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime as dt
+import json
+import subprocess
+import sys
+
+CONTAINERS = {
+    "nimbus": "oasis-claw-runtime",
+    "hello-world": "oasis-claw-hello-world",
+    "house": "oasis-claw-house",
+    "kolmogorov": "oasis-claw-kolmogorov",
+    "yesman": "oasis-claw-yesman",
+    "butterbolt": "oasis-claw-butterbolt",
+    "vanhelsing": "oasis-claw-vanhelsing",
+}
+AUDIT = "/home/node/.openclaw/logs/reviewer/reviewer-audit.jsonl"
+BANDS = [(0.0, 0.5), (0.5, 0.7), (0.7, 0.9), (0.9, 1.01)]
+
+
+def rows_for(container: str, since: dt.datetime) -> list[dict]:
+    try:
+        out = subprocess.run(["docker", "exec", container, "cat", AUDIT],
+                             capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+    rows = []
+    for line in out.stdout.splitlines():
+        if '"decider_shadow"' not in line:
+            continue
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        try:
+            ts = dt.datetime.fromisoformat(r["ts"].replace("Z", "+00:00"))
+        except (KeyError, ValueError):
+            continue
+        if ts >= since:
+            rows.append(r)
+    return rows
+
+
+def pct(sorted_vals: list[float], q: float):
+    return sorted_vals[min(len(sorted_vals) - 1, int(q * len(sorted_vals)))] if sorted_vals else None
+
+
+def summarize(rows: list[dict]) -> dict:
+    tool = [r for r in rows if r.get("kind") == "tool_call"]
+    paired = [r for r in tool if r.get("decVerdict") and r.get("l2Verdict")]
+    confusion = collections.Counter(f"{r['l2Verdict']}->{r['decVerdict']}" for r in paired)
+    bands = {}
+    for lo, hi in BANDS:
+        b = [r for r in paired if lo <= (r.get("decVerdictP") or 0) < hi]
+        bands[f"{lo:.1f}-{min(hi, 1.0):.1f}"] = {
+            "n": len(b),
+            "agree": round(sum(r["decAgreesWithL2"] for r in b) / len(b), 3) if b else None,
+        }
+    model_ms = sorted(r["decModelMs"] for r in rows if isinstance(r.get("decModelMs"), (int, float)))
+    inj = [r for r in rows if r.get("kind") == "injection_report"]
+    return {
+        "rows": len(rows),
+        "tool_calls": len(tool),
+        "paired_with_judge": len(paired),
+        "agree": round(sum(r["decAgreesWithL2"] for r in paired) / len(paired), 3) if paired else None,
+        "confusion": dict(confusion.most_common()),
+        "by_confidence": bands,
+        # The case that matters most for any future fast path: the judge said
+        # deny or escalate and the decider was confident it was an allow.
+        "confident_allow_on_judge_block": sum(
+            1 for r in paired
+            if r["decVerdict"] == "allow" and r["l2Verdict"] != "allow" and (r.get("decVerdictP") or 0) >= 0.9),
+        "injection_reports": dict(collections.Counter(r.get("decVerdict") for r in inj)),
+        "errors": sum(1 for r in rows if r.get("decError")),
+        "timeouts": sum(1 for r in rows if r.get("decTimedOut")),
+        "model_ms_p50": pct(model_ms, 0.5),
+        "model_ms_p90": pct(model_ms, 0.9),
+    }
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--hours", type=float, default=24)
+    ap.add_argument("--bot", choices=sorted(CONTAINERS))
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+    since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=a.hours)
+    bots = [a.bot] if a.bot else list(CONTAINERS)
+    per_bot = {b: rows_for(CONTAINERS[b], since) for b in bots}
+    report = {b: summarize(rs) for b, rs in per_bot.items()}
+    report["ALL"] = summarize([r for rs in per_bot.values() for r in rs])
+    if a.json:
+        json.dump(report, sys.stdout, indent=2)
+        print()
+        return 0
+    print(f"decider shadow vs Layer 2 judge, last {a.hours:g} h")
+    for b, s in report.items():
+        if not s["rows"]:
+            print(f"  {b:12} no decider rows")
+            continue
+        print(f"  {b:12} rows {s['rows']:5}  paired {s['paired_with_judge']:5}  agree {s['agree']}  "
+              f"confident-allow-on-block {s['confident_allow_on_judge_block']}  errors {s['errors']}  "
+              f"model ms p50/p90 {s['model_ms_p50']}/{s['model_ms_p90']}")
+    allr = report["ALL"]
+    if allr["paired_with_judge"]:
+        print(f"  confusion (judge->decider): {allr['confusion']}")
+        print(f"  agreement by decider confidence: {allr['by_confidence']}")
+    if allr["injection_reports"]:
+        print(f"  injection reports (decider verdicts): {allr['injection_reports']}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

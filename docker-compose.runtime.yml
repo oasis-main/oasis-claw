@@ -90,6 +90,13 @@ services:
       OASIS_REVIEWER_LOOP_GUARD: ${OASIS_REVIEWER_LOOP_GUARD:-enforce}
       OASIS_REVIEWER_LOOP_GUARD_THRESHOLD: ${OASIS_REVIEWER_LOOP_GUARD_THRESHOLD:-3}
       OASIS_REVIEWER_LOOP_GUARD_TRANSIENT_THRESHOLD: ${OASIS_REVIEWER_LOOP_GUARD_TRANSIENT_THRESHOLD:-6}
+      # ── Decision-model shadow (CLAW-118) ──
+      # off | shadow. There is no enforce value: the decider's answers are
+      # logged as phase:"decider_shadow" rows and never change a verdict.
+      # Repeated in bots/docker-compose.bots.yml for the same reason as the
+      # loop guard above.
+      OASIS_REVIEWER_DECIDER: ${OASIS_REVIEWER_DECIDER:-shadow}
+      OASIS_REVIEWER_DECIDER_URL: ${OASIS_REVIEWER_DECIDER_URL:-http://oasis-decider:8790}
 
     # Host-side mapping is loopback-only. Other devices on your Wi-Fi
     # cannot reach this port through your Mac's LAN IP.
@@ -121,6 +128,7 @@ services:
     # gateway only needs IP networking on its loopback-published port.
     networks:
       - oasis_runtime
+      - oasis_decider   # CLAW-118: reach oasis-decider; internal, no route out
 
     healthcheck:
       # Authenticated healthz to avoid false-positives if auth is misconfigured.
@@ -269,6 +277,12 @@ networks:
     # Default bridge driver. No driver_opts to expose externally — the
     # only ingress is the explicit ports: mapping above.
     driver: bridge
+  # CLAW-118: internal, no internet. Members: oasis-decider (declared in
+  # sandbox/docker-compose.sandbox-runtime.yml), Nimbus, and the non-sandboxed
+  # bots/ services. Declared here so Nimbus's own two-file stack knows it.
+  oasis_decider:
+    driver: bridge
+    internal: true
 
 volumes:
   oasis_openclaw_home:
