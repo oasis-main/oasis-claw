@@ -93,6 +93,8 @@ def summarize(rows: list[dict]) -> dict:
         "injection_reports": dict(collections.Counter(r.get("decVerdict") for r in inj)),
         "errors": sum(1 for r in rows if r.get("decError")),
         "timeouts": sum(1 for r in rows if r.get("decTimedOut")),
+        # 503 from the sidecar's pending-call limit: overload, not a slow model.
+        "busy": sum(1 for r in rows if "busy" in (r.get("decError") or "")),
         "model_ms_p50": pct(model_ms, 0.5),
         "model_ms_p90": pct(model_ms, 0.9),
     }
@@ -119,7 +121,8 @@ def main() -> int:
             print(f"  {b:12} no decider rows")
             continue
         print(f"  {b:12} rows {s['rows']:5}  paired {s['paired_with_judge']:5}  agree {s['agree']}  "
-              f"confident-allow-on-block {s['confident_allow_on_judge_block']}  errors {s['errors']}  "
+              f"confident-allow-on-block {s['confident_allow_on_judge_block']}  "
+              f"errors {s['errors']} (timeout {s['timeouts']}, busy {s['busy']})  "
               f"model ms p50/p90 {s['model_ms_p50']}/{s['model_ms_p90']}")
     allr = report["ALL"]
     if allr["paired_with_judge"]:

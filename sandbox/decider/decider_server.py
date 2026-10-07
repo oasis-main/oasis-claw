@@ -41,6 +41,12 @@ MAX_BODY_BYTES = 64 * 1024
 MAX_QUESTIONS = 8
 MAX_CHOICE_OPTIONS = 20  # Laya: options share a 256-token head budget
 MAX_STATE_CHARS = 6000
+# Calls in progress + waiting for the model lock. Above this the server says
+# "busy" at once (503). Without it, a burst from several bots queued behind the
+# single lock until the reviewer's timeout fired (2026-10-07 20:14-20:26 UTC:
+# 39 of 78 shadow calls timed out at 8 s). A fast 503 is cheaper and is
+# reported as "busy", not confused with a slow model.
+DEFAULT_MAX_PENDING = 8
 QUESTION_TYPES = ("choice", "noul", "score")
 
 
@@ -109,7 +115,28 @@ def unwrap(out) -> tuple[dict, dict | None]:
     return out, None
 
 
-def make_handler(decider):
+class Admission:
+    """Counts calls in progress or waiting. Thread-safe."""
+
+    def __init__(self, limit: int):
+        self.limit, self.pending = limit, 0
+        self._lock = threading.Lock()
+
+    def enter(self) -> bool:
+        with self._lock:
+            if self.pending >= self.limit:
+                return False
+            self.pending += 1
+            return True
+
+    def leave(self) -> None:
+        with self._lock:
+            self.pending -= 1
+
+
+def make_handler(decider, max_pending: int = DEFAULT_MAX_PENDING):
+    admission = Admission(max_pending)
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "oasis-decider/1"
 
@@ -146,12 +173,17 @@ def make_handler(decider):
             except (BadRequest, json.JSONDecodeError) as e:
                 self._send(400, {"error": str(e)})
                 return
+            if not admission.enter():
+                self._send(503, {"error": f"busy: {admission.pending} calls pending"})
+                return
             started = time.perf_counter()
             try:
                 answers, usage = decider.predict(state, questions)
             except Exception as e:  # noqa: BLE001 - report, never crash the server
                 self._send(500, {"error": f"{type(e).__name__}: {e}"[:300]})
                 return
+            finally:
+                admission.leave()
             self._send(200, {
                 "answers": answers,
                 "usage": usage,
@@ -168,11 +200,12 @@ def main() -> None:
     name = os.environ.get("DECIDER_MODEL_NAME", "unknown")
     revision = os.environ.get("DECIDER_MODEL_REVISION", "unknown")
     port = int(os.environ.get("DECIDER_PORT", "8790"))
+    max_pending = int(os.environ.get("DECIDER_MAX_PENDING", str(DEFAULT_MAX_PENDING)))
     started = time.perf_counter()
     decider = Decider(model_dir, name, revision)
     print(f"oasis-decider: loaded {name}@{revision[:12]} in {time.perf_counter() - started:.1f}s; "
           f"listening on :{port}", flush=True)
-    ThreadingHTTPServer(("0.0.0.0", port), make_handler(decider)).serve_forever()
+    ThreadingHTTPServer(("0.0.0.0", port), make_handler(decider, max_pending)).serve_forever()
 
 
 if __name__ == "__main__":

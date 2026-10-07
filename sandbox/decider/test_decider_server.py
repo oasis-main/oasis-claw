@@ -6,6 +6,7 @@ Run:  cd sandbox/decider && python3 -m unittest test_decider_server.py
 
 import json
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -59,10 +60,12 @@ class Unwrap(unittest.TestCase):
 class FakeDecider:
     name, revision = "fake", "0" * 40
 
-    def __init__(self, fail=False):
-        self.fail, self.calls = fail, []
+    def __init__(self, fail=False, gate=None):
+        self.fail, self.calls, self.gate = fail, [], gate
 
     def predict(self, state, questions):
+        if self.gate is not None:
+            self.gate.wait(5)
         if self.fail:
             raise RuntimeError("boom")
         self.calls.append((state, questions))
@@ -71,8 +74,8 @@ class FakeDecider:
 
 
 class Http(unittest.TestCase):
-    def serve(self, decider):
-        srv = ThreadingHTTPServer(("127.0.0.1", 0), ds.make_handler(decider))
+    def serve(self, decider, max_pending=ds.DEFAULT_MAX_PENDING):
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), ds.make_handler(decider, max_pending))
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         self.addCleanup(srv.shutdown)
         return f"http://127.0.0.1:{srv.server_address[1]}"
@@ -109,6 +112,19 @@ class Http(unittest.TestCase):
     def test_oversized_body_rejected(self):
         code, _ = self.post(self.serve(FakeDecider()), None, raw=b" " * (ds.MAX_BODY_BYTES + 1))
         self.assertEqual(code, 413)
+
+    def test_full_queue_answers_busy_at_once(self):
+        gate = threading.Event()
+        base = self.serve(FakeDecider(gate=gate), max_pending=1)
+        first = threading.Thread(target=self.post, args=(base, {"state": "s", "questions": VERDICT}))
+        first.start()
+        time.sleep(0.2)  # let the first call take the only slot
+        code, out = self.post(base, {"state": "s", "questions": VERDICT})
+        self.assertEqual(code, 503)
+        self.assertIn("busy", out["error"])
+        gate.set()
+        first.join(5)
+        self.assertEqual(self.post(base, {"state": "s", "questions": VERDICT})[0], 200)  # slot released
 
     def test_model_error_is_500_not_crash(self):
         base = self.serve(FakeDecider(fail=True))

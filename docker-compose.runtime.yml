@@ -97,6 +97,9 @@ services:
       # loop guard above.
       OASIS_REVIEWER_DECIDER: ${OASIS_REVIEWER_DECIDER:-shadow}
       OASIS_REVIEWER_DECIDER_URL: ${OASIS_REVIEWER_DECIDER_URL:-http://oasis-decider:8790}
+      # Shadow calls are never awaited, so a long timeout costs nothing. 8 s
+      # (the code default) timed out 39 of 78 calls in a multi-bot burst.
+      OASIS_REVIEWER_DECIDER_TIMEOUT_MS: ${OASIS_REVIEWER_DECIDER_TIMEOUT_MS:-60000}
 
     # Host-side mapping is loopback-only. Other devices on your Wi-Fi
     # cannot reach this port through your Mac's LAN IP.
