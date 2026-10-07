@@ -1968,6 +1968,12 @@ if oasis_gen_token:
         _gen_model("claude-opus-5-5", "Claude Opus 5.5 (Bedrock)", _CTX_1M, ["text", "image"]),
         _gen_model("gpt-6-astra", "GPT-6 Astra (Bedrock)", _CTX_GPT, ["text", "image"]),
         _gen_model("claude-sonnet-5", "Claude Sonnet 5 (Bedrock)", _CTX_1M, ["text", "image"]),
+        # Sonnet 5.5 and Haiku 5.5 added 2026-10-07 (gateway catalog 1ba15ed).
+        # They serve only after the account's one-time AWS Marketplace
+        # subscription, as Opus 5.5 did. Haiku 5.5's window is not confirmed;
+        # 200K matches Haiku 4.5 until it is.
+        _gen_model("claude-sonnet-5-5", "Claude Sonnet 5.5 (Bedrock)", _CTX_1M, ["text", "image"]),
+        _gen_model("claude-haiku-5-5", "Claude Haiku 5.5 (Bedrock)", _CTX_200K, ["text", "image"]),
         _gen_model("gpt-5.6-sol", "GPT-5.6-sol (Bedrock)", _CTX_GPT, ["text", "image"]),
         _gen_model("glm-5", "GLM-5 (Bedrock)", _CTX_200K),
         # Cheaper tier (ADM-052, 2026-08-28). Added because GPT-5.6-sol was
