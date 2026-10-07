@@ -232,8 +232,162 @@ function refreshIcons() {
 }
 
 function controlUiLink(bot, text = "Control UI ↗") {
-  const href = openUrlFor(bot?.key);
-  return href ? externalLink(href, text, "button small") : h("span", { class: "muted small", title: "No reachable Control UI", text: `Control UI: ${bot?.controlUi?.via ?? "unknown"}` });
+  if (!openUrlFor(bot?.key)) {
+    return h("span", { class: "muted small", title: "No reachable Control UI", text: `Control UI: ${bot?.controlUi?.via ?? "unknown"}` });
+  }
+  return h("button", {
+    class: "button small",
+    type: "button",
+    title: `Open ${botLabel(bot)}'s Control UI, signed in`,
+    text,
+    onclick: (event) => {
+      event.stopPropagation();
+      openControlUi(bot);
+    },
+  });
+}
+
+// ── one-click Control UI (R2) ─────────────────────────────────────────────────
+// The server returns a signed-in address (gateway token in the fragment). A
+// browser that the bot has not seen before then asks the gateway to pair; the
+// page watches for that request and approves it. A request that came through
+// the port proxy is approved at once; any other needs a click (the server
+// judges both again).
+const PAIR_POLL_MS = 2000;
+const PAIR_QUIET_MS = 30_000;
+const PAIR_MAX_MS = 3 * 60_000;
+const pairWatches = new Map();
+
+function controlUiStatus() {
+  let bar = document.getElementById("cui-status");
+  if (!bar) {
+    bar = h("div", { id: "cui-status", class: "cui-status", role: "status", "aria-live": "polite" });
+    document.body.append(bar);
+  }
+  return bar;
+}
+
+function setControlUiStatus(key, message, tone = "", action = null) {
+  const bar = controlUiStatus();
+  let row = bar.querySelector(`[data-bot="${key}"]`);
+  if (!message) {
+    row?.remove();
+    return;
+  }
+  if (!row) {
+    row = h("div", { class: "cui-row", "data-bot": key });
+    bar.append(row);
+  }
+  row.className = `cui-row ${tone}`;
+  row.replaceChildren(
+    ...[h("span", { text: message }), action].filter(Boolean),
+    h("button", { class: "cui-close", type: "button", title: "Close", text: "×", onclick: () => stopPairWatch(key, true) }),
+  );
+}
+
+function stopPairWatch(key, clear = false) {
+  const w = pairWatches.get(key);
+  if (w) clearTimeout(w.timer);
+  pairWatches.delete(key);
+  if (clear) setControlUiStatus(key, null);
+}
+
+async function openControlUi(bot) {
+  const name = botLabel(bot);
+  // Open the tab inside the click; a tab opened after an await is a popup.
+  const win = window.open("about:blank", "_blank");
+  if (win) {
+    win.opener = null;
+    // A sandboxed bot answers docker exec in about 3 s; say so in the new tab.
+    try {
+      win.document.title = `Opening ${name}…`;
+      win.document.body.style.cssText = "font:14px/1.5 -apple-system,system-ui,sans-serif;margin:40px;color:#6a6962";
+      win.document.body.textContent = `Opening ${name}'s Control UI…`;
+    } catch {
+      // the tab is still usable without the message
+    }
+  }
+  setControlUiStatus(bot.key, `Opening ${name}…`);
+  let res;
+  try {
+    res = await api(`/api/control-ui/${encodeURIComponent(bot.key)}/open`, { method: "POST" });
+  } catch (err) {
+    win?.close();
+    setControlUiStatus(bot.key, `${name}: ${err.message}`, "bad");
+    return;
+  }
+  if (win) win.location.replace(res.url);
+  else location.assign(res.url);
+  watchPairing(bot);
+}
+
+function watchPairing(bot) {
+  const name = botLabel(bot);
+  stopPairWatch(bot.key);
+  const started = Date.now();
+  const watch = { timer: null, approving: new Set() };
+  pairWatches.set(bot.key, watch);
+  setControlUiStatus(bot.key, `Opened ${name}. Watching for a pairing request…`);
+  const tick = async () => {
+    if (pairWatches.get(bot.key) !== watch) return;
+    let pending = [];
+    try {
+      pending = (await api(`/api/control-ui/${encodeURIComponent(bot.key)}/pairing`)).pending ?? [];
+    } catch (err) {
+      setControlUiStatus(bot.key, `${name}: ${err.message}`, "bad");
+      stopPairWatch(bot.key);
+      return;
+    }
+    const ok = pending.filter((r) => r.ok);
+    const auto = ok.find((r) => r.viaProxy && !watch.approving.has(r.requestId));
+    if (auto) {
+      await approvePairing(bot, auto.requestId, watch);
+      return;
+    }
+    const manual = ok.find((r) => !watch.approving.has(r.requestId));
+    if (manual) {
+      setControlUiStatus(
+        bot.key,
+        `${name}: a browser asks to pair (${manual.platform ?? "unknown platform"}, from ${manual.remoteIp ?? "?"}). Approve only if you just opened it.`,
+        "warn",
+        h("button", { class: "button small", type: "button", text: "Approve", onclick: () => approvePairing(bot, manual.requestId, watch) }),
+      );
+    }
+    const quiet = Date.now() - started > PAIR_QUIET_MS && !pending.length;
+    if (quiet) {
+      setControlUiStatus(bot.key, `Opened ${name}. No pairing step was needed.`, "ok");
+      stopPairWatch(bot.key);
+      setTimeout(() => !pairWatches.has(bot.key) && setControlUiStatus(bot.key, null), 6000);
+      return;
+    }
+    if (Date.now() - started > PAIR_MAX_MS) {
+      setControlUiStatus(bot.key, `${name}: stopped watching for a pairing request. Open the Control UI again to retry.`, "warn");
+      stopPairWatch(bot.key);
+      return;
+    }
+    watch.timer = setTimeout(tick, PAIR_POLL_MS);
+  };
+  watch.timer = setTimeout(tick, PAIR_POLL_MS);
+}
+
+async function approvePairing(bot, requestId, watch) {
+  const name = botLabel(bot);
+  watch.approving.add(requestId);
+  setControlUiStatus(bot.key, `Pairing this browser with ${name}…`);
+  try {
+    await api(`/api/control-ui/${encodeURIComponent(bot.key)}/approve`, {
+      method: "POST",
+      type: "application/json",
+      body: JSON.stringify({ requestId }),
+    });
+  } catch (err) {
+    setControlUiStatus(bot.key, `${name}: pairing refused: ${err.message}`, "bad");
+    stopPairWatch(bot.key);
+    return;
+  }
+  stopPairWatch(bot.key);
+  setControlUiStatus(bot.key, `Paired with ${name}. The Control UI tab connects on its next retry.`, "ok");
+  setTimeout(() => !pairWatches.has(bot.key) && setControlUiStatus(bot.key, null), 8000);
 }
 
 function loadSelection() {
@@ -310,6 +464,8 @@ function renderBotBar() {
       ),
     ),
   );
+  // The background swarm (swarm.js) follows the bots in view.
+  window.dispatchEvent(new CustomEvent("observatory:bots", { detail: inScope(bots).map((b) => ({ key: b.key, family: famOf(b) })) }));
 }
 
 // ── app shell ─────────────────────────────────────────────────────────────────
