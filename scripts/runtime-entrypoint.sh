@@ -1903,6 +1903,17 @@ if oasis_gen_token:
         # character estimate alone (2026-10-03: House's overflow logged
         # observedTokens=unknown). The gateway returns OpenAI-style usage on
         # the final chunk for both backends since oasis-generation 2026-10-03.
+        #
+        # maxTokens: openclaw sends max_tokens = this value, and the gateway
+        # honours an explicit max_tokens over its profile default (16,000 for
+        # Opus 5). At 8,192, Opus 5 with adaptive thinking at effort "high"
+        # spent most of the budget on hidden thinking and Kolmogorov's turns
+        # ended with stopReason=length (2026-10-07). Claude and GPT models get
+        # 32,000, the gateway's "deep" profile value; a live probe through the
+        # gateway accepted max_tokens=32000 on Opus 5/5.5/4.8/4.7, Sonnet 5/4.6,
+        # Haiku 4.5, GPT-5.6-sol and GPT-6 Astra (2026-10-07). Thinking is
+        # adaptive, so the larger cap costs nothing unless a turn needs it.
+        max_tokens = 32000 if mid.startswith(("claude-", "gpt-")) else 8192
         return {
             "id": mid,
             "name": name,
@@ -1910,7 +1921,7 @@ if oasis_gen_token:
             "input": inputs or ["text"],
             "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
             "contextWindow": ctx,
-            "maxTokens": 8192,
+            "maxTokens": max_tokens,
             "compat": {"supportsUsageInStreaming": True},
         }
 
