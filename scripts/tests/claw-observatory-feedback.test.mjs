@@ -25,7 +25,7 @@ import {
   renderItem,
   validateCreate,
 } from "../claw-observatory-feedback.mjs";
-import { createObservatoryServer } from "../claw-observatory.mjs";
+import { createObservatoryServer, DEFAULT_FEEDBACK_TO, feedbackMail, queueConsoleMail } from "../claw-observatory.mjs";
 
 const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(40, 7)]);
 const JPEG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(40, 1)]);
@@ -339,5 +339,151 @@ test("server: feedback writes need the token and this page's Origin", async () =
   } finally {
     server.close();
     store.close();
+  }
+});
+
+// ── R5: requests go to bots by console mail (2026-10-07) ─────────────────────
+
+test("validateCreate: recipients are optional, deduplicated, bot names only", () => {
+  assert.equal(validateCreate({ body: "x" }).to, null, "absent: the server default");
+  assert.deepEqual(validateCreate({ body: "x", to: [] }).to, []);
+  assert.deepEqual(validateCreate({ body: "x", to: ["kolmogorov", "kolmogorov", "helloworld"] }).to, ["kolmogorov", "helloworld"]);
+  assert.throws(() => validateCreate({ body: "x", to: "kolmogorov" }), /list/);
+  assert.throws(() => validateCreate({ body: "x", to: ["../console"] }), /not a bot name/);
+  assert.throws(() => validateCreate({ body: "x", to: ["Kolmogorov"] }), /not a bot name/);
+  assert.throws(() => validateCreate({ body: "x", to: Array.from({ length: 9 }, (_, i) => `b${i}`) }), /at most/);
+});
+
+test("default recipients are the primary Oasis-X bots", () => {
+  assert.deepEqual(DEFAULT_FEEDBACK_TO, ["kolmogorov", "helloworld", "butterbolt"]);
+});
+
+test("queueConsoleMail writes the envelope claw-mail.mjs writes, atomically", () => {
+  const root = tmp("fb-mailroot-");
+  const id = queueConsoleMail(root, { to: "kolmogorov", subject: "s", body: "b", thread: "FB-1", items: ["CLAW-108"] });
+  const dir = path.join(root, "console", "outbox");
+  assert.deepEqual(fs.readdirSync(dir), [`${id}.json`], "no temp file left behind");
+  const env = JSON.parse(fs.readFileSync(path.join(dir, `${id}.json`), "utf8"));
+  assert.deepEqual(Object.keys(env).sort(), ["body", "id", "kind", "refs", "subject", "thread_id", "to", "ts", "work"]);
+  assert.deepEqual(env.to, ["kolmogorov"]);
+  assert.equal(env.kind, "dm");
+  assert.deepEqual(env.work, { items: ["CLAW-108"], repos: [] });
+  assert.ok(!("from" in env), "the relay stamps from=console; the envelope never claims it");
+});
+
+test("feedbackMail carries text and context, never an image path", () => {
+  const item = {
+    ref: "FB-ABCDEF12",
+    body: "Make the tab smaller\nand bolder",
+    context: { view: "work", chosenBots: ["house"], build: "abc1234" },
+    attachments: [{ name: "s.png", path: "/Users/x/Library/Application Support/oasis-x/observatory/feedback/images/FB-1.png" }],
+    deliveries: [{ bot: "kolmogorov" }, { bot: "helloworld" }],
+  };
+  const m = feedbackMail(item, { kolmogorov: "Kolmogorov", helloworld: "Hello World" });
+  assert.equal(m.subject, "Observatory feedback FB-ABCDEF12: Make the tab smaller");
+  assert.equal(m.thread, "FB-ABCDEF12");
+  assert.match(m.body, /Sent to: Kolmogorov, Hello World\./);
+  assert.match(m.body, /Make the tab smaller\nand bolder/);
+  assert.match(m.body, /view: work; bots in view: house; build: abc1234/);
+  assert.match(m.body, /1 screenshot\(s\) are attached on Mike's Mac only/);
+  assert.match(m.body, /not an authorization/);
+  assert.ok(!m.body.includes("Application Support") && !m.body.includes(".png"), "no image path or name in the mail");
+});
+
+test("server: submit mails each recipient once; unknown bots refused; failures recorded", async () => {
+  const store = openFeedbackStore(tmp("fb-r5-"));
+  const mailRoot = tmp("fb-r5-mail-");
+  const sent = [];
+  let failFor = null;
+  const ctx = {
+    port: 0,
+    token: "t".repeat(43),
+    author: "mike",
+    discover: async () => ({
+      bots: ["butterbolt", "helloworld", "house", "kolmogorov"].map((key) => ({ key, running: false, controlUi: { url: null, via: "unpublished" }, identity: { name: key.toUpperCase() } })),
+      proxy: null,
+    }),
+    swarm: { port: 1, url: "http://127.0.0.1:1/" },
+    snapshotDir: tmp("fb-r5-snap-"),
+    mailRoot,
+    proxyKey: () => "k".repeat(43),
+    identities: { get: () => null },
+    feedbackStore: async () => store,
+    feedbackTo: ["kolmogorov", "helloworld", "butterbolt", "notinfleet"],
+    sendMail: (mail) => {
+      if (mail.to === failFor) throw new Error("outbox not writable");
+      sent.push(mail);
+      return queueConsoleMail(mailRoot, mail);
+    },
+  };
+  const server = createObservatoryServer(ctx);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  ctx.port = server.address().port;
+  const headers = { host: `127.0.0.1:${ctx.port}`, "x-observatory-token": ctx.token, origin: `http://127.0.0.1:${ctx.port}`, "content-type": "application/json" };
+  const call = (pathname, method, payload) =>
+    new Promise((resolve, reject) => {
+      const req = http.request({ host: "127.0.0.1", port: ctx.port, path: pathname, method, headers, agent: false }, (res) => {
+        let text = "";
+        res.on("data", (c) => (text += c));
+        res.on("end", () => resolve({ status: res.statusCode, json: text ? JSON.parse(text) : null }));
+      });
+      req.on("error", reject);
+      req.end(payload === undefined ? undefined : JSON.stringify(payload));
+    });
+  try {
+    // Default recipients, filtered to the fleet.
+    const a = await call("/api/feedback", "POST", { body: "First request", context: { view: "work" } });
+    assert.equal(a.status, 201);
+    assert.deepEqual(sent, [], "nothing goes out before submit");
+    const done = await call(`/api/feedback/${a.json.id}/submit`, "POST");
+    assert.equal(done.status, 200);
+    assert.deepEqual(done.json.deliveries.map((d) => [d.bot, Boolean(d.mailId), d.error]), [
+      ["kolmogorov", true, null],
+      ["helloworld", true, null],
+      ["butterbolt", true, null],
+    ]);
+    assert.deepEqual(sent.map((m) => m.to), ["kolmogorov", "helloworld", "butterbolt"]);
+    assert.match(sent[0].body, /Sent to: KOLMOGOROV, HELLOWORLD, BUTTERBOLT\./);
+    assert.equal(fs.readdirSync(path.join(mailRoot, "console", "outbox")).length, 3);
+    // A second submit does not mail again.
+    await call(`/api/feedback/${a.json.id}/submit`, "POST");
+    assert.equal(sent.length, 3);
+
+    // Explicit recipients; an unknown bot is refused at create.
+    assert.equal((await call("/api/feedback", "POST", { body: "x", to: ["nobody"] })).status, 400);
+    const b = await call("/api/feedback", "POST", { body: "Only House", to: ["house"] });
+    await call(`/api/feedback/${b.json.id}/submit`, "POST");
+    assert.deepEqual(sent.slice(3).map((m) => m.to), ["house"]);
+
+    // An empty list queues the request and mails nobody.
+    const c = await call("/api/feedback", "POST", { body: "Queue only", to: [] });
+    const cDone = await call(`/api/feedback/${c.json.id}/submit`, "POST");
+    assert.deepEqual(cDone.json.deliveries, []);
+    assert.equal(sent.length, 4);
+
+    // A failed mail is recorded, and the next submit retries only that one.
+    failFor = "helloworld";
+    const d = await call("/api/feedback", "POST", { body: "Partly fails", to: ["kolmogorov", "helloworld"] });
+    const dDone = await call(`/api/feedback/${d.json.id}/submit`, "POST");
+    assert.deepEqual(dDone.json.deliveries.map((x) => [x.bot, Boolean(x.mailId), x.error]), [
+      ["kolmogorov", true, null],
+      ["helloworld", false, "outbox not writable"],
+    ]);
+    failFor = null;
+    const retry = await call(`/api/feedback/${d.json.id}/submit`, "POST");
+    assert.deepEqual(retry.json.deliveries.map((x) => [x.bot, Boolean(x.mailId)]), [["kolmogorov", true], ["helloworld", true]]);
+    assert.deepEqual(sent.slice(4).map((m) => m.to), ["kolmogorov", "helloworld"]);
+
+    // The fleet read tells the page the default.
+    const fleet = await new Promise((resolve) =>
+      http.get({ host: "127.0.0.1", port: ctx.port, path: "/api/fleet", headers: { host: headers.host, "x-observatory-token": ctx.token } }, (res) => {
+        let text = "";
+        res.on("data", (c) => (text += c));
+        res.on("end", () => resolve(JSON.parse(text)));
+      }),
+    );
+    assert.deepEqual(fleet.feedback.defaultTo, ["kolmogorov", "helloworld", "butterbolt", "notinfleet"]);
+  } finally {
+    server.close();
   }
 });

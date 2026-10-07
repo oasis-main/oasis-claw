@@ -494,3 +494,8 @@ button.button { font: inherit; cursor: pointer; }
 
 /* background swarm (R4, swarm.js): behind every widget, never takes a click */
 #swarm-bg { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 0; pointer-events: none; }
+
+/* feedback recipients (R5) */
+.fb-to { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.fb-to .bot-chip.small { padding: 2px 8px 2px 3px; font-size: 12px; }
+.fb-to .bot-chip.small .bot-icon { width: 18px; height: 18px; }

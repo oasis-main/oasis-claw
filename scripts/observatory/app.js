@@ -1680,6 +1680,37 @@ function mountFeedback() {
   const shotList = h("ul", { class: "fb-shots" });
   const contextBtn = h("button", { type: "button", class: "fb-link", text: "Show what is attached automatically" });
   const contextBox = h("pre", { class: "fb-context mono small", hidden: true });
+  // R5: the bots that get this request by console mail. Starts on the
+  // server's default (the primary Oasis-X bots) once the fleet is known.
+  let recipients = null;
+  const toRow = h("div", { class: "fb-to", role: "group", "aria-label": "Send to" });
+  const renderTo = () => {
+    const bots = app.fleet?.bots ?? [];
+    recipients ??= app.fleet ? new Set(app.fleet.feedback?.defaultTo ?? []) : null;
+    toRow.replaceChildren(
+      h("span", { class: "muted small", text: "Send to" }),
+      ...bots.map((b) => {
+        const on = recipients?.has(b.key) ?? false;
+        return h(
+          "button",
+          {
+            type: "button",
+            class: `bot-chip small fam-${famOf(b)}${on ? " active" : ""}`,
+            "aria-pressed": String(on),
+            title: on ? `${botLabel(b)} gets this request by mail. Click to remove.` : `Click to send this request to ${botLabel(b)} too.`,
+            onclick: () => {
+              recipients ??= new Set();
+              if (on) recipients.delete(b.key);
+              else recipients.add(b.key);
+              renderTo();
+            },
+          },
+          botIcon(b),
+          h("span", { class: "bot-chip-name", text: botLabel(b) }),
+        );
+      }),
+    );
+  };
   const sendBtn = h("button", { type: "button", class: "button fb-send", text: "Send" });
   const notice = h("span", { class: "fb-notice small", role: "status" });
   const recentList = h("ul", { class: "fb-recent" });
@@ -1692,7 +1723,8 @@ function mountFeedback() {
     h("div", { class: "fb-row" }, counter, h("span", { class: "fb-spacer" }), h("span", { class: "muted small", text: "⌘↵ sends · esc closes" })),
     h("div", { class: "fb-row" }, captureBtn, addBtn, fileInput),
     shotList,
-    h("p", { class: "muted small", text: "Screenshots stay on this Mac, in a folder that no bot mounts. `make feedback-pull` copies only the text to oasis-claw/.swarm/feedback/, which House and Yes Man can read." }),
+    toRow,
+    h("p", { class: "muted small", text: "The chosen bots get the text and the page context by console mail. Screenshots stay on this Mac, in a folder that no bot mounts. `make feedback-pull` copies only the text to oasis-claw/.swarm/feedback/, which House and Yes Man can read." }),
     contextBtn,
     contextBox,
     h("div", { class: "fb-row" }, sendBtn, notice),
@@ -1766,6 +1798,9 @@ function mountFeedback() {
                 h("span", { class: "mono small", text: f.ref }),
                 h("span", { class: "fb-first", text: f.body.split("\n")[0] }),
                 f.attachments.length ? h("span", { class: "muted small", text: `${f.attachments.length} img` }) : null,
+                f.deliveries?.some((d) => d.mailId)
+                  ? h("span", { class: "muted small", title: f.deliveries.filter((d) => d.mailId).map((d) => d.bot).join(", "), text: `→ ${f.deliveries.filter((d) => d.mailId).length} bots` })
+                  : null,
                 f.status === "new"
                   ? h("button", { type: "button", class: "fb-link", text: "withdraw", onclick: () => withdraw(f) })
                   : null,
@@ -1803,6 +1838,7 @@ function mountFeedback() {
           body,
           context: feedbackContext(),
           files: shots.map((s) => ({ name: s.name, contentType: s.blob.type, bytes: s.blob.size })),
+          ...(recipients ? { to: [...recipients] } : {}),
         }),
       });
       for (let i = 0; i < shots.length; i++) {
@@ -1813,7 +1849,11 @@ function mountFeedback() {
       shots.splice(0).forEach((s) => URL.revokeObjectURL(s.url));
       text.value = "";
       remember(FB_DRAFT_KEY, null);
-      say(`${done.ref} is in the queue.`, "ok-text");
+      const mailed = (done.deliveries ?? []).filter((d) => d.mailId).map((d) => botLabel(botByKey(d.bot) ?? { key: d.bot }));
+      const failed = (done.deliveries ?? []).filter((d) => d.error).map((d) => `${d.bot} (${d.error})`);
+      if (failed.length) say(`${done.ref} is in the queue. Mail failed for ${failed.join(", ")}.`, "bad-text");
+      else if (mailed.length) say(`${done.ref} sent to ${mailed.join(", ")}.`, "ok-text");
+      else say(`${done.ref} is in the queue. No bot was chosen, so no mail went out.`, "ok-text");
       loadRecent();
     } catch (err) {
       say(`Not sent: ${err.message}`, "bad-text");
@@ -1829,6 +1869,7 @@ function mountFeedback() {
     remember(FB_OPEN_KEY, open ? "1" : null);
     if (open) {
       if (!busy) say(null);
+      renderTo();
       refresh();
       loadRecent();
       requestAnimationFrame(() => text.focus());
@@ -1836,6 +1877,11 @@ function mountFeedback() {
   };
 
   tab.addEventListener("click", () => setOpen(true));
+  // The drawer can open (restored from the last visit) before the fleet read
+  // arrives; draw the recipients again once the bot bar has the fleet.
+  window.addEventListener("observatory:bots", () => {
+    if (!drawer.hidden) renderTo();
+  });
   closeBtn.addEventListener("click", () => setOpen(false));
   addBtn.addEventListener("click", () => fileInput.click());
   sendBtn.addEventListener("click", send);

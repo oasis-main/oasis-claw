@@ -1868,6 +1868,84 @@ export function lazyFeedbackStore(dir = DEFAULT_FEEDBACK_DIR) {
   return () => (opening ??= import(FEEDBACK_MODULE.href).then((m) => m.openFeedbackStore(dir)));
 }
 
+// ── feedback to the bots (Mike, 2026-10-07, R5) ──────────────────────────────
+// A submitted change request goes, as console mail, to the bots it names. The
+// default is the primary Oasis-X bots. The envelope is the one that
+// claw-mail.mjs `send` writes; the relay stamps `from=console` from the outbox
+// directory and applies its route table and audit.
+export const DEFAULT_FEEDBACK_TO = (process.env.OASIS_OBSERVATORY_FEEDBACK_TO || "kolmogorov,helloworld,butterbolt")
+  .split(",")
+  .map((b) => b.trim())
+  .filter(Boolean);
+
+/** Write one console mail into the outbox under `root`. Returns its id. */
+export function queueConsoleMail(root, { to, subject, body, thread = "", items = [] }) {
+  const dir = path.join(root, "console", "outbox");
+  fs.mkdirSync(dir, { recursive: true });
+  const env = {
+    id: `m_${crypto.randomBytes(12).toString("hex")}`,
+    to: [to],
+    kind: "dm",
+    subject,
+    body,
+    refs: [],
+    work: { items, repos: [] },
+    thread_id: thread,
+    ts: new Date().toISOString(),
+  };
+  const tmp = path.join(dir, `.${env.id}.json.tmp`);
+  fs.writeFileSync(tmp, JSON.stringify(env, null, 2), { flag: "wx" });
+  fs.renameSync(tmp, path.join(dir, `${env.id}.json`));
+  return env.id;
+}
+
+/** The mail a bot gets for one change request: text and page context only.
+ *  Screenshots stay on the Mac (a screenshot can show other agents' memory). */
+export function feedbackMail(item, names = {}) {
+  const ctx = item.context ?? {};
+  const first = item.body.trim().split("\n")[0].slice(0, 70);
+  const recipients = (item.deliveries ?? []).map((d) => names[d.bot] ?? d.bot);
+  const where = [
+    ctx.view ? `view: ${ctx.view}` : null,
+    ctx.bot ? `bot: ${ctx.bot}` : null,
+    Array.isArray(ctx.chosenBots) && ctx.chosenBots.length ? `bots in view: ${ctx.chosenBots.join(", ")}` : null,
+    ctx.build ? `build: ${ctx.build}` : null,
+  ].filter(Boolean);
+  const images = item.attachments?.length ?? 0;
+  const body = [
+    `Change request ${item.ref} from Mike, written on the Fleet Observatory page (CLAW-108).`,
+    `Sent to: ${recipients.join(", ")}.`,
+    "",
+    item.body.trim(),
+    "",
+    where.length ? `Page context — ${where.join("; ")}.` : null,
+    images
+      ? `${images} screenshot(s) are attached on Mike's Mac only. They are not sent, because a screenshot can show other agents' memory.`
+      : null,
+    "",
+    `This is a request to consider, not an authorization. Reply to console in thread ${item.ref} with what you will do, or why not.`,
+  ]
+    .filter((l) => l !== null)
+    .join("\n");
+  return { subject: `Observatory feedback ${item.ref}: ${first}`, body, thread: item.ref, items: ["CLAW-108"] };
+}
+
+/** Mail every recipient of a submitted request that has no mail yet. */
+async function deliverFeedback(store, item, ctx) {
+  const fleet = await cached(ctx, "fleet", 4000, ctx.discover);
+  const names = Object.fromEntries(fleet.bots.map((b) => [b.key, b.identity?.name || b.agentName || b.key]));
+  const mail = feedbackMail(item, names);
+  for (const d of item.deliveries ?? []) {
+    if (d.mailId) continue;
+    try {
+      store.recordDelivery(item.id, d.bot, { mailId: ctx.sendMail({ to: d.bot, ...mail }) });
+    } catch (err) {
+      store.recordDelivery(item.id, d.bot, { error: String(err.message ?? err).slice(0, 300) });
+    }
+  }
+  return store.get(item.id);
+}
+
 /** /api/feedback routes. Returns [status, json] or [204, null]. */
 async function routeFeedback(req, url, ctx) {
   const store = await ctx.feedbackStore();
@@ -1890,7 +1968,13 @@ async function routeFeedback(req, url, ctx) {
     }
     // The server adds what the page cannot know (the build). The size limit
     // applies to the page's part only.
-    const created = store.create(input, { author: ctx.author ?? null, extra: ctx.build ? { build: ctx.build } : {} });
+    const fleet = await cached(ctx, "fleet", 4000, ctx.discover);
+    const created = store.create(input, {
+      author: ctx.author ?? null,
+      extra: ctx.build ? { build: ctx.build } : {},
+      defaultTo: ctx.feedbackTo.filter((b) => fleet.bots.some((x) => x.key === b)),
+      knownBots: fleet.bots.map((b) => b.key),
+    });
     return [201, created];
   }
   if (parts.length === 3 && req.method === "GET") {
@@ -1901,7 +1985,8 @@ async function routeFeedback(req, url, ctx) {
     return [204, null];
   }
   if (parts.length === 4 && parts[3] === "submit" && req.method === "POST") {
-    return [200, publicItem(store.submit(id))];
+    const submitted = store.submit(id);
+    return [200, publicItem(submitted.status === "new" ? await deliverFeedback(store, submitted, ctx) : submitted)];
   }
   if (parts.length === 5 && parts[3] === "files" && req.method === "PUT") {
     if (!/^[1-9]$/.test(parts[4])) return [404, { error: "no such image slot" }];
@@ -1995,6 +2080,7 @@ async function routeApi(url, ctx) {
         bots: withUrls.bots.map((b) => ({ ...b, identity: publicIdentity(ctx, b) })),
         families: [...ROLE_FAMILIES.map(({ id, label }) => ({ id, label })), OTHER_FAMILY],
         swarm: { ...ctx.swarm, running: swarmUp },
+        feedback: { defaultTo: ctx.feedbackTo },
         snapshot: { dir: ctx.snapshotDir, last: snapshot },
       },
     ];
@@ -2090,6 +2176,8 @@ export function createObservatoryServer(ctx) {
   ctx.approveDevice ??= (container, requestId) =>
     docker(["exec", container, "openclaw", "devices", "approve", requestId, "--json"], { timeoutMs: 30_000 });
   ctx.feedbackStore ??= lazyFeedbackStore();
+  ctx.feedbackTo ??= DEFAULT_FEEDBACK_TO;
+  ctx.sendMail ??= (mail) => queueConsoleMail(ctx.mailRoot, mail);
   ctx.identities ??= identityStore(IDENTITY_DIR);
   ctx.identityRefreshing ??= new Set();
   ctx.readIdentity ??= (bot) => collect(bot.container, collectIdentity);

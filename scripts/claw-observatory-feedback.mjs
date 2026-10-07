@@ -27,6 +27,15 @@
 //   replaces an existing path, refuses a symlinked folder, and the database —
 //   not the folder — is the list of record (`feedback list`).
 //
+// RECIPIENTS (Mike, 2026-10-07, R5)
+//   Each request names the bots it goes to (default: the primary Oasis-X bots,
+//   Kolmogorov, Hello World and ButterBolt). On submit, the observatory writes
+//   one console mail per bot into the mail outbox; the relay applies its routes
+//   and audit as for any console mail. The mail carries the text and the page
+//   context only, never an image. feedback_delivery records each mail id or
+//   error. To a bot, console mail is a request to consider, not an
+//   authorization.
+//
 // The store uses node:sqlite (Node 22.13 or later). claw-observatory.mjs loads
 // this module only for `serve` and `feedback`, so the launchd copy of that
 // script (snapshot only) does not need this file.
@@ -40,6 +49,8 @@ export const FEEDBACK_MAX_CHARS = 4000;
 export const MAX_FILES = 6;
 export const MAX_FILE_BYTES = 10 * 1024 * 1024;
 export const CONTEXT_MAX_BYTES = 2000;
+export const MAX_RECIPIENTS = 8;
+const BOT_KEY_RE = /^[a-z0-9-]{1,40}$/;
 export const IMAGE_TYPES = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" };
 export const STATUSES = ["draft", "new", "queued", "in_progress", "done", "declined"];
 const TRIAGE_STATUSES = STATUSES.filter((s) => s !== "draft");
@@ -102,7 +113,17 @@ export function validateCreate(input) {
     }
     return { name, contentType: f.contentType, bytes: f.bytes };
   });
-  return { body, context, files: clean };
+  // `to` absent: the server's default recipients. An empty list: queue only.
+  let to = null;
+  if (input.to !== undefined) {
+    if (!Array.isArray(input.to)) throw new FeedbackError(400, "to must be a list of bot names");
+    to = [...new Set(input.to)];
+    if (to.length > MAX_RECIPIENTS) throw new FeedbackError(400, `at most ${MAX_RECIPIENTS} recipients`);
+    for (const bot of to) {
+      if (typeof bot !== "string" || !BOT_KEY_RE.test(bot)) throw new FeedbackError(400, "a recipient is not a bot name");
+    }
+  }
+  return { body, context, files: clean, to };
 }
 
 const MIGRATIONS = [
@@ -130,6 +151,15 @@ const MIGRATIONS = [
      stored       INTEGER NOT NULL DEFAULT 0,
      created_at   TEXT NOT NULL,
      PRIMARY KEY (feedback_id, seq)
+   ) STRICT;`,
+  // R5 (2026-10-07): who each request goes to, and what happened to each mail.
+  `CREATE TABLE feedback_delivery (
+     feedback_id  TEXT NOT NULL REFERENCES feedback (id) ON DELETE CASCADE,
+     bot          TEXT NOT NULL,
+     mail_id      TEXT,
+     error        TEXT,
+     sent_at      TEXT,
+     PRIMARY KEY (feedback_id, bot)
    ) STRICT;`,
 ];
 
@@ -191,6 +221,9 @@ export function openFeedbackStore(dir, { now = () => new Date() } = {}) {
     triage: db.prepare("UPDATE feedback SET status = ?, resolution = COALESCE(?, resolution), updated_at = ? WHERE id = ?"),
     remove: db.prepare("DELETE FROM feedback WHERE id = ?"),
     staleDrafts: db.prepare("SELECT id FROM feedback WHERE status = 'draft' AND created_at < ?"),
+    deliveries: db.prepare("SELECT * FROM feedback_delivery WHERE feedback_id = ? ORDER BY rowid"),
+    insertDelivery: db.prepare("INSERT INTO feedback_delivery (feedback_id, bot) VALUES (?, ?)"),
+    delivered: db.prepare("UPDATE feedback_delivery SET mail_id = ?, error = ?, sent_at = ? WHERE feedback_id = ? AND bot = ?"),
   };
 
   const imagePath = (file) => path.join(imageDir, file);
@@ -214,6 +247,7 @@ export function openFeedbackStore(dir, { now = () => new Date() } = {}) {
       stored: a.stored === 1,
       path: imagePath(a.file),
     })),
+    deliveries: q.deliveries.all(f.id).map((d) => ({ bot: d.bot, mailId: d.mail_id, error: d.error, sentAt: d.sent_at })),
   });
 
   function load(idOrRef) {
@@ -237,9 +271,14 @@ export function openFeedbackStore(dir, { now = () => new Date() } = {}) {
     imageDir,
     dbFile,
 
-    /** `extra` is context the server adds after validation (the build). */
-    create(input, { author = null, extra = {} } = {}) {
-      const { body, context, files } = validateCreate(input);
+    /** `extra` is context the server adds after validation (the build).
+     *  `defaultTo` is used when the page names no recipients; `knownBots`,
+     *  when given, refuses a recipient that is not in the fleet. */
+    create(input, { author = null, extra = {}, defaultTo = [], knownBots = null } = {}) {
+      const { body, context, files, to } = validateCreate(input);
+      const recipients = to ?? defaultTo;
+      const unknown = knownBots ? recipients.filter((b) => !knownBots.includes(b)) : [];
+      if (unknown.length) throw new FeedbackError(400, `not a bot in the fleet: ${unknown.join(", ")}`);
       const t = iso();
       return transaction(db, () => {
         let id;
@@ -252,6 +291,7 @@ export function openFeedbackStore(dir, { now = () => new Date() } = {}) {
         files.forEach((f, i) => {
           q.insertAtt.run(id, i + 1, f.name, f.contentType, f.bytes, `${ref}-${i + 1}.${IMAGE_TYPES[f.contentType]}`, t);
         });
+        for (const bot of recipients) q.insertDelivery.run(id, bot);
         return {
           id,
           ref,
@@ -277,6 +317,12 @@ export function openFeedbackStore(dir, { now = () => new Date() } = {}) {
       fs.writeFileSync(tmp, data, { mode: 0o600, flag: "wx" });
       fs.renameSync(tmp, target);
       q.stored.run(data.length, f.id, seq);
+    },
+
+    /** Record what happened to one recipient's mail. */
+    recordDelivery(id, bot, { mailId = null, error = null } = {}) {
+      const f = load(id);
+      q.delivered.run(mailId, error, iso(), f.id, bot);
     },
 
     submit(id) {
@@ -376,6 +422,7 @@ export function renderItem(item) {
     `bot: ${scalar(ctx.bot)}`,
     `session: ${scalar(ctx.session)}`,
     `build: ${scalar(ctx.build)}`,
+    `mailed_to: ${scalar((item.deliveries ?? []).filter((d) => d.mailId).map((d) => d.bot).join(", ") || null)}`,
     "---",
     "",
     `# ${item.ref}: ${first}`,
