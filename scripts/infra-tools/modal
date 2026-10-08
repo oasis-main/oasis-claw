@@ -1,0 +1,16 @@
+#!/bin/sh
+# modal — the Modal CLI for Yes Man (CLAW-116). Staged read-only at
+# /opt/infra-tools/bin/modal by scripts/claw-infra-tools.
+#
+# The Modal client ignores HTTPS_PROXY, so this wrapper starts the relay
+# (/opt/infra-tools/lib/modal_relay.py) and points the client at it. Inside Yes
+# Man, api.modal.com resolves to 127.0.0.1 (compose extra_hosts), so TLS is
+# still checked against api.modal.com. Keys: MODAL_TOKEN_ID / MODAL_TOKEN_SECRET
+# from providers.env. The package itself is installed under
+# /opt/infra-tools/python for Linux aarch64, Python 3.11.
+set -e
+python3 /opt/infra-tools/lib/modal_relay.py --ensure
+PYTHONPATH="/opt/infra-tools/python${PYTHONPATH:+:$PYTHONPATH}"
+MODAL_SERVER_URL="https://api.modal.com:8443"
+export PYTHONPATH MODAL_SERVER_URL
+exec python3 -m modal "$@"

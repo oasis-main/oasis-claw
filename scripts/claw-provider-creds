@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+"""
+claw-provider-creds — give Yes Man his infrastructure providers: key and egress
+together (CLAW-116, .swarm/INFRA_BROKER.md "Providers").
+
+Yes Man is the fleet's only infrastructure applier. Mike keeps Yes Man's keys in
+ONE folder outside ~/Documents/Runes (which Yes Man reads and writes) and outside
+every repository:
+
+  ~/Library/Application Support/oasis-x/yesman-secrets/
+    providers.env      env_file for Yes Man only: SCW_*, MODAL_TOKEN_*, GH_TOKEN,
+                       DIGITALOCEAN_ACCESS_TOKEN
+    aws/credentials    mounted read-only at /home/node/.aws in Yes Man:
+    aws/config         profiles oasis-dev, oasis-prod, default (personal account)
+
+A key without egress is useless, and egress without a key is surface for
+nothing. So egress is derived from the keys:
+
+  scripts/claw-provider-creds apply          # grant egress for providers WITH keys, restart, test
+  scripts/claw-provider-creds check          # test every provider that has a key (no restart)
+  scripts/claw-provider-creds mint-aws       # create yesman-infra access keys in dev, prod and
+                                             # personal, write them into aws/credentials, delete
+                                             # the older keys (rotation) — never displayed
+  scripts/claw-provider-creds revoke <p>     # remove provider p's key (aws: also deletes the IAM
+                                             # keys) and its egress, restart
+
+Providers: aws, scaleway, modal, github, digitalocean, gcp. Each host in bots/yesman/role.yaml
+origins.trusted carries a `# provider:<name>` tag; `apply` writes
+sandbox/egress-proxy/seeds/yesman/allowlist.txt with only the hosts of the
+providers that have keys. `apply` refuses while the known secret files still sit
+at the Runes root.
+
+Never prints a secret. Key IDs are shown by their last 4 characters only.
+"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+RUNES = Path.home() / "Documents" / "Runes"
+SECRETS = Path.home() / "Library" / "Application Support" / "oasis-x" / "yesman-secrets"
+PROVIDERS_ENV = SECRETS / "providers.env"
+AWS_CREDS = SECRETS / "aws" / "credentials"
+ROLE = REPO / "bots" / "yesman" / "role.yaml"
+SEED = REPO / "sandbox" / "egress-proxy" / "seeds" / "yesman" / "allowlist.txt"
+BOT = "yesman"
+CONTAINER = "oasis-claw-yesman"
+FALLBACK_FILES = [
+    "docker-compose.runtime.yml",
+    "sandbox/docker-compose.sandbox-runtime.yml",
+    "bots/docker-compose.bots.yml",
+    "bots/docker-compose.yesman-reach.yml",
+]
+PROVIDERS = ("aws", "scaleway", "modal", "github", "digitalocean", "gcp")
+
+# (admin profile on Mike's Mac, profile name inside Yes Man's credentials file)
+AWS_ACCOUNTS = [
+    ("oasis-dev", "oasis-dev"),
+    ("oasis-prod", "oasis-prod"),
+    ("personal-admin", "default"),
+]
+AWS_USER = "yesman-infra"
+
+ENV_KEYS = {
+    "scaleway": ("SCW_ACCESS_KEY", "SCW_SECRET_KEY", "SCW_DEFAULT_PROJECT_ID", "SCW_DEFAULT_ORGANIZATION_ID"),
+    "modal": ("MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"),
+    "github": ("GH_TOKEN",),
+    "digitalocean": ("DIGITALOCEAN_ACCESS_TOKEN",),
+}
+
+# Providers whose credential is a FILE, not a providers.env key (Mike,
+# 2026-10-08): GitHub tokens minted on the Mac (scripts/claw-gh-minter) and the
+# Google federation config (scripts/claw-gcp-federation; it holds no secret).
+GH_TOKEN_DIR = SECRETS.parent / "gh-tokens" / "yesman"
+GCP_CRED_CONFIG = SECRETS / "gcp" / "credential-config.json"
+
+
+def file_providers():
+    active = []
+    if GH_TOKEN_DIR.is_dir() and any(GH_TOKEN_DIR.glob("*.json")):
+        active.append("github")
+    if GCP_CRED_CONFIG.is_file():
+        active.append("gcp")
+    return active
+
+
+# A host that must stay blocked for Yes Man (negative control).
+BLOCKED_PROBE = "https://api.hetzner.cloud/v1/servers"
+
+
+def die(msg):
+    sys.exit(f"claw-provider-creds: {msg}")
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+# ── reading the key files (values never leave this process) ─────────────────
+
+def env_values():
+    out = {}
+    if not PROVIDERS_ENV.exists():
+        return out
+    for line in PROVIDERS_ENV.read_text().splitlines():
+        m = re.match(r"^([A-Z][A-Z0-9_]*)=(.*)$", line)
+        if m and m.group(2).strip():
+            out[m.group(1)] = m.group(2).strip()
+    return out
+
+
+def aws_profiles_with_keys():
+    """Profile names in aws/credentials that have both key lines filled in."""
+    if not AWS_CREDS.exists():
+        return []
+    have, section, found = [], None, {}
+    for line in AWS_CREDS.read_text().splitlines():
+        s = line.strip()
+        m = re.match(r"^\[([^\]]+)\]$", s)
+        if m:
+            section = m.group(1).strip()
+            continue
+        m = re.match(r"^(aws_access_key_id|aws_secret_access_key)\s*=\s*(\S+)$", s)
+        if section and m:
+            found.setdefault(section, set()).add(m.group(1))
+    for sec, keys in found.items():
+        if keys == {"aws_access_key_id", "aws_secret_access_key"}:
+            have.append(sec)
+    return have
+
+
+def active_providers():
+    env = env_values()
+    active = []
+    if aws_profiles_with_keys():
+        active.append("aws")
+    for p, keys in ENV_KEYS.items():
+        if all(k in env for k in keys):
+            active.append(p)
+    for p in file_providers():
+        if p not in active:
+            active.append(p)
+    return active
+
+
+# ── preconditions ───────────────────────────────────────────────────────────
+
+def secrets_at_runes_root():
+    pats = ["mikes_secrets.py", "config_secret_mba.json", "gate_usdt_eth.txt",
+            "github-recovery-codes-*.txt", "PyPI-Recovery-Codes-*.txt",
+            "oasis-training-suite-*.json", "*.pem"]
+    found = []
+    for p in pats:
+        found += [f.name for f in RUNES.glob(p)]
+    return sorted(set(found))
+
+
+def require_clean_runes():
+    left = secrets_at_runes_root()
+    if left:
+        print(f"These secret files are still at {RUNES}, which Yes Man reads and writes:", file=sys.stderr)
+        for f in left:
+            print(f"  {f}", file=sys.stderr)
+        die("move them out of ~/Documents/Runes first (MIKE_CONSOLE_TODO.md 0.3 step 1)")
+
+
+# ── egress seed ─────────────────────────────────────────────────────────────
+
+def tagged_hosts():
+    """{provider: [hosts]} from role.yaml origins.trusted `# provider:<name>` tags."""
+    out = {}
+    for line in ROLE.read_text().splitlines():
+        m = re.match(r"^\s*-\s*(\S+)\s*#\s*provider:([a-z0-9_-]+)\s*$", line)
+        if m:
+            out.setdefault(m.group(2), []).append(m.group(1))
+    return out
+
+
+def write_seed(active):
+    hosts = tagged_hosts()
+    missing = [p for p in active if not hosts.get(p)]
+    if missing:
+        die(f"role.yaml has no `# provider:` hosts for: {', '.join(missing)}")
+    lines = [
+        "# egress allowlist for yesman — written by scripts/claw-provider-creds apply",
+        f"# {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%MZ')}; providers with keys: {', '.join(active) or 'none'}",
+        "# Source: bots/yesman/role.yaml origins.trusted (# provider:<name> tags). Do not edit by hand.",
+    ]
+    for p in active:
+        lines += hosts[p]
+    SEED.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SEED.with_suffix(".txt.tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    tmp.replace(SEED)
+    n = sum(len(hosts[p]) for p in active)
+    print(f"egress seed: {n} hosts for {', '.join(active) or 'no provider'} → {SEED.relative_to(REPO)}")
+
+
+# ── container lifecycle ─────────────────────────────────────────────────────
+
+def compose_files():
+    r = run(["docker", "inspect", CONTAINER, "--format",
+             '{{index .Config.Labels "com.docker.compose.project.config_files"}}'])
+    files = [f for f in r.stdout.strip().split(",") if f] if r.returncode == 0 else []
+    return files or FALLBACK_FILES
+
+
+def recreate():
+    args = ["docker", "compose", "-p", "oasis-claw"]
+    for f in compose_files():
+        args += ["-f", f]
+    args += ["up", "-d", "--no-deps", "--force-recreate", BOT]
+    print(f"recreating {BOT} with its live compose files")
+    r = subprocess.run(args, cwd=REPO)
+    if r.returncode != 0:
+        die("docker compose up failed")
+    run([sys.executable, str(REPO / "scripts" / "claw-egress-sync")])
+    status = ""
+    for _ in range(60):
+        status = run(["docker", "inspect", "-f", "{{.State.Health.Status}}", CONTAINER]).stdout.strip()
+        if status == "healthy":
+            break
+        time.sleep(3)
+    print(f"{CONTAINER} health: {status}")
+
+
+# ── probes (inside Yes Man, through the egress proxy) ───────────────────────
+
+def dexec(cmd, timeout=90):
+    try:
+        return run(["docker", "exec", CONTAINER] + cmd, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, 124, "", "timed out")
+
+
+def tail(r):
+    lines = (r.stderr or r.stdout).strip().splitlines()
+    return lines[-1][:160] if lines else f"exit {r.returncode}"
+
+
+PY_SCW = r"""
+import json, os, urllib.error, urllib.request
+s = os.environ.get("SCW_SECRET_KEY", ""); z = os.environ.get("SCW_DEFAULT_ZONE", "fr-par-2")
+p = os.environ.get("SCW_DEFAULT_PROJECT_ID", "")
+req = urllib.request.Request(f"https://api.scaleway.com/instance/v1/zones/{z}/servers?project={p}&per_page=1", headers={"X-Auth-Token": s})
+try:
+    with urllib.request.urlopen(req, timeout=20) as r:
+        print(f"HTTP {r.status}, servers on first page: {len(json.load(r).get('servers', []))}")
+except urllib.error.HTTPError as e:
+    print(f"FAILED HTTP {e.code}")
+except Exception as e:
+    print(f"FAILED {type(e).__name__}")
+"""
+
+PY_BLOCKED = r"""
+import sys, urllib.error, urllib.request
+try:
+    urllib.request.urlopen(sys.argv[1], timeout=15)
+    print("REACHED — egress is wider than intended")
+except urllib.error.HTTPError as e:
+    print(f"REACHED (HTTP {e.code}) — egress is wider than intended" if e.code not in (403, 407) else f"blocked (HTTP {e.code})")
+except Exception as e:
+    print(f"blocked ({type(e).__name__})")
+"""
+
+
+def probe(provider):
+    if provider == "aws":
+        for _, prof in AWS_ACCOUNTS:
+            if prof not in aws_profiles_with_keys():
+                print(f"  aws [{prof}]: no key in aws/credentials")
+                continue
+            r = dexec(["aws", "sts", "get-caller-identity", "--profile", prof, "--query", "Arn", "--output", "text"])
+            print(f"  aws [{prof}]: {r.stdout.strip() if r.returncode == 0 else 'FAILED ' + tail(r)}")
+    elif provider == "scaleway":
+        r = dexec(["python3", "-c", PY_SCW])
+        print(f"  scaleway: {r.stdout.strip() or tail(r)}")
+    elif provider == "modal":
+        r = dexec(["sh", "-c", "command -v modal >/dev/null || { echo 'modal not staged (claw-infra-tools stage)'; exit 3; }; modal app list --json >/dev/null && echo 'app list ok'"], timeout=120)
+        print(f"  modal: {r.stdout.strip() if r.returncode == 0 else 'FAILED ' + tail(r)}")
+    elif provider == "github":
+        # An App installation token has no user, so count the repos each
+        # minted token reaches (GH_REPO tells the gh wrapper which account).
+        for account in ("oasis-main", "MikeHLee"):
+            r = dexec(["env", f"GH_REPO={account}/x", "gh", "api", "installation/repositories", "--jq", ".total_count"])
+            print(f"  github [{account}]: {(r.stdout.strip() + ' repos') if r.returncode == 0 else 'FAILED ' + tail(r)}")
+    elif provider == "gcp":
+        r = dexec(["sh", "-c", "command -v gcloud >/dev/null || { echo 'gcloud not staged (claw-infra-tools stage)'; exit 3; }; gcloud projects list --format='value(projectId)' --limit=5 | tr '\\n' ' '"], timeout=120)
+        print(f"  gcp: {('projects ' + r.stdout.strip()) if r.returncode == 0 else 'FAILED ' + (r.stdout.strip() or tail(r))}")
+    elif provider == "digitalocean":
+        # Status and droplet limit only: `account get` also shows the email.
+        r = dexec(["sh", "-c", "command -v doctl >/dev/null || { echo 'doctl not staged (claw-infra-tools stage)'; exit 3; }; doctl account get --format Status,DropletLimit --no-header"], timeout=60)
+        print(f"  digitalocean: {('account ' + ' '.join(r.stdout.split())) if r.returncode == 0 else 'FAILED ' + (r.stdout.strip() or tail(r))}")
+
+
+def cmd_check(_args=None):
+    if run(["docker", "inspect", CONTAINER]).returncode != 0:
+        die(f"{CONTAINER} is not running")
+    active = active_providers()
+    print(f"providers with keys: {', '.join(active) or 'none'}")
+    for p in active:
+        probe(p)
+    r = dexec(["python3", "-c", PY_BLOCKED, BLOCKED_PROBE])
+    print(f"  negative control {BLOCKED_PROBE}: {r.stdout.strip() or tail(r)}")
+
+
+def cmd_apply(_args=None):
+    require_clean_runes()
+    if not SECRETS.exists():
+        die(f"{SECRETS} does not exist")
+    active = active_providers()
+    write_seed(active)
+    recreate()
+    cmd_check()
+
+
+# ── AWS key minting and revocation ──────────────────────────────────────────
+
+def aws_admin(profile, *args):
+    return run(["aws", *args, "--profile", profile, "--output", "json"])
+
+
+def list_keys(admin):
+    r = aws_admin(admin, "iam", "list-access-keys", "--user-name", AWS_USER)
+    if r.returncode != 0:
+        die(f"[{admin}] cannot list {AWS_USER} keys (was the Terraform applied?): {tail(r)}")
+    return [k["AccessKeyId"] for k in json.loads(r.stdout)["AccessKeyMetadata"]]
+
+
+def write_aws_credentials(keys):
+    """keys: {profile: (id, secret)} — rewrites the file, keeping only these."""
+    lines = [
+        "# Yes Man's AWS keys: IAM user `yesman-infra` (path /bots/) in each account.",
+        "# Written by scripts/claw-provider-creds mint-aws. Profile names are fixed:",
+        "# the oasis-cloud-admin stacks name oasis-dev / oasis-prod in code; the exp",
+        "# stacks use [default] (personal account 469618777502).",
+        "",
+    ]
+    for _, prof in AWS_ACCOUNTS:
+        lines.append(f"[{prof}]")
+        if prof in keys:
+            lines.append(f"aws_access_key_id = {keys[prof][0]}")
+            lines.append(f"aws_secret_access_key = {keys[prof][1]}")
+        else:
+            lines.append("# aws_access_key_id =")
+            lines.append("# aws_secret_access_key =")
+        lines.append("")
+    tmp = AWS_CREDS.with_name("credentials.tmp")
+    tmp.touch(mode=0o600)
+    tmp.write_text("\n".join(lines))
+    tmp.chmod(0o600)
+    tmp.replace(AWS_CREDS)
+
+
+def read_aws_credentials():
+    keys, section, cur = {}, None, {}
+    if AWS_CREDS.exists():
+        for line in AWS_CREDS.read_text().splitlines():
+            s = line.strip()
+            m = re.match(r"^\[([^\]]+)\]$", s)
+            if m:
+                section = m.group(1)
+                continue
+            m = re.match(r"^(aws_access_key_id|aws_secret_access_key)\s*=\s*(\S+)$", s)
+            if section and m:
+                cur.setdefault(section, {})[m.group(1)] = m.group(2)
+    for sec, d in cur.items():
+        if "aws_access_key_id" in d and "aws_secret_access_key" in d:
+            keys[sec] = (d["aws_access_key_id"], d["aws_secret_access_key"])
+    return keys
+
+
+def cmd_mint_aws(_args=None):
+    keys = read_aws_credentials()
+    old = {}
+    for admin, prof in AWS_ACCOUNTS:
+        existing = list_keys(admin)
+        if len(existing) >= 2:
+            die(f"[{admin}] {AWS_USER} already has 2 keys; run `revoke aws` first")
+        r = aws_admin(admin, "iam", "create-access-key", "--user-name", AWS_USER)
+        if r.returncode != 0:
+            die(f"[{admin}] create-access-key failed: {tail(r)}")
+        k = json.loads(r.stdout)["AccessKey"]
+        keys[prof] = (k["AccessKeyId"], k["SecretAccessKey"])
+        old[admin] = existing
+        write_aws_credentials(keys)  # write after each account: a later failure keeps earlier keys
+        print(f"[{prof}] new key …{k['AccessKeyId'][-4:]} written to aws/credentials")
+    print("waiting 10 s for the new keys to become usable")
+    time.sleep(10)
+    for admin, ids in old.items():
+        for kid in ids:
+            r = aws_admin(admin, "iam", "delete-access-key", "--user-name", AWS_USER, "--access-key-id", kid)
+            print(f"[{admin}] old key …{kid[-4:]} {'deleted' if r.returncode == 0 else 'NOT deleted: ' + tail(r)}")
+    print("next: scripts/claw-provider-creds apply")
+
+
+def comment_out_env(keys):
+    if not PROVIDERS_ENV.exists():
+        return
+    out = []
+    for line in PROVIDERS_ENV.read_text().splitlines():
+        m = re.match(r"^([A-Z][A-Z0-9_]*)=", line)
+        out.append(f"# {m.group(1)}=" if m and m.group(1) in keys else line)
+    tmp = PROVIDERS_ENV.with_name("providers.env.tmp")
+    tmp.touch(mode=0o600)
+    tmp.write_text("\n".join(out) + "\n")
+    tmp.chmod(0o600)
+    tmp.replace(PROVIDERS_ENV)
+
+
+def cmd_revoke(args):
+    p = args.provider
+    if p == "aws":
+        ans = input("Delete every yesman-infra access key in dev, prod and personal? [y/N] ")
+        if ans.strip().lower() != "y":
+            die("aborted")
+        for admin, _ in AWS_ACCOUNTS:
+            for kid in list_keys(admin):
+                r = aws_admin(admin, "iam", "delete-access-key", "--user-name", AWS_USER, "--access-key-id", kid)
+                print(f"[{admin}] key …{kid[-4:]} {'deleted' if r.returncode == 0 else 'NOT deleted: ' + tail(r)}")
+        write_aws_credentials({})
+    else:
+        comment_out_env(set(ENV_KEYS[p]) | ({"OASIS_GIT_REPOS"} if p == "github" else set()))
+        print(f"commented out {p} keys in providers.env")
+        if p != "github":
+            print(f"Also delete the {p} token in the provider console: removing it here does not revoke it.")
+        else:
+            print("Also delete the token at https://github.com/settings/personal-access-tokens")
+    active = active_providers()
+    write_seed(active)
+    recreate()
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="claw-provider-creds", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("apply").set_defaults(func=cmd_apply)
+    sub.add_parser("check").set_defaults(func=cmd_check)
+    sub.add_parser("mint-aws").set_defaults(func=cmd_mint_aws)
+    rv = sub.add_parser("revoke")
+    rv.add_argument("provider", choices=PROVIDERS)
+    rv.set_defaults(func=cmd_revoke)
+    args = ap.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

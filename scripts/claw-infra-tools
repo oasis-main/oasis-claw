@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+# claw-infra-tools — stage Yes Man's infrastructure tools on the host (CLAW-116).
+#
+# Yes Man applies infrastructure for the fleet (.swarm/INFRA_BROKER.md), but
+# the shared runtime image carries no Terraform, and Yes Man has no egress to
+# releases.hashicorp.com or the Terraform registry. Rebuilding the shared image
+# for one bot's tools would put them in all seven bots and needs disk the Mac
+# does not always have. So this script stages them in ONE host folder that only
+# Yes Man mounts, READ-ONLY, at /opt/infra-tools:
+#
+#   bin/terraform     pinned version, SHA-256 checked against HashiCorp's list
+#   bin/scw           Scaleway CLI, pinned, SHA-256 checked against its release
+#   bin/doctl         DigitalOcean CLI, pinned, SHA-256 checked against its release
+#   bin/hcloud        Hetzner Cloud CLI, pinned, SHA-256 checked against its release
+#   bin/gcloud        wrapper: hands Yes Man's oasis-dev AWS keys to Google's
+#                     federation, then runs google-cloud-sdk/bin/gcloud (pinned;
+#                     Google publishes no tarball hash, so the first stage records
+#                     it in bin/gcloud.sha256 and later stages must match it)
+#   bin/modal         wrapper: starts lib/modal_relay.py, then runs the Modal CLI
+#   lib/              modal_relay.py (tunnels api.modal.com through the egress
+#                     proxy; the Modal client ignores HTTPS_PROXY)
+#   python/           the Modal client for Linux aarch64 / Python 3.11 (uv)
+#   plugins/          a filesystem mirror of every provider version the applied
+#                     stacks lock (packed zips; `terraform providers mirror`
+#                     verifies the registry signatures while it downloads them)
+#   terraformrc       TF_CLI_CONFIG_FILE: install providers ONLY from plugins/,
+#                     never from the network; no version checkpoint call
+#
+# It also creates the Terraform state folder that Yes Man mounts read-write at
+# /reach/tfstate. State lives outside every repository, because Yes Man applies
+# from a throwaway `git archive` export of the requester's commit.
+#
+# Usage:
+#   scripts/claw-infra-tools stage    # download, verify, write (idempotent)
+#   scripts/claw-infra-tools check    # show what is staged and what Yes Man sees
+#
+# To add a provider or bump a version: edit PROVIDERS (and the pin in the
+# requester repo's required_providers), then run `stage` again. Nothing in the
+# container can change this folder.
+
+set -euo pipefail
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+TOOLS_DIR="${OASIS_INFRA_TOOLS_DIR:-$HOME/Library/Application Support/oasis-x/infra-tools}"
+STATE_DIR="${OASIS_TFSTATE_DIR:-$HOME/Library/Application Support/oasis-x/tfstate}"
+CONTAINER="${OASIS_INFRA_BOT_CONTAINER:-oasis-claw-yesman}"
+
+TF_VERSION="1.12.2"
+# Docker on Apple silicon runs the bots as linux/arm64 (`uname -m` = aarch64).
+# The same read-only folder is also mounted into Kolmogorov (2026-10-02) for
+# read-only work: terraform validate/fmt, scw, hcloud.
+TF_PLATFORM="linux_arm64"
+# From https://releases.hashicorp.com/terraform/1.12.2/terraform_1.12.2_SHA256SUMS
+TF_SHA256="f8a0347dc5e68e6d60a9fa2db361762e7943ed084a773f28a981d988ceb6fdc9"
+
+SCW_VERSION="2.62.0"
+# From https://github.com/scaleway/scaleway-cli/releases/download/v2.62.0/SHA256SUMS
+SCW_SHA256="c15df24f287f2b458269700be70d5621677aefa31efa8a19917f96062da2c8d0"
+
+DOCTL_VERSION="1.177.0"
+# From https://github.com/digitalocean/doctl/releases/download/v1.177.0/doctl-1.177.0-checksums.sha256
+DOCTL_SHA256="3adfe5bb667c2cdee15eb3501d53b57d8f04dfa945ddd4584f6f760834506992"
+
+HCLOUD_VERSION="1.69.0"
+# From https://github.com/hetznercloud/cli/releases/download/v1.69.0/checksums.txt
+HCLOUD_SHA256="3afa68ac6c7dfb62f41d4a740376aaf88d3772e95f94a8816f41050c4bf1077e"
+
+GCLOUD_VERSION="567.0.0"
+MODAL_VERSION="1.3.5"
+# Yes Man's container: Debian 12, Python 3.11, glibc 2.36, aarch64.
+MODAL_PY="3.11"
+MODAL_PLATFORM="aarch64-unknown-linux-gnu"
+
+# source=version — every version the stacks Yes Man applies have in their
+# .terraform.lock.hcl (a lock file pins exact versions and hashes, and the
+# mirror is the only install source). Checked 2026-09-21:
+#   oasis-generation dev           scaleway 2.83.1
+#   oasis-cloud-admin dev          aws 5.68.0, archive 2.7.1, random 3.8.1
+#   oasis-cloud-admin prod         aws 5.68.0, archive 2.8.0, random 3.9.0
+#   exp (all six stacks)           aws 5.100.0, archive 2.8.0, random 3.9.0
+# When a stack's lock file changes, add the new version here and re-stage.
+PROVIDERS=(
+  "scaleway/scaleway=2.83.1"
+  "hashicorp/aws=5.68.0"
+  "hashicorp/aws=5.100.0"
+  "hashicorp/archive=2.7.1"
+  "hashicorp/archive=2.8.0"
+  "hashicorp/random=3.8.1"
+  "hashicorp/random=3.9.0"
+)
+
+# State sub-folders, one per applied repository.
+STATE_REPOS=(
+  "oasis-generation"
+)
+
+die() { echo "claw-infra-tools: $*" >&2; exit 1; }
+
+tmp=""
+trap '[ -n "$tmp" ] && rm -rf "$tmp"' EXIT
+
+stage() {
+  command -v terraform >/dev/null || die "host terraform not found (it builds the provider mirror)"
+  command -v unzip >/dev/null || die "unzip not found"
+
+  mkdir -p "$TOOLS_DIR/bin" "$TOOLS_DIR/plugins"
+  chmod 755 "$TOOLS_DIR"
+
+  tmp="$(mktemp -d)"
+
+  # 1. Terraform binary.
+  local have=""
+  if [ -f "$TOOLS_DIR/bin/terraform.version" ]; then
+    have="$(cat "$TOOLS_DIR/bin/terraform.version")"
+  fi
+  if [ "$have" = "$TF_VERSION/$TF_PLATFORM" ] && [ -x "$TOOLS_DIR/bin/terraform" ]; then
+    echo "terraform $TF_VERSION ($TF_PLATFORM) already staged"
+  else
+    local zip="terraform_${TF_VERSION}_${TF_PLATFORM}.zip"
+    echo "downloading $zip from releases.hashicorp.com"
+    curl -fsSL -o "$tmp/$zip" "https://releases.hashicorp.com/terraform/${TF_VERSION}/${zip}"
+    local got
+    got="$(shasum -a 256 "$tmp/$zip" | awk '{print $1}')"
+    [ "$got" = "$TF_SHA256" ] || die "SHA-256 mismatch for $zip: got $got, want $TF_SHA256"
+    echo "SHA-256 ok"
+    unzip -o -q "$tmp/$zip" terraform -d "$tmp"
+    install -m 0755 "$tmp/terraform" "$TOOLS_DIR/bin/terraform"
+    echo "$TF_VERSION/$TF_PLATFORM" > "$TOOLS_DIR/bin/terraform.version"
+    echo "staged bin/terraform"
+  fi
+
+  # 2. Provider mirror — one run per provider version (one configuration
+  # cannot require two versions of the same provider). A filesystem mirror
+  # needs only the zips in the right folders, so runs accumulate.
+  local p src ver name zip
+  for p in "${PROVIDERS[@]}"; do
+    src="${p%%=*}"; ver="${p#*=}"; name="${src##*/}"
+    zip="$TOOLS_DIR/plugins/registry.terraform.io/${src}/terraform-provider-${name}_${ver}_${TF_PLATFORM}.zip"
+    if [ -f "$zip" ]; then
+      echo "provider ${src} ${ver} already mirrored"
+      continue
+    fi
+    rm -rf "$tmp/mirror" && mkdir -p "$tmp/mirror"
+    printf 'terraform {\n  required_providers {\n    %s = { source = "%s", version = "%s" }\n  }\n}\n' \
+      "$name" "$src" "$ver" > "$tmp/mirror/versions.tf"
+    echo "mirroring ${src} ${ver} ($TF_PLATFORM)"
+    (cd "$tmp/mirror" && terraform providers mirror -platform="$TF_PLATFORM" "$TOOLS_DIR/plugins" >/dev/null)
+  done
+  echo "staged plugins/"
+
+  # 3. Scaleway CLI.
+  if [ -x "$TOOLS_DIR/bin/scw" ] && [ "$(cat "$TOOLS_DIR/bin/scw.version" 2>/dev/null)" = "$SCW_VERSION" ]; then
+    echo "scw $SCW_VERSION already staged"
+  else
+    local bin="scaleway-cli_${SCW_VERSION}_linux_arm64"
+    echo "downloading $bin from github.com/scaleway/scaleway-cli"
+    curl -fsSL -o "$tmp/$bin" "https://github.com/scaleway/scaleway-cli/releases/download/v${SCW_VERSION}/${bin}"
+    local got
+    got="$(shasum -a 256 "$tmp/$bin" | awk '{print $1}')"
+    [ "$got" = "$SCW_SHA256" ] || die "SHA-256 mismatch for $bin: got $got, want $SCW_SHA256"
+    install -m 0755 "$tmp/$bin" "$TOOLS_DIR/bin/scw"
+    echo "$SCW_VERSION" > "$TOOLS_DIR/bin/scw.version"
+    echo "staged bin/scw"
+  fi
+
+  # 3b. DigitalOcean CLI (reads DIGITALOCEAN_ACCESS_TOKEN; honours HTTPS_PROXY).
+  if [ -x "$TOOLS_DIR/bin/doctl" ] && [ "$(cat "$TOOLS_DIR/bin/doctl.version" 2>/dev/null)" = "$DOCTL_VERSION" ]; then
+    echo "doctl $DOCTL_VERSION already staged"
+  else
+    local tgz="doctl-${DOCTL_VERSION}-linux-arm64.tar.gz"
+    echo "downloading $tgz from github.com/digitalocean/doctl"
+    curl -fsSL -o "$tmp/$tgz" "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/${tgz}"
+    local got_do
+    got_do="$(shasum -a 256 "$tmp/$tgz" | awk '{print $1}')"
+    [ "$got_do" = "$DOCTL_SHA256" ] || die "SHA-256 mismatch for $tgz: got $got_do, want $DOCTL_SHA256"
+    echo "SHA-256 ok"
+    tar -xzf "$tmp/$tgz" -C "$tmp" doctl
+    install -m 0755 "$tmp/doctl" "$TOOLS_DIR/bin/doctl"
+    echo "$DOCTL_VERSION" > "$TOOLS_DIR/bin/doctl.version"
+    echo "staged bin/doctl"
+  fi
+
+  # 3c. Hetzner Cloud CLI (reads HCLOUD_TOKEN; honours HTTPS_PROXY).
+  if [ -x "$TOOLS_DIR/bin/hcloud" ] && [ "$(cat "$TOOLS_DIR/bin/hcloud.version" 2>/dev/null)" = "$HCLOUD_VERSION" ]; then
+    echo "hcloud $HCLOUD_VERSION already staged"
+  else
+    local htgz="hcloud-linux-arm64.tar.gz"
+    echo "downloading $htgz v$HCLOUD_VERSION from github.com/hetznercloud/cli"
+    curl -fsSL -o "$tmp/$htgz" "https://github.com/hetznercloud/cli/releases/download/v${HCLOUD_VERSION}/${htgz}"
+    local got_h
+    got_h="$(shasum -a 256 "$tmp/$htgz" | awk '{print $1}')"
+    [ "$got_h" = "$HCLOUD_SHA256" ] || die "SHA-256 mismatch for $htgz: got $got_h, want $HCLOUD_SHA256"
+    echo "SHA-256 ok"
+    tar -xzf "$tmp/$htgz" -C "$tmp" hcloud
+    install -m 0755 "$tmp/hcloud" "$TOOLS_DIR/bin/hcloud"
+    echo "$HCLOUD_VERSION" > "$TOOLS_DIR/bin/hcloud.version"
+    echo "staged bin/hcloud"
+  fi
+
+  # 3d. Google Cloud CLI (Mike, 2026-10-08). No Google key: the wrapper turns
+  # Yes Man's oasis-dev AWS keys into env vars (google-auth reads AWS keys
+  # from the environment only) and points gcloud at the federation credential
+  # config that scripts/claw-gcp-federation writes. Update checks and usage
+  # reporting are off; gcloud's own state goes in the bot's volume.
+  if [ -x "$TOOLS_DIR/google-cloud-sdk/bin/gcloud" ] && [ "$(cat "$TOOLS_DIR/bin/gcloud.version" 2>/dev/null)" = "$GCLOUD_VERSION" ]; then
+    echo "gcloud $GCLOUD_VERSION already staged"
+  else
+    local gtgz="google-cloud-cli-${GCLOUD_VERSION}-linux-arm.tar.gz"
+    echo "downloading $gtgz from dl.google.com"
+    curl -fsSL -o "$tmp/$gtgz" "https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/${gtgz}"
+    local got_g
+    got_g="$(shasum -a 256 "$tmp/$gtgz" | awk '{print $1}')"
+    if [ -f "$TOOLS_DIR/bin/gcloud.sha256" ] && [ "$(cut -d' ' -f1 "$TOOLS_DIR/bin/gcloud.sha256")" != "$got_g" ] && grep -q " $gtgz\$" "$TOOLS_DIR/bin/gcloud.sha256"; then
+      die "SHA-256 of $gtgz changed since the first stage: got $got_g"
+    fi
+    rm -rf "$TOOLS_DIR/google-cloud-sdk"
+    tar -xzf "$tmp/$gtgz" -C "$TOOLS_DIR"
+    echo "$got_g $gtgz" > "$TOOLS_DIR/bin/gcloud.sha256"
+    cat > "$TOOLS_DIR/bin/gcloud" <<'WRAP'
+#!/bin/sh
+# gcloud for Yes Man through workload identity federation (no Google key).
+# google-auth reads AWS keys from the environment only, so export the oasis-dev
+# profile's keys for this one process, then run the real gcloud.
+eval "$(aws configure export-credentials --profile "${OASIS_GCP_AWS_PROFILE:-oasis-dev}" --format env 2>/dev/null)"
+export AWS_REGION="${AWS_REGION:-us-east-1}"
+export CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="${CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE:-/run/oasis-gcp/credential-config.json}"
+export CLOUDSDK_CONFIG="${CLOUDSDK_CONFIG:-/home/node/.openclaw/config/gcloud}"
+export CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK=1
+export CLOUDSDK_CORE_DISABLE_USAGE_REPORTING=1
+exec /opt/infra-tools/google-cloud-sdk/bin/gcloud "$@"
+WRAP
+    chmod 0755 "$TOOLS_DIR/bin/gcloud"
+    echo "$GCLOUD_VERSION" > "$TOOLS_DIR/bin/gcloud.version"
+    echo "staged gcloud $GCLOUD_VERSION (sha256 $got_g recorded)"
+  fi
+
+  # 4. Modal client (Linux aarch64 wheels, installed into python/) + relay.
+  command -v uv >/dev/null || die "uv not found (installs the Modal client for the container's platform)"
+  if [ "$(cat "$TOOLS_DIR/python/.modal-version" 2>/dev/null)" = "$MODAL_VERSION" ]; then
+    echo "modal $MODAL_VERSION already staged"
+  else
+    rm -rf "$TOOLS_DIR/python"
+    echo "installing modal $MODAL_VERSION for $MODAL_PLATFORM / Python $MODAL_PY"
+    uv pip install --quiet --target "$TOOLS_DIR/python" \
+      --python-platform "$MODAL_PLATFORM" --python-version "$MODAL_PY" \
+      --only-binary :all: "modal==${MODAL_VERSION}"
+    echo "$MODAL_VERSION" > "$TOOLS_DIR/python/.modal-version"
+    echo "staged python/ (modal $MODAL_VERSION)"
+  fi
+  mkdir -p "$TOOLS_DIR/lib"
+  install -m 0644 "$REPO/scripts/infra-tools/modal_relay.py" "$TOOLS_DIR/lib/modal_relay.py"
+  install -m 0755 "$REPO/scripts/infra-tools/modal" "$TOOLS_DIR/bin/modal"
+  echo "staged lib/modal_relay.py and bin/modal"
+
+  # 5. CLI config — mirror only, no network installs, no checkpoint call.
+  cat > "$TOOLS_DIR/terraformrc" <<'EOF'
+# Written by oasis-claw/scripts/claw-infra-tools. Read-only inside Yes Man.
+disable_checkpoint = true
+
+provider_installation {
+  filesystem_mirror {
+    path    = "/opt/infra-tools/plugins"
+    include = ["registry.terraform.io/*/*"]
+  }
+}
+
+# One unpacked copy of each provider version for every apply (symlinked into
+# each .terraform/). Yes Man inits in a fresh /work/apply/<repo>@<sha>/ export
+# for each approved apply; without the cache each export unpacks its own copy.
+# The aws provider is 530-700 MB unpacked, and the Mac disk is nearly full.
+# The lock files record h1: hashes for darwin only, so Terraform would skip
+# the cache on every linux init; the flag below lets it use the cache.
+# The mirror zips are checked against the lock files' zh: hashes on the
+# first install into the cache.
+plugin_cache_dir                            = "/reach/tfstate/.plugin-cache"
+plugin_cache_may_break_dependency_lock_file = true
+EOF
+  echo "staged terraformrc"
+
+  # 6. State folders (read-write in Yes Man). 700: only Mike's user reads it.
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
+  local r
+  for r in "${STATE_REPOS[@]}"; do
+    mkdir -p "$STATE_DIR/$r"
+  done
+  mkdir -p "$STATE_DIR/.plugin-cache"
+  echo "state folder: $STATE_DIR"
+
+  echo
+  check
+}
+
+check() {
+  echo "tools:  $TOOLS_DIR"
+  [ -f "$TOOLS_DIR/bin/terraform.version" ] && echo "  terraform $(cat "$TOOLS_DIR/bin/terraform.version")" || echo "  terraform: NOT staged"
+  [ -f "$TOOLS_DIR/bin/scw.version" ] && echo "  scw $(cat "$TOOLS_DIR/bin/scw.version")" || echo "  scw: NOT staged"
+  [ -f "$TOOLS_DIR/bin/doctl.version" ] && echo "  doctl $(cat "$TOOLS_DIR/bin/doctl.version")" || echo "  doctl: NOT staged"
+  [ -f "$TOOLS_DIR/bin/hcloud.version" ] && echo "  hcloud $(cat "$TOOLS_DIR/bin/hcloud.version")" || echo "  hcloud: NOT staged"
+  [ -f "$TOOLS_DIR/bin/gcloud.version" ] && echo "  gcloud $(cat "$TOOLS_DIR/bin/gcloud.version")" || echo "  gcloud: NOT staged"
+  [ -f "$TOOLS_DIR/python/.modal-version" ] && echo "  modal $(cat "$TOOLS_DIR/python/.modal-version")" || echo "  modal: NOT staged"
+  if [ -d "$TOOLS_DIR/plugins" ]; then
+    find "$TOOLS_DIR/plugins" -name '*.zip' -exec basename {} \; | sed 's/^/  provider /'
+  fi
+  echo "state:  $STATE_DIR"
+  if docker inspect "$CONTAINER" >/dev/null 2>&1; then
+    echo "inside $CONTAINER:"
+    docker exec "$CONTAINER" sh -c '
+      if command -v terraform >/dev/null; then terraform version | head -1; else echo "  terraform not on PATH (recreate Yes Man after the overlay change)"; fi
+      if command -v scw >/dev/null; then scw version 2>/dev/null | head -1; else echo "  scw not on PATH"; fi
+      if command -v doctl >/dev/null; then doctl version 2>/dev/null | head -1; else echo "  doctl not on PATH"; fi
+      if command -v hcloud >/dev/null; then hcloud version 2>/dev/null | head -1; else echo "  hcloud not on PATH"; fi
+      if [ -x /opt/infra-tools/bin/gcloud ]; then echo "  gcloud wrapper staged; federation config $( [ -f /run/oasis-gcp/credential-config.json ] && echo present || echo MISSING)"; else echo "  gcloud not staged"; fi
+      if [ -f /opt/infra-tools/python/.modal-version ]; then echo "modal client $(cat /opt/infra-tools/python/.modal-version) staged"; else echo "  modal client not staged"; fi
+      echo "  TF_CLI_CONFIG_FILE=${TF_CLI_CONFIG_FILE:-unset}"
+      if [ -d /reach/tfstate ] && [ -w /reach/tfstate ]; then echo "  /reach/tfstate writable"; else echo "  /reach/tfstate missing or read-only"; fi
+    ' 2>&1 | sed 's/^/  /'
+  else
+    echo "$CONTAINER is not running"
+  fi
+}
+
+case "${1:-}" in
+  stage) stage ;;
+  check) check ;;
+  *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

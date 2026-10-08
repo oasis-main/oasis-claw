@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# claw-gcp-federation — give Yes Man Google Cloud access with NO Google key
+# (Mike, 2026-10-08: "Federate from his AWS identity").
+#
+# Google Cloud trusts one AWS identity — Yes Man's dev-account user
+# arn:aws:iam::451873237418:user/bots/yesman-infra — through a workload
+# identity pool. That identity may act as ONE Google service account,
+# yesman-infra@<project>, which holds only the roles granted below. Yes Man
+# signs a short AWS request in the container; Google checks it with AWS and
+# returns a 1-hour Google token. The credential config written at the end
+# holds no secret.
+#
+# Runs on the Mac with Mike's own gcloud login (`gcloud auth login` first).
+# Idempotent: a step whose resource exists already is skipped.
+#
+# usage: claw-gcp-federation --project ID [--create-project] [--org ORG_ID]
+#                            [--role ROLE@SCOPE ...] [--apply]
+#   --project         the project that holds the pool and the service account
+#   --create-project  create that project under --org if it does not exist
+#   --org             the organization, for org-wide read roles
+#   --role            extra role, e.g. roles/editor@project:oasis-bot-keys,
+#                     roles/browser@org or
+#                     roles/billing.user@billing:01E494-97437B-601018
+#                     (repeatable)
+#   without --apply it prints the commands and changes nothing
+set -euo pipefail
+
+AWS_ACCOUNT=451873237418
+AWS_ARN="arn:aws:iam::${AWS_ACCOUNT}:user/bots/yesman-infra"
+POOL=oasis-bots
+PROVIDER=aws-yesman
+SA_NAME=yesman-infra
+OUT_DIR="${HOME}/Library/Application Support/oasis-x/yesman-secrets/gcp"
+# Wide reach, low destructive power: read everywhere, change only where a
+# --role says so.
+DEFAULT_ORG_ROLES=(roles/viewer roles/iam.securityReviewer roles/serviceusage.serviceUsageViewer)
+
+project="" org="" apply=0 create=0 roles=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --project) project="$2"; shift 2 ;;
+    --org) org="$2"; shift 2 ;;
+    --create-project) create=1; shift ;;
+    --role) roles+=("$2"); shift 2 ;;
+    --apply) apply=1; shift ;;
+    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+[ -n "$project" ] || { echo "--project is required" >&2; exit 2; }
+
+run() {
+  if [ "$apply" = 1 ]; then echo "+ $*"; "$@"; else echo "would run: $*"; fi
+}
+exists() { "$@" >/dev/null 2>&1; }
+
+account="$(gcloud config get-value account 2>/dev/null || true)"
+echo "gcloud account: ${account:-none}; project: $project; mode: $([ "$apply" = 1 ] && echo APPLY || echo dry-run)"
+if exists gcloud projects describe "$project"; then
+  number="$(gcloud projects describe "$project" --format='value(projectNumber)')"
+elif [ "$create" = 1 ]; then
+  [ -n "$org" ] || { echo "--create-project needs --org" >&2; exit 2; }
+  run gcloud projects create "$project" --organization="$org" --name="$project"
+  if [ "$apply" = 1 ]; then
+    number="$(gcloud projects describe "$project" --format='value(projectNumber)')"
+  else
+    number="<new-project-number>"
+  fi
+else
+  echo "cannot read project $project with this login (run: gcloud auth login, or pass --create-project)" >&2
+  exit 1
+fi
+SA="${SA_NAME}@${project}.iam.gserviceaccount.com"
+PRINCIPAL="principal://iam.googleapis.com/projects/${number}/locations/global/workloadIdentityPools/${POOL}/subject/${AWS_ARN}"
+
+run gcloud services enable iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com \
+  cloudresourcemanager.googleapis.com serviceusage.googleapis.com --project "$project"
+
+if exists gcloud iam workload-identity-pools describe "$POOL" --location=global --project "$project"; then
+  echo "pool $POOL exists"
+else
+  run gcloud iam workload-identity-pools create "$POOL" --location=global --project "$project" \
+    --display-name="oasis-claw bots" --description="AWS identities of oasis-claw bots (claw-gcp-federation)"
+fi
+
+if exists gcloud iam workload-identity-pools providers describe "$PROVIDER" --workload-identity-pool="$POOL" --location=global --project "$project"; then
+  echo "provider $PROVIDER exists"
+else
+  # The condition admits exactly one AWS identity; every other caller from
+  # that account (or any account) is refused.
+  run gcloud iam workload-identity-pools providers create-aws "$PROVIDER" \
+    --workload-identity-pool="$POOL" --location=global --project "$project" \
+    --account-id="$AWS_ACCOUNT" \
+    --attribute-mapping="google.subject=assertion.arn,attribute.aws_account=assertion.account" \
+    --attribute-condition="assertion.arn == '${AWS_ARN}'"
+fi
+
+if exists gcloud iam service-accounts describe "$SA" --project "$project"; then
+  echo "service account $SA exists"
+else
+  run gcloud iam service-accounts create "$SA_NAME" --project "$project" \
+    --display-name="Yes Man (oasis-claw infra broker)"
+fi
+
+run gcloud iam service-accounts add-iam-policy-binding "$SA" --project "$project" \
+  --role=roles/iam.workloadIdentityUser --member="$PRINCIPAL" --condition=None
+
+if [ -n "$org" ]; then
+  for r in "${DEFAULT_ORG_ROLES[@]}"; do
+    run gcloud organizations add-iam-policy-binding "$org" --member="serviceAccount:${SA}" --role="$r" --condition=None
+  done
+else
+  for r in "${DEFAULT_ORG_ROLES[@]}"; do
+    run gcloud projects add-iam-policy-binding "$project" --member="serviceAccount:${SA}" --role="$r" --condition=None
+  done
+fi
+
+for spec in "${roles[@]+"${roles[@]}"}"; do
+  role="${spec%@*}" scope="${spec#*@}"
+  case "$scope" in
+    org) [ -n "$org" ] || { echo "role $role@org needs --org" >&2; exit 2; }
+         run gcloud organizations add-iam-policy-binding "$org" --member="serviceAccount:${SA}" --role="$role" --condition=None ;;
+    project:*) run gcloud projects add-iam-policy-binding "${scope#project:}" --member="serviceAccount:${SA}" --role="$role" --condition=None ;;
+    billing:*) run gcloud billing accounts add-iam-policy-binding "${scope#billing:}" --member="serviceAccount:${SA}" --role="$role" ;;
+    *) echo "bad role scope in $spec (use @org, @project:ID or @billing:ACCOUNT)" >&2; exit 2 ;;
+  esac
+done
+
+# The credential config names the pool, the provider and the service account.
+# It holds no secret: without Yes Man's AWS keys it is useless.
+if [ "$apply" = 1 ]; then
+  mkdir -p "$OUT_DIR"; chmod 700 "$OUT_DIR"
+fi
+run gcloud iam workload-identity-pools create-cred-config \
+  "projects/${number}/locations/global/workloadIdentityPools/${POOL}/providers/${PROVIDER}" \
+  --service-account="$SA" --aws --output-file="${OUT_DIR}/credential-config.json"
+echo "done. Yes Man's gcloud wrapper uses ${OUT_DIR}/credential-config.json with his oasis-dev AWS keys."
