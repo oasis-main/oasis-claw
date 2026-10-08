@@ -26,7 +26,10 @@
         "*_rsa",
         "*_ed25519",
         ".env*",
-        "*.env"
+        "*.env",
+        ".gateway-token",
+        "device-auth.json",
+        "exec-approvals.json"
       ],
       "destructiveExec": "deny",
       "_execComposition": "the operator 2026-07-27 (reviewer-gated bots): benign shell composition RUNS; only the dangerous is gated. compoundExec=allow (pipes | , redirects > >> , && || ;). substitutionExec=escalate ($( ) ` <( ) = eval vector). Hard-DENY (in code, DOWNLOAD_EXEC): pipe/decode into a shell — `… | sh`, `curl … | bash`, `base64 -d | sh`, `eval …` (obfuscated RCE). destructive stays deny; git/docker/openclaw-self-runtime stay escalate. Rationale: mode=full already allows tee/cp/touch as single commands, so gating a plain `>>` was pure friction that forced every append onto the flaky Telegram approval path.",
@@ -45,7 +48,9 @@
       "escalateExecAlways": {
         "_note": "SELF-MODIFICATION backstop — applied to EVERY bot (no opt-in). Load-bearing under mode=full (reviewer-gated exec): a bot driving its own openclaw runtime CLI (e.g. `openclaw config set`) would otherwise default-allow and drift its live config into a crash. NOT claw-* (that would break example-bot's legit claw-coms). Emits principle hard:self-runtime and is NEVER auto-downgraded in unattended runs. Regex, case-insensitive.",
         "_fixed_2026_07_29": "WAS `\\bopenclaw\\b`, which matched the PATH '.openclaw' as well as the command — `\\b` treats the leading dot as a word boundary. Every gog call carries XDG_CONFIG_HOME=/home/node/.openclaw/config (needed to find its OAuth keyring), so EVERY Gmail/Drive/Calendar command escalated. Invisible in shadow; under enforce it broke a bot's unattended cron jobs (they escalate → nobody to approve → 180s timeout → deny). Now matches openclaw only as a COMMAND: start-of-string or after whitespace/;/&/|/(, an optional path prefix, and a following space or end-of-string. Verified against 11 cases incl. `cat /home/node/.openclaw/openclaw.json` (no match) and `/usr/local/bin/openclaw config set` (match).",
-        "self-runtime": "(?:^|[\\s;&|(])(?:[\\w./-]*/)?openclaw(?=\\s|$)"
+        "self-runtime": "(?:^|[\\s;&|(])(?:[\\w./-]*/)?openclaw(?=\\s|$)",
+        "_gateway_credential_note": "CLAW-049 (2026-10-08): a bare gateway token self-grants ANY requested scope over loopback (operator.admin/approvals, tested live), so an exec that reads the token or the device keys, or talks to the bot's own gateway port, is the bot driving its own runtime. Same principle and same never-downgrade handling as self-runtime. node/python3 stay allowed for everything else. Interim control; the structural fix is tracked separately.",
+        "gateway-credential": "\\.gateway-token\\b|\\bdevice-auth\\.json\\b|identity/device\\.json\\b|devices/(?:paired|pending)\\.json\\b|\\bexec-approvals\\.json\\b|\\bOPENCLAW_GATEWAY_TOKEN\\b|gateway-runtime\\.js\\b|\\bcallGatewayFromCli\\b|:18789\\b"
       }
     },
     "per_bot": {}

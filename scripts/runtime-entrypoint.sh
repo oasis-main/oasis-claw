@@ -2619,4 +2619,8 @@ if [ "${OASIS_MEMORY_SELFHEAL:-1}" = "1" ]; then
   ) &
 fi
 
+# CLAW-049: the gateway resolves its token from the file SecretRef written above,
+# so keep the value out of its environment. Every exec child inherits that env
+# (agents.sandbox is off), and a bare token self-grants any scope on loopback.
+unset OPENCLAW_GATEWAY_TOKEN
 exec openclaw gateway --bind "${BIND}" --port "${PORT}"

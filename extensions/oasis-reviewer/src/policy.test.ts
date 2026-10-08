@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import {
   evaluateHard,
   isInertReadOnlyPipeline,
@@ -903,5 +904,59 @@ describe("resolveHardPolicy — mail knobs (CLAW-089)", () => {
     const strict = resolveHardPolicy(file, "house");
     expect(strict.maxBroadcastRecipients).toBe(3);
     expect(strict.mailRequireThreadOrWork).toBe(true);
+  });
+});
+
+// ── CLAW-049: the bot's own gateway credentials (2026-10-08) ─────────────────
+// A bare gateway token self-grants any requested scope over loopback, so reading
+// the token or device keys, or talking to the gateway port, is the bot driving
+// its own runtime. Uses the SHIPPED base policy so the test covers what deploys.
+describe("evaluateHard — gateway credential access (CLAW-049)", () => {
+  const base = JSON.parse(
+    readFileSync(new URL("../policy/reviewer-policy.json", import.meta.url), "utf8"),
+  );
+  const policy = resolveHardPolicy(base, "anybot");
+
+  it("escalates exec that reaches for the gateway token, device keys or port", () => {
+    for (const c of [
+      "cat /home/node/.openclaw/.gateway-token",
+      "cat ~/.openclaw/.gateway-token",
+      "node -e \"require('fs').readFileSync('/home/node/.openclaw/.gateway-token')\"",
+      "python3 -c \"open('/home/node/.openclaw/identity/device-auth.json').read()\"",
+      "cat /home/node/.openclaw/identity/device.json",
+      "cat /home/node/.openclaw/devices/paired.json",
+      "cat /home/node/.openclaw/exec-approvals.json",
+      "printenv OPENCLAW_GATEWAY_TOKEN",
+      "node -e \"new (require('ws'))('ws://127.0.0.1:18789')\"",
+      "node --input-type=module -e \"import('file:///usr/local/lib/node_modules/openclaw/dist/plugin-sdk/gateway-runtime.js')\"",
+    ]) {
+      expect(evaluateHard(exec(c), policy), c).toMatchObject({
+        verdict: "escalate",
+        principle: "hard:self-runtime",
+      });
+    }
+  });
+
+  it("leaves ordinary node and python3 project work alone", () => {
+    for (const c of [
+      "node scripts/build.mjs",
+      "node -e \"console.log(require('./package.json').version)\"",
+      "python3 -m pytest tests/",
+      "python3 tools/device_config.py --out device.json",
+      "cat firmware/config/device.json",
+      "node server.js --port 18080",
+    ]) {
+      expect(evaluateHard(exec(c), policy).principle, c).not.toBe("hard:self-runtime");
+    }
+  });
+
+  it("denies the read tool on the credential files", () => {
+    for (const path of [
+      "/home/node/.openclaw/.gateway-token",
+      "/home/node/.openclaw/identity/device-auth.json",
+      "/home/node/.openclaw/exec-approvals.json",
+    ]) {
+      expect(evaluateHard(file("read", path), policy).verdict, path).toBe("deny");
+    }
   });
 });
