@@ -251,12 +251,18 @@ def capture_redirect(port, auth_url, timeout=300):
     return captured["url"]
 
 
-def refresh_account(display, container, email, services_csv, paste):
+def refresh_account(display, container, email, services_csv, paste, extra_scopes=None):
     print(color(f"\n[{display}] refreshing {email} ({services_csv})", "cyan"))
+    # --extra-scopes adds exact OAuth scope URIs. A narrow admin sign-in uses
+    # it (e.g. Yes Man on hello@: Directory users/groups + Reports read, no
+    # Gmail, no Drive, no cloud-platform), so the scope list stays explicit.
+    extra = ["--extra-scopes", extra_scopes] if extra_scopes else []
+    if extra_scopes:
+        print(color(f"  extra scopes: {extra_scopes}", "cyan"))
 
     r = gog_exec(container, [
         "auth", "add", email, "--remote", "--step", "1",
-        "--services", services_csv, "--force-consent", "-j",
+        "--services", services_csv, *extra, "--force-consent", "-j",
     ])
     try:
         auth_url = json.loads(r.stdout)["auth_url"]
@@ -285,7 +291,7 @@ def refresh_account(display, container, email, services_csv, paste):
 
     gog_exec(container, [
         "auth", "add", email, "--remote", "--step", "2",
-        "--auth-url", redirect, "--services", services_csv,
+        "--auth-url", redirect, "--services", services_csv, *extra,
         "--force-consent",
     ])
     print(color("  ✓ token rotated", "green"))
@@ -330,7 +336,9 @@ def cmd_refresh(args):
                 # carries, so a follow-up gog call for a not-yet-used service
                 # doesn't force a second consent round-trip.
                 print(color(f"[{display}] no accounts configured — bootstrapping {args.account}", "cyan"))
-                refresh_account(display, container, args.account, DEFAULT_BOOTSTRAP_SERVICES, args.paste)
+                refresh_account(display, container, args.account,
+                                args.services or DEFAULT_BOOTSTRAP_SERVICES,
+                                args.paste, args.extra_scopes)
             else:
                 print(color(f"[{display}] no accounts configured", "yellow"))
             continue
@@ -340,8 +348,9 @@ def cmd_refresh(args):
                 print(color(f"[{display}] no account matching {args.account}", "yellow"))
                 continue
         for acc in accounts:
-            services_csv = ",".join(acc.get("services") or []) or "user"
-            refresh_account(display, container, acc["email"], services_csv, args.paste)
+            services_csv = args.services or ",".join(acc.get("services") or []) or "user"
+            refresh_account(display, container, acc["email"], services_csv,
+                            args.paste, args.extra_scopes)
 
 
 def main():
@@ -361,6 +370,11 @@ def main():
     pr.add_argument("--all", action="store_true", help="every running bot")
     pr.add_argument("--account",
                     help="only this email (default: every account on each bot)")
+    pr.add_argument("--services",
+                    help="comma-separated gog services; replaces the stored list "
+                         "(or the broad bootstrap default) for a narrow sign-in")
+    pr.add_argument("--extra-scopes",
+                    help="comma-separated OAuth scope URIs added to the request")
     pr.add_argument("--paste", action="store_true",
                     help="disable auto-browser; paste the redirect URL via stdin")
     pr.set_defaults(func=cmd_refresh)
