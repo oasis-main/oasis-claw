@@ -62,6 +62,7 @@ we\'ve hit; the diff script should catch this class of change).
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -170,16 +171,24 @@ def call_gateway_headless(bot, token, method, params, scopes):
     Invoke a gateway RPC through a null-device-identity, token-authenticated
     connect. Returns the parsed JSON result on success, raises on failure.
     """
-    out = subprocess.run(
-        ["docker", "exec", "-i",
-         "-e", f"GWT={token}",
-         "-e", f"RPC_METHOD={method}",
-         "-e", f"RPC_PARAMS={json.dumps(params)}",
-         "-e", f"RPC_SCOPES={json.dumps(list(scopes))}",
-         container(bot),
-         "node", "--input-type=module", "-e", _NODE_HEADLESS_RPC],
-        capture_output=True, text=True, timeout=45,
-    )
+    # The token travels in the docker CLI's ENVIRONMENT (`-e GWT` with no
+    # value copies it from there), never in argv. An argv token shows in `ps`
+    # and in the TimeoutExpired message, which printed three bots' tokens to a
+    # watcher log on 2026-10-08.
+    env = dict(os.environ, GWT=token)
+    try:
+        out = subprocess.run(
+            ["docker", "exec", "-i",
+             "-e", "GWT",
+             "-e", f"RPC_METHOD={method}",
+             "-e", f"RPC_PARAMS={json.dumps(params)}",
+             "-e", f"RPC_SCOPES={json.dumps(list(scopes))}",
+             container(bot),
+             "node", "--input-type=module", "-e", _NODE_HEADLESS_RPC],
+            capture_output=True, text=True, timeout=90, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"headless RPC timed out ({method}) in {container(bot)}") from None
     if out.returncode != 0:
         err = (out.stderr or out.stdout).strip()
         raise RuntimeError(f"headless RPC failed ({method}): {err[:500]}")
@@ -283,7 +292,16 @@ def main():
 
     deadline = time.time() + (args.timeout if args.watch else 0)
     while True:
-        d = devices_list(args.bot, token)
+        try:
+            d = devices_list(args.bot, token)
+        except RuntimeError as err:
+            # A slow docker exec must not end a long watch; a one-shot run
+            # still fails loudly.
+            if not args.watch or time.time() >= deadline:
+                raise
+            print(f"[claw-approve-v2] {err}; retrying", file=sys.stderr, flush=True)
+            time.sleep(args.interval)
+            continue
         reqs = agent_requests(d.get("pending", []), allow_cli=args.allow_cli)
         if reqs:
             # Newest last — approve the freshest; each connect supersedes the
