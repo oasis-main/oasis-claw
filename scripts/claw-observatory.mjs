@@ -39,9 +39,9 @@
 //      not a regular file.
 //   4. The snapshot never copies identity/device.json (the device private
 //      key), openclaw.json, tokens, or transcripts.
-//   5. The only writes the API takes are change requests (/api/feedback) and
-//      the Control UI open and approve (item 7). A write needs the token AND
-//      this page's Origin. The requests and their screenshots stay in the
+//   5. The only writes the API takes are change requests (/api/feedback),
+//      the Control UI open and approve (item 7), and the settings (item 8).
+//      A write needs the token AND this page's Origin. The requests and their screenshots stay in the
 //      state folder, which no bot mounts: a screenshot can show any agent's
 //      memory.
 //   7. Control UI (Mike, 2026-10-07, R2): on Mike's click, POST
@@ -50,6 +50,14 @@
 //      This server keeps no copy and never logs it. The approve route pairs
 //      only a Control UI browser, never from the container's loopback, and
 //      only for a few minutes after that open (judgeControlUiRequest).
+//   8. Settings (Mike, 2026-10-08): PUT /api/user-md/<bot> replaces that
+//      bot's workspace/USER.md, which openclaw puts in every prompt of that
+//      bot. Only this page can send it (token + Origin, as item 5). The
+//      container refuses the write when the file changed since the page read
+//      it, never follows a symlink, and the server keeps the replaced text
+//      in the state folder. PUT /api/settings keeps the user profile and the
+//      swarm parameters there too. Nothing here reads or writes any other
+//      bot file.
 //   6. `serve` also starts the dot_swarm dashboard (`swarm gui`, 18781), where
 //      the human claims, finishes, blocks and comments on items. A bot can
 //      reach that port too, so the observatory starts it only after it proves
@@ -964,17 +972,22 @@ export function collectTranscript(fs, path, home, agent, sessionId, limitRaw) {
           } catch {
             args = "[unserializable arguments]";
           }
-          parts.push({ t: "call", name: String(p.name ?? ""), args: cap(args, 6000) });
+          parts.push({ t: "call", name: String(p.name ?? ""), args: cap(args, 6000), id: typeof p.id === "string" ? p.id.slice(0, 128) : null });
         } else parts.push({ t: String(p.type ?? "unknown") });
       }
     }
+    // Token counts only (the session view shows them per turn).
+    const u = m.usage && typeof m.usage === "object" ? m.usage : null;
+    const n = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
     entries.push({
       ts: o.timestamp ?? m.timestamp ?? null,
       role: String(m.role ?? "unknown"),
       model: m.model ?? null,
       stopReason: m.stopReason ?? null,
       toolName: m.toolName ?? null,
+      toolCallId: typeof m.toolCallId === "string" ? m.toolCallId.slice(0, 128) : null,
       isError: m.isError ?? null,
+      usage: u ? { input: n(u.input), output: n(u.output), cacheRead: n(u.cacheRead), cacheWrite: n(u.cacheWrite), total: n(u.totalTokens) } : null,
       parts,
     });
   }
@@ -1592,6 +1605,292 @@ const MANIFEST = JSON.stringify({
   icons: [{ src: "/icon.png", sizes: "512x512", type: "image/png", purpose: "any" }],
 });
 
+// ── user settings: USER.md for every bot, and the page's own settings ────────
+// (Mike, 2026-10-08.) The settings page edits each bot's workspace/USER.md
+// (who the human is; openclaw puts it in every session's prompt) and keeps a
+// user profile and the background swarm's parameters in the state folder.
+//
+// A bot also writes its own USER.md as it learns. So the profile goes into
+// one marked block, and an apply replaces only that block. A file that is
+// still the blank openclaw template is replaced whole. A file with the bot's
+// own notes keeps them: the block goes in under the first heading. Every
+// write carries the hash of the text the page saw, and the container refuses
+// it when the file changed since (the bot wrote in between). The previous
+// text is kept in the state folder, which no bot mounts.
+
+export const USER_MD_MAX = 16000;
+export const USER_MD_START = "<!-- fleet-observatory:user-profile:start -->";
+export const USER_MD_END = "<!-- fleet-observatory:user-profile:end -->";
+const USER_MD_HISTORY_KEEP = 30;
+export const PROFILE_FIELDS = [
+  ["name", "Name"],
+  ["callThem", "What to call them"],
+  ["pronouns", "Pronouns"],
+  ["timezone", "Timezone"],
+  ["notes", "Notes"],
+];
+const PROFILE_MAX = { context: 8000 };
+const SETTINGS_FILE = path.join(STATE_DIR, "settings.json");
+const USER_MD_HISTORY_DIR = path.join(STATE_DIR, "user-md-history");
+const SWARM_KEY_RE = /^[A-Z][A-Z0-9_]{0,40}$/;
+
+/** Read ("read") or replace ("write") workspace/USER.md inside a bot
+ *  container. A write needs the hash of the current text (or "missing"), and
+ *  takes the new text as base64. Self-contained: it runs as `node -e`. */
+export function collectUserMd(fs, path, home, op, baseHash, b64) {
+  const MAX = 16000;
+  const file = path.join(home, "workspace", "USER.md");
+  // cyrb53-style hash: a change check, not a security check.
+  const hash = (s) => {
+    let h1 = 0xdeadbeef ^ s.length;
+    let h2 = 0x41c6ce57 ^ s.length;
+    for (let i = 0; i < s.length; i++) {
+      const c = s.charCodeAt(i);
+      h1 = Math.imul(h1 ^ c, 2654435761);
+      h2 = Math.imul(h2 ^ c, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (h2 >>> 0).toString(16).padStart(8, "0") + (h1 >>> 0).toString(16).padStart(8, "0");
+  };
+  const read = () => {
+    let st;
+    try {
+      st = fs.lstatSync(file);
+    } catch (err) {
+      if (err.code === "ENOENT") return { exists: false, text: "", hash: "missing", size: 0, mtimeMs: null };
+      throw err;
+    }
+    if (!st.isFile()) return { error: "USER.md is not a regular file" };
+    if (st.size > 256 * 1024) return { error: "USER.md is larger than 256 KB" };
+    const text = fs.readFileSync(file, "utf8");
+    return { exists: true, text, hash: hash(text), size: st.size, mtimeMs: st.mtimeMs };
+  };
+  const current = read();
+  if (op !== "write" || current.error) return current;
+  if (current.hash !== baseHash) return { conflict: true, ...current };
+  const text = Buffer.from(String(b64 ?? ""), "base64").toString("utf8");
+  if (text.length > MAX) return { error: `the new text is longer than ${MAX} characters` };
+  const dir = path.dirname(file);
+  if (!fs.lstatSync(dir).isDirectory()) return { error: "the workspace is not a directory" };
+  const tmp = path.join(dir, `.USER.md.observatory-${Date.now()}`);
+  fs.writeFileSync(tmp, text, { mode: 0o644, flag: "wx" });
+  fs.renameSync(tmp, file);
+  return { written: true, ...read() };
+}
+
+const profileValue = (profile, key) => String(profile?.[key] ?? "").trim();
+
+/** The managed block: the profile fields and the context, between markers. */
+export function renderProfileBlock(profile) {
+  const lines = [
+    USER_MD_START,
+    "<!-- Written from the Fleet Observatory settings. An edit inside this block is replaced on the next apply; add your own notes outside it. -->",
+    ...PROFILE_FIELDS.map(([key, label]) => `- **${label}:** ${profileValue(profile, key).replace(/\s*\n\s*/g, " ")}`.trimEnd()),
+  ];
+  const context = profileValue(profile, "context");
+  if (context) lines.push("", "### Context", "", context);
+  lines.push(USER_MD_END);
+  return lines.join("\n");
+}
+
+/** True when the text is still openclaw's blank USER.md template: no field
+ *  filled in, and nothing in Context but the italic prompt. */
+export function isBlankUserTemplate(text) {
+  if (!/^#\s*USER\.md\b/m.test(text) || text.includes(USER_MD_START)) return false;
+  for (const [, label] of PROFILE_FIELDS) {
+    const m = text.match(new RegExp(`^\\s*-\\s*\\*\\*${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:\\*\\*(.*)$`, "m"));
+    if (m && m[1].replace(/_\(optional\)_/i, "").trim()) return false;
+  }
+  const context = text.split(/^##\s*Context\s*$/m)[1]?.split(/^---\s*$/m)[0] ?? "";
+  return context
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .every((l) => /^_.*_$/.test(l));
+}
+
+/** A whole USER.md for a bot that has no notes of its own yet. */
+export function renderUserMd(profile) {
+  return [
+    "# USER.md - About Your Human",
+    "",
+    renderProfileBlock(profile),
+    "",
+    "## What I have learned",
+    "",
+    "_(Add what you learn about this person here, below the block above.)_",
+    "",
+  ].join("\n");
+}
+
+/** The new USER.md after an apply of the profile to the current text. */
+export function mergeUserMd(current, profile) {
+  const text = String(current ?? "");
+  const block = renderProfileBlock(profile);
+  const start = text.indexOf(USER_MD_START);
+  const end = text.indexOf(USER_MD_END, start);
+  if (start >= 0 && end > start) return text.slice(0, start) + block + text.slice(end + USER_MD_END.length);
+  if (!text.trim() || isBlankUserTemplate(text)) return renderUserMd(profile);
+  const heading = text.match(/^#[^#].*$/m);
+  if (!heading) return `${block}\n\n${text}`;
+  const at = heading.index + heading[0].length;
+  return `${text.slice(0, at)}\n\n${block}\n${text.slice(at)}`;
+}
+
+/** Check a settings change from the page. Returns the clean patch, or throws
+ *  with status 400. */
+export function validateSettings(patch) {
+  const bad = (msg) => Object.assign(new Error(msg), { status: 400 });
+  if (!patch || typeof patch !== "object" || Array.isArray(patch)) throw bad("the body must be a JSON object");
+  const out = {};
+  for (const key of Object.keys(patch)) {
+    if (key !== "profile" && key !== "swarm") throw bad(`unknown setting "${key}"`);
+  }
+  if (patch.profile !== undefined) {
+    const p = patch.profile;
+    if (!p || typeof p !== "object" || Array.isArray(p)) throw bad("profile must be an object");
+    const allowed = new Set([...PROFILE_FIELDS.map(([k]) => k), "context"]);
+    out.profile = {};
+    for (const [k, v] of Object.entries(p)) {
+      if (!allowed.has(k)) throw bad(`unknown profile field "${k}"`);
+      if (typeof v !== "string") throw bad(`profile.${k} must be text`);
+      const max = PROFILE_MAX[k] ?? 400;
+      if (v.length > max) throw bad(`profile.${k} is longer than ${max} characters`);
+      out.profile[k] = v;
+    }
+  }
+  if (patch.swarm !== undefined) {
+    const s = patch.swarm;
+    if (s === null) {
+      out.swarm = {};
+    } else {
+      if (typeof s !== "object" || Array.isArray(s)) throw bad("swarm must be an object or null");
+      const keys = Object.keys(s);
+      if (keys.length > 80) throw bad("too many swarm parameters");
+      out.swarm = {};
+      for (const k of keys) {
+        if (!SWARM_KEY_RE.test(k)) throw bad(`bad swarm parameter name "${k}"`);
+        if (typeof s[k] !== "number" || !Number.isFinite(s[k])) throw bad(`swarm.${k} must be a finite number`);
+        out.swarm[k] = s[k];
+      }
+    }
+  }
+  return out;
+}
+
+/** settings.json in the state folder: { profile, swarm, updatedAt }. */
+export function settingsStore(file) {
+  const read = () => {
+    try {
+      const v = JSON.parse(fs.readFileSync(file, "utf8"));
+      return { profile: v.profile ?? {}, swarm: v.swarm ?? {}, updatedAt: v.updatedAt ?? null };
+    } catch {
+      return { profile: {}, swarm: {}, updatedAt: null };
+    }
+  };
+  return {
+    read,
+    update(patch) {
+      const next = { ...read(), ...validateSettings(patch), updatedAt: new Date().toISOString() };
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      const tmp = `${file}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+      fs.renameSync(tmp, file);
+      return next;
+    },
+  };
+}
+
+/** Keep the text a write replaced: <dir>/<bot>/<time>.md, newest 30. */
+export function keepUserMdHistory(dir, key, text) {
+  const botDir = path.join(dir, key);
+  fs.mkdirSync(botDir, { recursive: true, mode: 0o700 });
+  const name = `${new Date().toISOString().replace(/[:.]/g, "-")}.md`;
+  fs.writeFileSync(path.join(botDir, name), text, { mode: 0o600 });
+  const all = fs.readdirSync(botDir).filter((n) => n.endsWith(".md")).sort();
+  for (const old of all.slice(0, Math.max(0, all.length - USER_MD_HISTORY_KEEP))) fs.rmSync(path.join(botDir, old));
+  return name;
+}
+
+const SETTINGS_PATH_RE = /^\/api\/settings$/;
+const USER_MD_PATH_RE = /^\/api\/user-md(?:\/([a-z0-9-]{1,40})(?:\/(preview))?)?$/;
+const isSettingsWrite = (method, pathname) =>
+  method === "PUT" && (SETTINGS_PATH_RE.test(pathname) || /^\/api\/user-md\/[a-z0-9-]{1,40}$/.test(pathname));
+
+/** /api/settings and /api/user-md[/<bot>[/preview]]. Returns [status, json].
+ *  settings          GET   { profile, swarm, updatedAt }
+ *                    PUT   { profile?, swarm? }: merge and keep
+ *  user-md           GET   every bot's USER.md, and the profile
+ *  user-md/<bot>     PUT   { text, baseHash }: replace that bot's USER.md
+ *  user-md/<bot>/preview
+ *                    GET   the text an apply of the saved profile gives */
+async function routeSettings(req, url, ctx) {
+  if (SETTINGS_PATH_RE.test(url.pathname)) {
+    if (req.method === "GET") return [200, ctx.settings.read()];
+    if (req.method === "PUT") {
+      let patch;
+      try {
+        patch = JSON.parse((await readBody(req, 64 * 1024)).toString("utf8"));
+      } catch (err) {
+        if (err.status) throw err;
+        return [400, { error: "the body is not valid JSON" }];
+      }
+      return [200, ctx.settings.update(patch)];
+    }
+    return [405, { error: "method not allowed here" }];
+  }
+  const [, key, sub] = USER_MD_PATH_RE.exec(url.pathname) ?? [];
+  const fleet = await cached(ctx, "fleet", 4000, ctx.discover);
+  if (!key) {
+    if (req.method !== "GET") return [405, { error: "method not allowed here" }];
+    const bots = await Promise.all(
+      fleet.bots.map(async (bot) => {
+        const base = { key: bot.key, running: bot.running, state: bot.state };
+        if (!bot.running) return { ...base, error: `${bot.container} is ${bot.state}` };
+        try {
+          return { ...base, ...(await ctx.readUserMd(bot)) };
+        } catch (err) {
+          return { ...base, error: err.message };
+        }
+      }),
+    );
+    return [200, { profile: ctx.settings.read().profile, bots }];
+  }
+  const bot = fleet.bots.find((b) => b.key === key);
+  if (!bot) return [404, { error: `unknown bot "${key}"` }];
+  if (!bot.running) return [409, { error: `${bot.container} is ${bot.state}` }];
+  if (sub === "preview") {
+    if (req.method !== "GET") return [405, { error: "method not allowed here" }];
+    const current = await ctx.readUserMd(bot);
+    if (current.error) return [409, { error: current.error }];
+    return [200, { text: mergeUserMd(current.text, ctx.settings.read().profile), baseHash: current.hash }];
+  }
+  if (req.method !== "PUT") return [405, { error: "method not allowed here" }];
+  let body;
+  try {
+    body = JSON.parse((await readBody(req, 128 * 1024)).toString("utf8"));
+  } catch (err) {
+    if (err.status) throw err;
+    return [400, { error: "the body is not valid JSON" }];
+  }
+  if (typeof body?.text !== "string") return [400, { error: "text must be a string" }];
+  if (typeof body.baseHash !== "string" || !/^(missing|[0-9a-f]{16})$/.test(body.baseHash)) return [400, { error: "baseHash is missing or malformed" }];
+  if (body.text.length > USER_MD_MAX) return [413, { error: `USER.md is limited to ${USER_MD_MAX} characters` }];
+  const before = await ctx.readUserMd(bot);
+  if (before.error) return [409, { error: before.error }];
+  const result = await ctx.writeUserMd(bot, body.baseHash, body.text);
+  if (result.error) return [409, { error: result.error }];
+  if (result.conflict) {
+    const { conflict: _c, ...current } = result;
+    return [409, { error: `${bot.key} changed its USER.md after this page read it. Reload, then apply again.`, current }];
+  }
+  // The text this write replaced. Taken from the read just before the write;
+  // the container compared hashes, so it is the text that was replaced.
+  if (before.exists && before.hash === body.baseHash) ctx.keepUserMdHistory(bot.key, before.text);
+  return [200, result];
+}
+
 // ── observatory HTTP server ──────────────────────────────────────────────────
 
 const SECURITY_HEADERS = {
@@ -1623,7 +1922,7 @@ export function checkRequest(req, port) {
     return null;
   }
   const pathname = String(req.url ?? "").split("?")[0];
-  if (!WRITE_METHODS.has(req.method) || !(isFeedbackPath(pathname) || isControlUiWrite(pathname))) {
+  if (!WRITE_METHODS.has(req.method) || !(isFeedbackPath(pathname) || isControlUiWrite(pathname) || isSettingsWrite(req.method, pathname))) {
     return { status: 405, error: "read-only" };
   }
   // A browser always sends Origin with a POST, PUT or DELETE fetch. A write
@@ -2191,6 +2490,11 @@ export function createObservatoryServer(ctx) {
   ctx.identityRefreshing ??= new Set();
   ctx.readIdentity ??= (bot) => collect(bot.container, collectIdentity);
   ctx.readColony ??= () => readColony(ctx.swarm.root);
+  ctx.settings ??= settingsStore(SETTINGS_FILE);
+  ctx.readUserMd ??= (bot) => collect(bot.container, collectUserMd, ["read"]);
+  ctx.writeUserMd ??= (bot, baseHash, text) =>
+    collect(bot.container, collectUserMd, ["write", baseHash, Buffer.from(text, "utf8").toString("base64")]);
+  ctx.keepUserMdHistory ??= (key, text) => keepUserMdHistory(USER_MD_HISTORY_DIR, key, text);
   return http.createServer((req, res) => {
     const refused = checkRequest(req, ctx.port);
     if (refused) {
@@ -2250,6 +2554,16 @@ export function createObservatoryServer(ctx) {
           // Stop reading a body that was refused part-way.
           if (err.status === 413) res.once("finish", () => req.destroy());
           sendJson(res, err.status ?? 500, { error: err.message });
+        },
+      );
+      return;
+    }
+    if (SETTINGS_PATH_RE.test(url.pathname) || USER_MD_PATH_RE.test(url.pathname)) {
+      routeSettings(req, url, ctx).then(
+        ([status, body]) => sendJson(res, status, body),
+        (err) => {
+          if (err.status === 413) res.once("finish", () => req.destroy());
+          sendJson(res, err.status ?? 502, { error: err.message });
         },
       );
       return;

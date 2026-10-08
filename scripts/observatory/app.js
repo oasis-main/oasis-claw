@@ -474,6 +474,7 @@ const VIEWS = [
   { id: "work", label: "Work", sub: "System 2" },
   { id: "live", label: "Live", sub: "System 1" },
   { id: "agents", label: "Agents", sub: "System 3" },
+  { id: "settings", label: "Settings", sub: "You · background" },
 ];
 
 function loadView() {
@@ -482,6 +483,15 @@ function loadView() {
     return VIEWS.some((x) => x.id === v) ? v : "work";
   } catch {
     return "work";
+  }
+}
+
+/** localStorage read for the app's starting state (recall() comes later). */
+function recallEarly(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
   }
 }
 
@@ -502,6 +512,11 @@ const app = {
     lastSize: null,
     data: null,
     toggled: new Map(),
+    mode: recallEarly("claw-observatory-live-mode") === "entries" ? "entries" : "turns",
+    depth: Math.min(4, Math.max(0, Number(recallEarly("claw-observatory-live-depth") ?? 1) || 0)),
+    turnDepth: new Map(),
+    zoom: new Set(),
+    redraw: null,
   },
   agents: { bot: null, tab: "identity", q: "" },
 };
@@ -640,10 +655,12 @@ async function refreshFleet(initial) {
 
 function renderView() {
   clearTimers();
+  document.body.classList.remove("swarm-solo");
   mainEl.replaceChildren();
   if (!app.fleet) return;
   if (app.view === "work") renderWork();
   else if (app.view === "live") renderLive();
+  else if (app.view === "settings") renderSettings();
   else renderAgents();
 }
 
@@ -893,6 +910,242 @@ function entryView(entry) {
   );
 }
 
+// ── turns: the session by depth (Mike, 2026-10-08) ───────────────────────────
+// Telegram gets the brief; this view gets the full chain. Each turn starts at
+// a message to the bot and runs to the next one. One depth setting opens
+// every turn to the same level, and each turn can go deeper on its own; a
+// click on a step shows its full detail (zoom).
+
+const DEPTHS = [
+  ["Brief", "Your message and the final answer, as Telegram shows them."],
+  ["Summaries", "Plus each interim message the bot wrote between steps."],
+  ["Tools", "Plus each tool call: name, time taken, and whether it failed."],
+  ["Reasoning", "Plus the thinking text and a line of each tool's output."],
+  ["Raw", "Plus the raw record of every transcript entry."],
+];
+const LIVE_MODE_KEY = "claw-observatory-live-mode";
+const LIVE_DEPTH_KEY = "claw-observatory-live-depth";
+const RUNNING_STOPS = new Set(["toolUse", "tool_use"]);
+
+const partText = (e) => (e?.parts ?? []).filter((p) => p.t === "text").map((p) => p.text).join("\n\n");
+const firstLine = (s, n = 160) => {
+  const line = String(s ?? "").trim().split("\n").find((l) => l.trim()) ?? "";
+  return line.length > n ? `${line.slice(0, n)}…` : line;
+};
+const seconds = (a, b) => {
+  const x = toMs(a);
+  const y = toMs(b);
+  if (x == null || y == null || y < x) return null;
+  const s = (y - x) / 1000;
+  return s < 10 ? `${s.toFixed(1)} s` : s < 120 ? `${Math.round(s)} s` : `${Math.round(s / 60)} min`;
+};
+
+/** Group transcript entries into turns. A step has a depth: it shows when the
+ *  turn's depth is at least that much. */
+function buildTurns(entries) {
+  const turns = [];
+  let cur = null;
+  const open = (user) => {
+    cur = { user, steps: [], entries: user ? [user] : [] };
+    turns.push(cur);
+  };
+  for (const e of entries) {
+    if (e.role === "user") {
+      open(e);
+      continue;
+    }
+    if (!cur) open(null);
+    cur.entries.push(e);
+    if (e.event) {
+      cur.steps.push({ k: "event", d: 2, e });
+    } else if (e.role === "assistant") {
+      for (const p of e.parts) {
+        if (p.t === "thinking" && p.text?.trim()) cur.steps.push({ k: "think", d: 3, p, e });
+        else if (p.t === "text" && p.text?.trim()) cur.steps.push({ k: "text", d: 1, p, e });
+        else if (p.t === "call") cur.steps.push({ k: "call", d: 2, p, e, result: null });
+      }
+    } else if (e.role === "toolResult") {
+      const call = [...cur.steps].reverse().find((s) => s.k === "call" && !s.result && (e.toolCallId && s.p.id ? s.p.id === e.toolCallId : s.p.name === e.toolName));
+      if (call) call.result = e;
+      else cur.steps.push({ k: "result", d: 2, e });
+    }
+  }
+  for (const t of turns) {
+    const last = t.entries[t.entries.length - 1];
+    t.running = !last || last.role === "toolResult" || (last.role === "assistant" && RUNNING_STOPS.has(last.stopReason)) || last === t.user;
+    // The final answer is the last message the bot wrote, once the turn ended.
+    const texts = t.steps.filter((s) => s.k === "text");
+    if (!t.running && texts.length) Object.assign(texts[texts.length - 1], { k: "final", d: 0 });
+    const asst = t.entries.filter((e) => e.role === "assistant");
+    // Output tokens summed; context = what the last model call read (input,
+    // cache read and cache write). Summing totals would count the context
+    // once for every call.
+    t.outTokens = asst.reduce((n, e) => n + (e.usage?.output ?? 0), 0);
+    const lastUse = [...asst].reverse().find((e) => e.usage)?.usage;
+    t.context = lastUse ? (lastUse.input ?? 0) + (lastUse.cacheRead ?? 0) + (lastUse.cacheWrite ?? 0) : 0;
+    t.models = [...new Set(asst.map((e) => e.model).filter(Boolean))];
+    t.calls = t.steps.filter((s) => s.k === "call").length;
+    t.failed = t.steps.filter((s) => s.k === "call" && s.result?.isError).length;
+    t.startTs = t.entries[0]?.ts ?? null;
+    t.endTs = last?.ts ?? null;
+    t.key = `${t.startTs ?? "start"}|${turns.indexOf(t)}`;
+  }
+  return turns;
+}
+
+const turnMatches = (t, q) =>
+  !q ||
+  t.entries.some((e) => (e.event ? matches(q, e.event) : e.parts.some((p) => matches(q, p.text, p.name, p.args))));
+
+function depthBar(value, onPick, small = false) {
+  return h(
+    "div",
+    { class: `depth-bar${small ? " small" : ""}`, role: "group", "aria-label": small ? "Depth of this turn" : "Depth for all turns" },
+    DEPTHS.map(([label, hint], i) =>
+      h("button", {
+        type: "button",
+        class: `depth${i === value ? " active" : ""}`,
+        "aria-pressed": String(i === value),
+        title: `${i} ${label}: ${hint}`,
+        text: small ? String(i) : `${i} ${label}`,
+        onclick: () => onPick(i),
+      }),
+    ),
+  );
+}
+
+/** One step row; a click opens or closes its detail. */
+function stepRow(kind, label, text, zoomKey, detail) {
+  const zoomed = detail && app.live.zoom.has(zoomKey);
+  const row = h(
+    "div",
+    { class: `step s-${kind}${detail ? " zoomable" : ""}${zoomed ? " zoomed" : ""}`, title: detail ? (zoomed ? "Click to close" : "Click to see all of it") : null },
+    h("span", { class: `step-tag tag-${kind}`, text: label }),
+    h("span", { class: `step-text${kind === "final" || kind === "user" ? " full" : ""}`, text }),
+  );
+  if (detail) {
+    row.tabIndex = 0;
+    const toggle = () => {
+      if (app.live.zoom.has(zoomKey)) app.live.zoom.delete(zoomKey);
+      else app.live.zoom.add(zoomKey);
+      app.live.redraw?.();
+    };
+    row.addEventListener("click", (e) => {
+      if (window.getSelection()?.toString()) return; // selecting text is not a click
+      e.stopPropagation();
+      toggle();
+    });
+    row.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        toggle();
+      }
+    });
+  }
+  return zoomed ? [row, h("div", { class: "step-zoom" }, detail)] : [row];
+}
+
+const pre = (text, extra = "") => h("pre", { class: `mono small zoom-pre ${extra}`, text });
+const rawView = (e) => pre(JSON.stringify(e, null, 2), "raw");
+
+function turnView(t, depth) {
+  const d = app.live.turnDepth.get(t.key) ?? depth;
+  const rows = [];
+  const zk = (i) => `${t.key}|${i}`;
+  if (t.user) {
+    const text = partText(t.user) || "(no text)";
+    const long = text.length > 600;
+    rows.push(...stepRow("user", "you", long ? `${text.slice(0, 600)}…` : text, zk("u"), long || d >= 4 ? [long ? pre(text) : null, d >= 4 ? rawView(t.user) : null].filter(Boolean) : null));
+  } else {
+    rows.push(h("div", { class: "muted small step-note", text: "The start of the transcript in view (the first message is older)." }));
+  }
+  let hidden = 0;
+  t.steps.forEach((s, i) => {
+    if (s.d > d) {
+      hidden++;
+      return;
+    }
+    const raw = d >= 4 && s.e ? [rawView(s.e)] : [];
+    if (s.k === "final") {
+      rows.push(...stepRow("final", "answer", s.p.text, zk(i), raw.length ? raw : null));
+    } else if (s.k === "text") {
+      const long = s.p.text.length > 400;
+      const detail = [long ? pre(s.p.text) : null, ...raw].filter(Boolean);
+      rows.push(...stepRow("text", "summary", long ? `${s.p.text.slice(0, 400)}…` : s.p.text, zk(i), detail.length ? detail : null));
+    } else if (s.k === "think") {
+      rows.push(...stepRow("think", "reasoning", s.p.text.length > 240 ? `${s.p.text.slice(0, 240)}…` : s.p.text, zk(i), [pre(s.p.text, "thinking-pre"), ...raw]));
+    } else if (s.k === "call") {
+      const took = s.result ? seconds(s.e.ts, s.result.ts) : null;
+      const state = !s.result ? "no result yet" : s.result.isError ? "failed" : "ok";
+      let arg = "";
+      try {
+        const a = JSON.parse(s.p.args);
+        arg = firstLine(a.command ?? a.path ?? a.file_path ?? a.query ?? a.url ?? a.action ?? "", 90);
+      } catch {
+        arg = "";
+      }
+      const out = s.result ? partText(s.result) : "";
+      rows.push(
+        ...stepRow(
+          s.result?.isError ? "fail" : "call",
+          "tool",
+          [s.p.name, arg, took, state].filter(Boolean).join(" · "),
+          zk(i),
+          [h("div", { class: "muted small", text: "arguments" }), pre(s.p.args), s.result ? h("div", { class: "muted small", text: `output · ${num(out.length)} characters` }) : null, s.result ? pre(out || "(empty)") : null, ...raw, ...(d >= 4 && s.result ? [rawView(s.result)] : [])].filter(Boolean),
+        ),
+      );
+      if (d >= 3 && out) rows.push(h("div", { class: "step-out mono small", text: `→ ${firstLine(out, 200)}` }));
+    } else if (s.k === "result") {
+      rows.push(...stepRow(s.e.isError ? "fail" : "call", "result", `${s.e.toolName ?? "tool"} · ${firstLine(partText(s.e), 120)}`, zk(i), [pre(partText(s.e)), ...raw]));
+    } else if (s.k === "event") {
+      rows.push(...stepRow("event", "event", s.e.event.replace(/_/g, " "), zk(i), d >= 4 ? [rawView(s.e)] : null));
+    }
+  });
+  if (hidden) {
+    rows.push(
+      h("button", {
+        type: "button",
+        class: "step-more",
+        text: `${hidden} more step${hidden === 1 ? "" : "s"} at a deeper level`,
+        onclick: () => {
+          app.live.turnDepth.set(t.key, Math.min(4, d + 1));
+          app.live.redraw?.();
+        },
+      }),
+    );
+  }
+  if (t.running) rows.push(h("div", { class: "step-note small", text: "Working… the turn has not ended." }));
+  const meta = [when(t.startTs), seconds(t.startTs, t.endTs), t.outTokens ? `${num(t.outTokens)} tokens out` : null, t.context ? `context ${num(t.context)}` : null, t.calls ? `${t.calls} tool call${t.calls === 1 ? "" : "s"}` : null, t.models.join(", ") || null].filter(Boolean).join(" · ");
+  return h(
+    "article",
+    { class: `turn${t.running ? " running" : ""}` },
+    h(
+      "div",
+      { class: "turn-head" },
+      h("span", { class: "muted small", text: meta }),
+      t.failed ? chip(`${t.failed} failed`, "bad") : null,
+      t.running ? chip("working", "info") : null,
+      app.live.turnDepth.has(t.key)
+        ? h("button", {
+            type: "button",
+            class: "fb-link small",
+            text: "use the depth for all",
+            onclick: () => {
+              app.live.turnDepth.delete(t.key);
+              app.live.redraw?.();
+            },
+          })
+        : null,
+      h("span", { class: "grow" }),
+      depthBar(d, (i) => {
+        app.live.turnDepth.set(t.key, i);
+        app.live.redraw?.();
+      }, true),
+    ),
+    rows,
+  );
+}
+
 const LIMIT_STEPS = [150, 300, 600, 1000];
 const SESSION_KINDS = ["all", "chat", "main", "subagent", "cron", "hook", "heartbeat", "dream", "other"];
 const PART_TOGGLES = [
@@ -1054,9 +1307,48 @@ function renderLive() {
       h("div", { class: "grow" }, h("h2", { class: "mono", text: shortKey(s.key) }), meta),
       controlUiLink(bot, "Open in Control UI ↗"),
     );
+    const modeBar = h("div", { class: "pill-bar", role: "group", "aria-label": "View" });
+    const depthSlot = h("div", { class: "depth-slot" });
+    const drawControls = () => {
+      modeBar.replaceChildren(
+        ...[
+          ["turns", "Turns", "One row for each turn, opened to a depth"],
+          ["entries", "Entries", "Every transcript entry, with part toggles"],
+        ].map(([id, label, tip]) =>
+          h("button", {
+            type: "button",
+            class: `pill small${app.live.mode === id ? " active" : ""}`,
+            "aria-pressed": String(app.live.mode === id),
+            title: tip,
+            text: label,
+            onclick: () => {
+              app.live.mode = id;
+              remember(LIVE_MODE_KEY, id);
+              drawControls();
+              drawTranscript(true);
+            },
+          }),
+        ),
+      );
+      toggles.hidden = app.live.mode !== "entries";
+      depthSlot.replaceChildren(
+        app.live.mode === "turns"
+          ? depthBar(app.live.depth, (i) => {
+              app.live.depth = i;
+              app.live.turnDepth.clear();
+              remember(LIVE_DEPTH_KEY, String(i));
+              drawControls();
+              drawTranscript(false);
+            })
+          : "",
+      );
+    };
+    drawControls();
     const tools = h(
       "div",
       { class: "toolbar tight" },
+      modeBar,
+      depthSlot,
       toggles,
       filterBox("Filter this transcript", app.live.tq, (v) => {
         app.live.tq = v;
@@ -1075,8 +1367,20 @@ function renderLive() {
     if (!chrome || chrome.key !== rowId(s.botKey, s)) chrome = transcriptChrome();
     const bot = botByKey(s.botKey);
     const { meta, body } = chrome;
-    const visible = data.entries.map(visibleEntry).filter(Boolean);
-    meta.textContent = [botLabel(bot), s.kind, s.model, `updated ${ago(s.updatedAt)}`, bytes(data.size), `showing ${visible.length} of ${data.entries.length} entries`].filter(Boolean).join(" · ");
+    app.live.redraw = () => drawTranscript(false);
+    let rows;
+    let shown;
+    if (app.live.mode === "turns") {
+      const turns = buildTurns(data.entries);
+      const kept = turns.filter((t) => turnMatches(t, app.live.tq));
+      shown = `showing ${kept.length} of ${turns.length} turns`;
+      rows = kept.length ? kept.map((t) => turnView(t, app.live.depth)) : [empty("No turn matches the filter.")];
+    } else {
+      const visible = data.entries.map(visibleEntry).filter(Boolean);
+      shown = `showing ${visible.length} of ${data.entries.length} entries`;
+      rows = visible.length ? visible.map(entryView) : [empty("No entry matches the toggles and the filter.")];
+    }
+    meta.textContent = [botLabel(bot), s.kind, s.model, `updated ${ago(s.updatedAt)}`, bytes(data.size), shown].filter(Boolean).join(" · ");
     const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 160;
     const keep = body.scrollTop;
     const canLoadMore = data.entries.length >= app.live.limit && app.live.limit < LIMIT_STEPS[LIMIT_STEPS.length - 1];
@@ -1094,7 +1398,7 @@ function renderLive() {
         ? h("div", { class: "muted small center", text: "Older entries are outside the last 6 MB of this transcript." })
         : null;
     // replaceChildren takes nodes, not arrays, and prints null as text.
-    body.replaceChildren(...[older, ...(visible.length ? visible.map(entryView) : [empty("No entry matches the toggles and the filter.")])].filter(Boolean));
+    body.replaceChildren(...[older, ...rows].filter(Boolean));
     if (force || atBottom) body.scrollTop = body.scrollHeight;
     else body.scrollTop = keep;
   }
@@ -1926,6 +2230,537 @@ function mountFeedback() {
   setOpen(recall(FB_OPEN_KEY) === "1");
 }
 
+// ── settings: the user, every bot's USER.md, the background (Mike, 2026-10-08)
+//
+// One panel, shown two ways: in a dialog from the gear button, and as the
+// Settings view. "You" keeps the user profile and edits each bot's
+// workspace/USER.md (openclaw puts that file in every prompt of the bot).
+// "Background" changes the swarm parameters live; the changed values are
+// kept on the server, so every browser that opens this page gets them.
+
+const PROFILE_FIELDS = [
+  ["name", "Name", "full name"],
+  ["callThem", "What to call them", "first name or nickname"],
+  ["pronouns", "Pronouns", "optional"],
+  ["timezone", "Timezone", "for example Europe/London"],
+  ["notes", "Notes", "one line: role, background, what matters"],
+];
+const USER_MD_MAX = 16000;
+const SETTINGS_SECTION_KEY = "claw-observatory-settings-section";
+
+app.settings = { profile: {}, swarm: {}, loaded: false };
+
+/** Read the kept settings once, and give the swarm its kept parameters. */
+async function loadSettings() {
+  try {
+    const s = await api("/api/settings");
+    app.settings = { profile: s.profile ?? {}, swarm: s.swarm ?? {}, loaded: true };
+    window.observatorySwarm?.set(app.settings.swarm);
+  } catch {
+    // The page works without them: the swarm keeps its defaults.
+  }
+}
+
+async function saveSettings(patch) {
+  const s = await api("/api/settings", { method: "PUT", type: "application/json", body: JSON.stringify(patch) });
+  app.settings = { profile: s.profile ?? {}, swarm: s.swarm ?? {}, loaded: true };
+  return s;
+}
+
+function settingsPanel(where) {
+  const sections = [
+    { id: "you", label: "You and USER.md" },
+    { id: "background", label: "Background" },
+  ];
+  let current = recall(SETTINGS_SECTION_KEY) === "background" ? "background" : "you";
+  const nav = h("nav", { class: "subtabs", "aria-label": "Settings" });
+  const body = h("div", { class: "settings-body" });
+  const root = h("div", { class: `settings settings-in-${where}` }, nav, body);
+  const show = (id) => {
+    current = id;
+    remember(SETTINGS_SECTION_KEY, id);
+    root.dataset.section = id;
+    if (id !== "background") document.body.classList.remove("swarm-solo");
+    root.dispatchEvent(new CustomEvent("settings:section", { detail: id, bubbles: true }));
+    nav.replaceChildren(
+      ...sections.map((s) =>
+        h("button", { type: "button", class: `subtab${s.id === id ? " active" : ""}`, "aria-pressed": String(s.id === id), text: s.label, onclick: () => show(s.id) }),
+      ),
+    );
+    body.replaceChildren(id === "you" ? youSection() : backgroundSection());
+  };
+  root.show = show;
+  queueMicrotask(() => show(current));
+  return root;
+}
+
+// ── You: the profile and each bot's USER.md ───────────────────────────────────
+
+function youSection() {
+  const status = h("span", { class: "muted small", role: "status" });
+  const inputs = {};
+  const form = h("div", { class: "profile-form" });
+  for (const [key, label, hint] of PROFILE_FIELDS) {
+    const input = h("input", { type: "text", class: "field", maxlength: "400", placeholder: hint, "aria-label": label });
+    input.value = app.settings.profile[key] ?? "";
+    inputs[key] = input;
+    const extra =
+      key === "timezone"
+        ? h("button", {
+            type: "button",
+            class: "fb-link",
+            text: "use this browser's",
+            onclick: () => {
+              input.value = Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+              input.dispatchEvent(new Event("input"));
+            },
+          })
+        : null;
+    form.append(h("label", { class: "field-row" }, h("span", { class: "field-label", text: label }), h("span", { class: "field-input" }, input, extra)));
+  }
+  const context = h("textarea", { class: "field", rows: "5", maxlength: "8000", placeholder: "What they care about, what they work on, how they like answers.", "aria-label": "Context" });
+  context.value = app.settings.profile.context ?? "";
+  inputs.context = context;
+  form.append(h("label", { class: "field-row" }, h("span", { class: "field-label", text: "Context" }), h("span", { class: "field-input" }, context)));
+
+  const readProfile = () => Object.fromEntries(Object.entries(inputs).map(([k, el]) => [k, el.value]));
+  const dirty = () => JSON.stringify(readProfile()) !== JSON.stringify({ ...Object.fromEntries(Object.keys(inputs).map((k) => [k, ""])), ...app.settings.profile });
+  const saveBtn = h("button", { type: "button", class: "button", text: "Save profile" });
+  const refreshSave = () => {
+    saveBtn.disabled = !dirty();
+    status.textContent = dirty() ? "not saved" : app.settings.profile && Object.values(app.settings.profile).some(Boolean) ? "saved" : "";
+  };
+  const saveProfile = async () => {
+    if (!dirty()) return true;
+    saveBtn.disabled = true;
+    status.textContent = "saving…";
+    try {
+      await saveSettings({ profile: readProfile() });
+      refreshSave();
+      return true;
+    } catch (err) {
+      status.textContent = `not saved: ${err.message}`;
+      saveBtn.disabled = false;
+      return false;
+    }
+  };
+  saveBtn.addEventListener("click", saveProfile);
+  for (const el of Object.values(inputs)) el.addEventListener("input", refreshSave);
+  refreshSave();
+
+  const bots = botFilesBlock(saveProfile);
+  return h(
+    "div",
+    { class: "stack" },
+    h(
+      "div",
+      { class: "card stack" },
+      h("div", { class: "card-head" }, h("h3", { text: "Your profile" }), h("span", { class: "muted small", text: "kept in the observatory state folder; no bot reads it there" })),
+      form,
+      h("div", { class: "fb-row" }, saveBtn, status),
+    ),
+    bots,
+  );
+}
+
+const userMdKind = (f) => {
+  if (f.error) return ["unreadable", "bad"];
+  if (!f.exists) return ["no file", "warn"];
+  if (f.text.includes("<!-- fleet-observatory:user-profile:start -->")) return ["has your profile", "ok"];
+  if (/^\s*-\s*\*\*Name:\*\*\s*$/m.test(f.text)) return ["blank template", "warn"];
+  return ["the bot's own notes", "info"];
+};
+
+/** Every bot's USER.md: state, an editor, and the profile apply. */
+function botFilesBlock(saveProfile) {
+  const list = h("div", { class: "usermd-list" }, placeholder("Reading USER.md from each bot…"));
+  const editor = h("div", { class: "usermd-editor" });
+  const note = h("div", { class: "muted small", role: "status" });
+  const chosen = new Set();
+  const undo = new Map(); // bot → the text before this page's last write
+  let files = [];
+  let open = null; // the bot in the editor
+
+  const fileOf = (key) => files.find((f) => f.key === key);
+
+  async function load() {
+    try {
+      const data = await api("/api/user-md");
+      files = data.bots;
+    } catch (err) {
+      list.replaceChildren(errorBox(err));
+      return;
+    }
+    renderList();
+    if (open) openEditor(open, null);
+  }
+
+  async function reloadOne(key) {
+    const data = await api("/api/user-md");
+    files = data.bots;
+    renderList();
+    return fileOf(key);
+  }
+
+  function renderList() {
+    list.replaceChildren(
+      ...files.map((f) => {
+        const bot = botByKey(f.key);
+        const [kind, tone] = userMdKind(f);
+        const box = h("input", { type: "checkbox", "aria-label": `Apply the profile to ${botLabel(bot ?? { key: f.key })}` });
+        box.checked = chosen.has(f.key);
+        box.disabled = Boolean(f.error);
+        box.addEventListener("change", () => {
+          if (box.checked) chosen.add(f.key);
+          else chosen.delete(f.key);
+          applyBtn.textContent = `Apply profile to ${chosen.size} bot${chosen.size === 1 ? "" : "s"}`;
+          applyBtn.disabled = !chosen.size;
+        });
+        return h(
+          "div",
+          { class: `usermd-row${open === f.key ? " active" : ""}` },
+          box,
+          botIcon(bot ?? { key: f.key }),
+          h("span", { class: "usermd-name", text: botLabel(bot ?? { key: f.key }) }),
+          chip(kind, tone),
+          h("span", { class: "muted small nowrap", text: f.error ? f.error : f.exists ? `${bytes(f.size)} · ${ago(f.mtimeMs)}` : "" }),
+          h("button", { type: "button", class: "button small", text: "Edit", disabled: Boolean(f.error), onclick: () => openEditor(f.key, null) }),
+        );
+      }),
+    );
+  }
+
+  /** Show one bot's USER.md in the editor; `proposed` replaces the text
+   *  (an apply preview) without saving it. */
+  function openEditor(key, proposed) {
+    open = key;
+    renderList();
+    const f = fileOf(key);
+    if (!f || f.error) {
+      editor.replaceChildren(f ? errorBox(new Error(f.error)) : empty("This bot is not in the fleet now."));
+      return;
+    }
+    const base = { text: f.text, hash: f.hash };
+    const area = h("textarea", { class: "field mono usermd-text", rows: "18", spellcheck: "false", "aria-label": `USER.md of ${key}` });
+    area.value = proposed ?? f.text;
+    const count = h("span", { class: "muted small" });
+    const state = h("span", { class: "small", role: "status" });
+    const save = h("button", { type: "button", class: "button", text: "Save to the bot" });
+    const revert = h("button", { type: "button", class: "button", text: "Revert" });
+    const insert = h("button", { type: "button", class: "button", text: "Insert profile" });
+    const undoBtn = h("button", { type: "button", class: "button", text: "Undo last save", hidden: !undo.has(key) });
+    const refresh = () => {
+      const changed = area.value !== base.text;
+      count.textContent = `${num(area.value.length)} / ${num(USER_MD_MAX)} characters`;
+      count.classList.toggle("bad-text", area.value.length > USER_MD_MAX);
+      save.disabled = !changed || area.value.length > USER_MD_MAX;
+      revert.disabled = !changed;
+      if (!state.dataset.sticky) state.textContent = changed ? "not saved" : "";
+    };
+    const write = async (text, hash) => {
+      const result = await api(`/api/user-md/${encodeURIComponent(key)}`, { method: "PUT", type: "application/json", body: JSON.stringify({ text, baseHash: hash }) });
+      Object.assign(f, result, { error: undefined });
+      return result;
+    };
+    save.addEventListener("click", async () => {
+      save.disabled = true;
+      state.dataset.sticky = "1";
+      state.textContent = "saving…";
+      try {
+        const before = base.text;
+        await write(area.value, base.hash);
+        undo.set(key, before);
+        base.text = f.text;
+        base.hash = f.hash;
+        state.textContent = `Saved ${when(Date.now())}. The bot reads it on its next turn.`;
+        undoBtn.hidden = false;
+        renderList();
+      } catch (err) {
+        state.textContent = err.status === 409 ? `${err.message} Your text is still here; Reload shows the bot's version.` : `not saved: ${err.message}`;
+      } finally {
+        delete state.dataset.sticky;
+        save.disabled = area.value === base.text;
+      }
+    });
+    revert.addEventListener("click", () => {
+      area.value = base.text;
+      refresh();
+    });
+    insert.addEventListener("click", async () => {
+      if (!(await saveProfile())) return;
+      try {
+        const p = await api(`/api/user-md/${encodeURIComponent(key)}/preview`);
+        if (p.baseHash !== base.hash) {
+          state.textContent = "The bot changed this file since this page read it. Reload first.";
+          return;
+        }
+        area.value = p.text;
+        refresh();
+        state.textContent = "Profile inserted. Read it, then Save to the bot.";
+      } catch (err) {
+        state.textContent = err.message;
+      }
+    });
+    undoBtn.addEventListener("click", async () => {
+      try {
+        await write(undo.get(key), base.hash);
+        undo.delete(key);
+        base.text = f.text;
+        base.hash = f.hash;
+        area.value = f.text;
+        undoBtn.hidden = true;
+        refresh();
+        state.textContent = "Restored the text from before the last save.";
+        renderList();
+      } catch (err) {
+        state.textContent = err.message;
+      }
+    });
+    const reload = h("button", {
+      type: "button",
+      class: "button",
+      text: "Reload",
+      onclick: async () => {
+        const fresh = await reloadOne(key);
+        if (fresh) openEditor(key, null);
+      },
+    });
+    area.addEventListener("input", refresh);
+    area.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "s" && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        if (!save.disabled) save.click();
+      }
+    });
+    const bot = botByKey(key);
+    editor.replaceChildren(
+      h(
+        "div",
+        { class: "card stack" },
+        h("div", { class: "card-head" }, botIcon(bot ?? { key }), h("h3", { text: `USER.md · ${botLabel(bot ?? { key })}` })),
+        h("div", { class: "doc-meta muted small" }, h("span", { class: "mono", text: `${botLabel(bot ?? { key })} · workspace/USER.md` }), f.exists ? ` · ${bytes(f.size)} · updated ${ago(f.mtimeMs)}` : " · no file yet"),
+        area,
+        h("div", { class: "fb-row" }, save, insert, revert, undoBtn, reload, count),
+        state,
+      ),
+    );
+    refresh();
+  }
+
+  const applyBtn = h("button", { type: "button", class: "button", text: "Apply profile to 0 bots", disabled: true });
+  applyBtn.addEventListener("click", async () => {
+    const keys = files.filter((f) => chosen.has(f.key) && !f.error).map((f) => f.key);
+    if (!keys.length) return;
+    const names = keys.map((k) => botLabel(botByKey(k) ?? { key: k })).join(", ");
+    if (!confirm(`Write your profile into USER.md for: ${names}?\n\nA blank template is replaced. A file with the bot's own notes keeps them; the profile goes in a marked block under the first heading. Each bot keeps an undo here until you reload the page.`)) return;
+    if (!(await saveProfile())) return;
+    applyBtn.disabled = true;
+    const done = [];
+    const failed = [];
+    for (const key of keys) {
+      note.textContent = `Writing ${botLabel(botByKey(key) ?? { key })}…`;
+      try {
+        const p = await api(`/api/user-md/${encodeURIComponent(key)}/preview`);
+        const before = fileOf(key)?.text ?? "";
+        if (p.text === before) {
+          done.push(`${key} (no change)`);
+          continue;
+        }
+        await api(`/api/user-md/${encodeURIComponent(key)}`, { method: "PUT", type: "application/json", body: JSON.stringify({ text: p.text, baseHash: p.baseHash }) });
+        undo.set(key, before);
+        done.push(key);
+      } catch (err) {
+        failed.push(`${key}: ${err.message}`);
+      }
+    }
+    note.textContent = [done.length ? `Written: ${done.join(", ")}.` : "", failed.length ? `Not written: ${failed.join("; ")}.` : ""].filter(Boolean).join(" ");
+    applyBtn.disabled = false;
+    await load();
+  });
+
+  const all = h("button", {
+    type: "button",
+    class: "fb-link",
+    text: "choose all",
+    onclick: () => {
+      for (const f of files) if (!f.error) chosen.add(f.key);
+      applyBtn.textContent = `Apply profile to ${chosen.size} bot${chosen.size === 1 ? "" : "s"}`;
+      applyBtn.disabled = !chosen.size;
+      renderList();
+    },
+  });
+
+  load();
+  return h(
+    "div",
+    { class: "card stack" },
+    h("div", { class: "card-head" }, h("h3", { text: "USER.md in each bot" }), h("span", { class: "muted small", text: "openclaw puts this file in every prompt of the bot" })),
+    list,
+    h("div", { class: "fb-row" }, applyBtn, all, note),
+    editor,
+  );
+}
+
+// ── Background: the swarm parameters ──────────────────────────────────────────
+
+function backgroundSection() {
+  const swarm = window.observatorySwarm;
+  if (!swarm?.params) return empty("The background swarm is not loaded on this page.");
+  const status = h("span", { class: "muted small", role: "status" });
+  let saveTimer = 0;
+  const changedValues = () => {
+    const { values, defaults } = swarm.params();
+    return Object.fromEntries(Object.entries(values).filter(([k, v]) => v !== defaults[k]));
+  };
+  const queueSave = () => {
+    clearTimeout(saveTimer);
+    status.textContent = "not saved";
+    saveTimer = setTimeout(async () => {
+      try {
+        await saveSettings({ swarm: changedValues() });
+        const n = Object.keys(app.settings.swarm).length;
+        status.textContent = n ? `saved · ${n} changed from the default` : "saved · all defaults";
+      } catch (err) {
+        status.textContent = `not saved: ${err.message}`;
+      }
+    }, 600);
+  };
+  const decimals = (step) => (String(step).split(".")[1] ?? "").length;
+  const rows = new Map();
+  const groups = new Map();
+  for (const p of swarm.params().spec) {
+    if (!groups.has(p.group)) groups.set(p.group, []);
+    groups.get(p.group).push(p);
+  }
+  const syncRow = (name) => {
+    const { values, defaults } = swarm.params();
+    const r = rows.get(name);
+    r.range.value = String(values[name]);
+    r.out.textContent = r.toggle ? (values[name] >= 0.5 ? "on" : "off") : Number(values[name]).toFixed(r.dec);
+    r.reset.hidden = values[name] === defaults[name];
+    r.row.classList.toggle("changed", values[name] !== defaults[name]);
+  };
+  const syncAll = () => {
+    for (const name of rows.keys()) syncRow(name);
+  };
+  const fieldsets = [...groups].map(([group, params]) => {
+    const open = recall(`claw-observatory-anim-${group}`) !== "0";
+    const box = h("details", { class: "anim-group", open: open || null }, h("summary", { text: group }));
+    box.addEventListener("toggle", () => remember(`claw-observatory-anim-${group}`, box.open ? null : "0"));
+    for (const p of params) {
+      const toggle = p.min === 0 && p.max === 1 && p.step === 1;
+      const range = h("input", { type: "range", min: String(p.min), max: String(p.max), step: String(p.step), "aria-label": p.label, "aria-description": p.hint });
+      const out = h("output", { class: "mono small anim-value" });
+      const reset = h("button", { type: "button", class: "fb-link", title: `Default: ${p.def}`, text: "default" });
+      const tip = `${p.hint}\n\n${p.name} · default ${p.def} · range ${p.min} to ${p.max}`;
+      range.setAttribute("title", tip);
+      const row = h("div", { class: "anim-row", title: tip }, h("span", { class: "anim-label", text: p.label }), range, out, reset);
+      rows.set(p.name, { range, out, reset, row, toggle, dec: decimals(p.step) });
+      range.addEventListener("input", () => {
+        swarm.set({ [p.name]: Number(range.value) });
+        syncRow(p.name);
+        queueSave();
+      });
+      reset.addEventListener("click", () => {
+        swarm.set({ [p.name]: p.def });
+        syncRow(p.name);
+        queueSave();
+      });
+      box.append(row);
+    }
+    return box;
+  });
+  syncAll();
+
+  const solo = h("input", { type: "checkbox" });
+  solo.checked = document.body.classList.contains("swarm-solo");
+  solo.addEventListener("change", () => document.body.classList.toggle("swarm-solo", solo.checked));
+  const resetAll = h("button", {
+    type: "button",
+    class: "button",
+    text: "Reset all",
+    onclick: () => {
+      swarm.reset();
+      syncAll();
+      queueSave();
+    },
+  });
+  const copy = h("button", {
+    type: "button",
+    class: "button",
+    text: "Copy changed values",
+    title: "Copy the values that differ from the defaults, as JSON",
+    onclick: async () => {
+      try {
+        await navigator.clipboard.writeText(JSON.stringify(changedValues(), null, 2));
+        status.textContent = "copied";
+      } catch {
+        status.textContent = "the browser refused the clipboard";
+      }
+    },
+  });
+  const n = Object.keys(changedValues()).length;
+  status.textContent = n ? `${n} changed from the default` : "all defaults";
+  return h(
+    "div",
+    { class: "anim-panel stack" },
+    h("div", { class: "fb-row" }, resetAll, copy, h("label", { class: "fb-row small" }, solo, "Hide the page while tuning"), status),
+    h("p", { class: "muted small", text: "Hold the pointer on a setting to see what it does. Each change shows at once. The page keeps the changed values on the server, so every browser that opens it gets them." }),
+    ...fieldsets,
+  );
+}
+
+// ── the dialog and the view ───────────────────────────────────────────────────
+
+function mountSettings() {
+  const dialog = h("dialog", { class: "settings-dialog", "aria-label": "Settings" });
+  const pageBtn = h("button", {
+    type: "button",
+    class: "button",
+    text: "Open as page",
+    onclick: () => {
+      dialog.close();
+      setView("settings");
+    },
+  });
+  const closeBtn = h("button", { type: "button", class: "button", text: "Close", onclick: () => dialog.close() });
+  const head = h("div", { class: "settings-head" }, h("h2", { text: "Settings" }), h("span", { class: "grow" }), pageBtn, closeBtn);
+  // The dialog box itself has no padding, so a click on the dialog element
+  // (not on this inner box) is a click on the backdrop.
+  const inner = h("div", { class: "settings-inner" }, head);
+  dialog.append(inner);
+  let panel = null;
+  dialog.addEventListener("settings:section", (e) => dialog.classList.toggle("docked", e.detail === "background"));
+  dialog.addEventListener("close", () => {
+    document.body.classList.remove("swarm-solo");
+    panel?.remove();
+    panel = null;
+  });
+  dialog.addEventListener("click", (e) => {
+    if (e.target === dialog) dialog.close(); // a click on the backdrop
+  });
+  document.body.append(dialog);
+  const gear = h("button", {
+    type: "button",
+    class: "gear",
+    title: "Settings: your profile, each bot's USER.md, and the background",
+    "aria-label": "Settings",
+    text: "⚙",
+    onclick: () => {
+      if (app.view === "settings") return;
+      panel = settingsPanel("dialog");
+      inner.append(panel);
+      dialog.showModal();
+    },
+  });
+  document.querySelector("header.top").insertBefore(gear, botBarEl);
+}
+
+function renderSettings() {
+  mainEl.append(section("Settings", "Your profile, the USER.md file in each bot, and the background swarm.", settingsPanel("page")));
+}
+
 // ── boot ──────────────────────────────────────────────────────────────────────
 
 async function boot() {
@@ -1935,6 +2770,8 @@ async function boot() {
     return;
   }
   mountFeedback();
+  mountSettings();
+  await loadSettings();
   // The first fleet read runs docker ps/inspect and can take several seconds.
   mainEl.replaceChildren(placeholder("Reading the fleet…"));
   if (!(await refreshFleet(true))) return;
