@@ -740,6 +740,18 @@ test("collectGatewayToken is self-contained and reads only gateway.auth", () => 
   assert.deepEqual(collectGatewayToken(fs, path, tmp("obs-gw-none-")), { mode: null, token: null });
 });
 
+test("collectGatewayToken follows the file SecretRef to .gateway-token (VH-002)", () => {
+  const home = tmp("obs-gw-ref-");
+  const ref = { source: "file", provider: "gateway-token", id: "value" };
+  fs.writeFileSync(path.join(home, "openclaw.json"), JSON.stringify({ gateway: { auth: { mode: "token", token: ref } } }));
+  // Negative control: a ref with no token file yields no token, never the ref.
+  assert.deepEqual(collectGatewayToken(fs, path, home), { mode: "token", token: null });
+  fs.writeFileSync(path.join(home, ".gateway-token"), `${GW}\n`);
+  assert.deepEqual(collectGatewayToken(fs, path, home), { mode: "token", token: GW });
+  const out = execFileSync(process.execPath, ["-e", collectorScript(collectGatewayToken, home)], { encoding: "utf8" });
+  assert.deepEqual(JSON.parse(out), { mode: "token", token: GW });
+});
+
 test("judgeControlUiRequest: a Control UI browser, not from loopback, inside the window after an open", () => {
   const now = 1_000_000_000;
   const opts = { proxyAddresses: ["172.30.0.3"], armedAt: now - 10_000, now };

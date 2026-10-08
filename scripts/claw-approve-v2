@@ -96,11 +96,13 @@ def container(bot):
 
 
 def gateway_token(bot):
-    """Read gateway.auth.token from the bot's own config. Never printed."""
+    """Read the bot's gateway token from .gateway-token. Never printed.
+
+    openclaw.json holds only a file SecretRef to this file (VH-002), so reading
+    gateway.auth.token from the config would return the ref, not the token.
+    """
     out = subprocess.run(
-        ["docker", "exec", container(bot), "python3", "-c",
-         "import json;print(json.load(open('/home/node/.openclaw/openclaw.json'))"
-         "['gateway']['auth']['token'])"],
+        ["docker", "exec", container(bot), "cat", "/home/node/.openclaw/.gateway-token"],
         capture_output=True, text=True, timeout=30,
     )
     tok = out.stdout.strip()

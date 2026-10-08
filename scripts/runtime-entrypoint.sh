@@ -57,6 +57,15 @@ if [[ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
   fi
   export OPENCLAW_GATEWAY_TOKEN
 fi
+# openclaw.json holds a file SecretRef to this file, never the value (VH-002):
+# every config write copies openclaw.json into the .bak ring and .last-good,
+# so a literal token there multiplied into 7+ agent-readable copies. The file
+# must exist even when the token arrived via env.
+GATEWAY_TOKEN_FILE="${CONFIG_DIR}/.gateway-token"
+if [[ "$(cat "${GATEWAY_TOKEN_FILE}" 2>/dev/null)" != "${OPENCLAW_GATEWAY_TOKEN}" ]]; then
+  printf '%s' "${OPENCLAW_GATEWAY_TOKEN}" > "${GATEWAY_TOKEN_FILE}"
+fi
+chmod 600 "${GATEWAY_TOKEN_FILE}"
 
 # ---- .swarm/ first-boot seed: REMOVED 2026-08-10 (CLAW-082) -------------
 # This block used to write a "First-boot placeholder" state.md + queue.md into
@@ -257,7 +266,7 @@ for p in "${!PLUGINS[@]}"; do
 done
 
 # ---- merge gateway + per-plugin config into openclaw.json --------------
-python3 - "${CONFIG_FILE}" "${BIND}" "${PORT}" "${OPENCLAW_GATEWAY_TOKEN}" <<'PY'
+python3 - "${CONFIG_FILE}" "${BIND}" "${PORT}" "${GATEWAY_TOKEN_FILE}" <<'PY'
 import glob
 import json
 import os
@@ -267,7 +276,7 @@ from pathlib import Path
 config_path = Path(sys.argv[1])
 bind = sys.argv[2]
 port = int(sys.argv[3])
-token = sys.argv[4]
+token_file = sys.argv[4]
 
 home = Path(os.environ["HOME"])
 config: dict = {}
@@ -282,8 +291,15 @@ config["gateway"]["bind"] = bind
 config["gateway"]["mode"] = "local"
 config["gateway"].setdefault("port", port)
 config["gateway"].setdefault("auth", {})
-config["gateway"]["auth"]["token"] = token
+config["gateway"]["auth"]["token"] = {
+    "source": "file", "provider": "gateway-token", "id": "value",
+}
 config["gateway"]["auth"].setdefault("mode", "token")
+# File provider for the gateway token ref above (VH-002). Env refs (Telegram,
+# oasis-generation) use the implicit "default" env provider.
+config.setdefault("secrets", {}).setdefault("providers", {})["gateway-token"] = {
+    "source": "file", "path": token_file, "mode": "singleValue",
+}
 
 allowed = [f"http://localhost:{port}", f"http://127.0.0.1:{port}"]
 config["gateway"].setdefault("controlUi", {})
@@ -2009,7 +2025,9 @@ if oasis_gen_token:
         _gen_timeout = 600
     config.setdefault("models", {}).setdefault("providers", {})["oasis-generation"] = {
         "baseUrl": oasis_gen_url,
-        "apiKey": oasis_gen_token,
+        # env SecretRef, not the value (VH-005): the value is already in the
+        # container env, and a literal here was copied into every backup.
+        "apiKey": {"source": "env", "provider": "default", "id": "OASIS_GENERATION_TOKEN"},
         "api": "openai-completions",
         "timeoutSeconds": max(120, _gen_timeout),
         "models": gen_models,

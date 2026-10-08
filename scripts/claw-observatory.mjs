@@ -429,15 +429,24 @@ const REQUEST_ID_RE = /^[A-Za-z0-9_-]{4,128}$/;
 /** How long after an open the observatory accepts a pairing for that bot. */
 export const PAIRING_WINDOW_MS = 3 * 60 * 1000;
 
-/** Collector: the gateway token that the entrypoint wrote into openclaw.json
- *  on this boot, which is the token the gateway checks. Only the open route
- *  calls this collector; the snapshot and every other route never do. */
+/** Collector: the gateway token the gateway checks. openclaw.json holds a file
+ *  SecretRef to `.gateway-token` (VH-002), so the token is read from that file;
+ *  a literal string in openclaw.json is still honoured for a bot on an older
+ *  image. Only the open route calls this collector; the snapshot and every
+ *  other route never do. */
 export function collectGatewayToken(fs, path, home) {
+  let auth;
   try {
-    const auth = (JSON.parse(fs.readFileSync(path.join(home, "openclaw.json"), "utf8")).gateway || {}).auth || {};
-    return { mode: auth.mode || null, token: typeof auth.token === "string" ? auth.token : null };
+    auth = (JSON.parse(fs.readFileSync(path.join(home, "openclaw.json"), "utf8")).gateway || {}).auth || {};
   } catch {
     return { mode: null, token: null };
+  }
+  if (typeof auth.token === "string") return { mode: auth.mode || null, token: auth.token };
+  try {
+    const token = fs.readFileSync(path.join(home, ".gateway-token"), "utf8").trim();
+    return { mode: auth.mode || null, token: token || null };
+  } catch {
+    return { mode: auth.mode || null, token: null };
   }
 }
 
