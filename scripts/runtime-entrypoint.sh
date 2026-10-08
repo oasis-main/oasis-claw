@@ -348,6 +348,23 @@ if inbound_env_name:
         "id": inbound_env_name,
     }
     tg["dmPolicy"] = "allowlist"
+    # Mike, 2026-10-08: Telegram gets the brief, the Fleet Observatory gets the
+    # full chain. openclaw's default "partial" edits ONE message in place, so
+    # interim text and tool lines are overwritten by the final answer. "progress"
+    # keeps a short status draft while the bot works (tool labels only, no
+    # command text), clears it, then sends the final answer as a new message.
+    # OASIS_TELEGRAM_STREAMING (off|partial|block|progress) overrides per bot.
+    _tg_stream_mode = os.environ.get("OASIS_TELEGRAM_STREAMING", "").strip().lower() or "progress"
+    if _tg_stream_mode not in ("off", "partial", "block", "progress"):
+        print(f"[entrypoint] telegram: OASIS_TELEGRAM_STREAMING={_tg_stream_mode!r} is not a mode; using progress")
+        _tg_stream_mode = "progress"
+    _tg_streaming = tg.get("streaming") if isinstance(tg.get("streaming"), dict) else {}
+    _tg_streaming["mode"] = _tg_stream_mode
+    if _tg_stream_mode == "progress":
+        _tg_streaming.setdefault("progress", {})["commandText"] = "status"
+    tg["streaming"] = _tg_streaming
+    tg.pop("streamMode", None)  # legacy key; doctor would migrate it
+    print(f"[entrypoint] telegram: streaming mode {_tg_stream_mode}")
     # ── CLAW-091: Telegram media downloads need an EXPLICIT proxy ──────────
     # Setting HTTP_PROXY/HTTPS_PROXY is NOT enough, and the difference is the
     # whole bug. With only the env vars the plugin picks dispatcher mode
