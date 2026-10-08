@@ -1,0 +1,44 @@
+#!/bin/sh
+# gh-oasis — installed as /usr/local/bin/gh; the real gh is at
+# /usr/local/libexec/oasis-gh/gh. When the Mac minter (scripts/claw-gh-minter)
+# gives this bot tokens in /run/oasis-gh, pick the token for the GitHub account
+# the command is about and pass it to gh as GH_TOKEN. A token already set in
+# the environment wins, and with no token folder gh runs unchanged.
+#
+# The account comes from, in order: -R/--repo OWNER/REPO, a `gh api` path
+# like repos/OWNER/..., GH_REPO, the origin remote of the current git repo,
+# and finally the only token if the bot has just one.
+REAL="${OASIS_GH_REAL:-/usr/local/libexec/oasis-gh/gh}"
+HELPER="${OASIS_GH_FILE_HELPER:-/usr/local/lib/oasis-git-policy/git-credential-oasis-gh-file}"
+DIR="${OASIS_GH_TOKEN_DIR:-/run/oasis-gh}"
+if [ -n "${GH_TOKEN:-}" ] || [ ! -d "$DIR" ]; then
+  exec "$REAL" "$@"
+fi
+
+owner=""
+prev=""
+for a in "$@"; do
+  case "$prev" in -R|--repo) owner="${a%%/*}" ;; esac
+  case "$a" in
+    --repo=*) v="${a#--repo=}"; owner="${v%%/*}" ;;
+    -R?*) v="${a#-R}"; owner="${v%%/*}" ;;
+    repos/*/*|/repos/*/*) v="${a#/}"; v="${v#repos/}"; [ -z "$owner" ] && owner="${v%%/*}" ;;
+  esac
+  prev="$a"
+done
+[ -z "$owner" ] && [ -n "${GH_REPO:-}" ] && owner="${GH_REPO%%/*}"
+if [ -z "$owner" ]; then
+  url="$(git remote get-url origin 2>/dev/null || true)"
+  case "$url" in
+    *github.com[:/]*) v="${url#*github.com}"; v="${v#[:/]}"; owner="${v%%/*}" ;;
+  esac
+fi
+
+path=""
+[ -n "$owner" ] && path="path=$owner/x"
+token="$(printf 'protocol=https\nhost=github.com\n%s\n\n' "$path" | "$HELPER" get 2>/dev/null | sed -n 's/^password=//p')"
+if [ -n "$token" ]; then
+  GH_TOKEN="$token"
+  export GH_TOKEN
+fi
+exec "$REAL" "$@"

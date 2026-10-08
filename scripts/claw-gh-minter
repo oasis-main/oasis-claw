@@ -1,0 +1,470 @@
+#!/usr/bin/env python3
+"""
+claw-gh-minter — GitHub access for the oasis-claw bots, minted on the Mac
+(Mike, 2026-10-08: "GitHub App + Mac minter").
+
+One private GitHub App per GitHub account (oasis-main and MikeHLee are two
+USER accounts; a private App installs only on the account that owns it). The
+App private keys stay on the Mac. Every 30 minutes this script mints, for each
+bot, a 1-hour installation token per account, down-scoped to that bot's repos
+and permissions (grants.json), and writes it to
+
+    ~/Library/Application Support/oasis-x/gh-tokens/<bot>/<account>.json
+
+Each bot mounts ONLY its own folder read-only at /run/oasis-gh. Its git
+credential helper and its gh wrapper read the token from there. No bot ever
+holds an App key or a long-lived token: a leaked token dies within the hour,
+and `revoke` kills a bot's tokens at once.
+
+COMMANDS
+  create-app --account A   make the App for account A (GitHub's manifest flow:
+                           you sign in to GitHub as A and press one button);
+                           the key goes straight to a mode-600 file
+  status                   Apps, installations, grants, token ages (no tokens)
+  mint [--bot B]           mint now (all bots, or one)
+  revoke --bot B           revoke B's live tokens on GitHub and delete them
+  install-launchd          copy this script outside ~/Documents (launchd
+                           cannot run files inside it) and mint every 30 min
+  uninstall-launchd
+
+FILES (all outside the repo; nothing secret is ever printed)
+  ~/Library/Application Support/oasis-x/github-app/apps.json     {account: {app_id, slug, key}}
+  ~/Library/Application Support/oasis-x/github-app/keys/<A>.pem  App keys, mode 600
+  ~/Library/Application Support/oasis-x/github-app/grants.json   bot -> account -> repos + permissions
+  ~/Library/Application Support/oasis-x/gh-tokens/<bot>/<A>.json minted tokens, mode 600
+
+RS256 signing uses the openssl CLI (no third-party Python packages).
+"""
+import argparse
+import base64
+import calendar
+import html
+import http.server
+import json
+import os
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+
+HOME = os.path.expanduser("~")
+SUPPORT = os.environ.get("OASIS_GH_SUPPORT_DIR") or os.path.join(HOME, "Library", "Application Support", "oasis-x")
+APP_DIR = os.path.join(SUPPORT, "github-app")
+TOKEN_ROOT = os.path.join(SUPPORT, "gh-tokens")
+APPS_FILE = os.path.join(APP_DIR, "apps.json")
+GRANTS_FILE = os.path.join(APP_DIR, "grants.json")
+API = os.environ.get("OASIS_GH_API", "https://api.github.com").rstrip("/")
+WEB = os.environ.get("OASIS_GH_WEB", "https://github.com").rstrip("/")
+LAUNCHD_LABEL = "com.oasis-x.gh-minter"
+LAUNCHD_PLIST = os.path.join(HOME, "Library", "LaunchAgents", f"{LAUNCHD_LABEL}.plist")
+INSTALLED_COPY = os.path.join(APP_DIR, "claw-gh-minter")
+REFRESH_SECONDS = 1800
+NAME_RE = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}$")
+REPO_RE = __import__("re").compile(r"^[A-Za-z0-9._-]{1,100}$")
+
+# The App asks for the most any bot may get. Each bot's token is cut down to
+# its own grant (grants.json) when it is minted. No administration, no
+# secrets, no workflows unless Mike adds them here and to that bot's grant.
+APP_PERMISSIONS = {
+    "contents": "write",
+    "pull_requests": "write",
+    "issues": "write",
+    "metadata": "read",
+    "actions": "read",
+    "checks": "read",
+    "statuses": "read",
+}
+READ_ONLY = {"contents": "read", "pull_requests": "read", "issues": "read", "metadata": "read", "actions": "read", "checks": "read", "statuses": "read"}
+WRITE = {"contents": "write", "pull_requests": "write", "issues": "write", "metadata": "read", "actions": "read", "checks": "read", "statuses": "read"}
+
+# Starting grants (Mike, 2026-10-08: every bot except Van Helsing). Repos an
+# App installation does not cover are dropped at mint time with a warning.
+DEFAULT_GRANTS = {
+    "yesman": {
+        "oasis-main": {"repos": "*", "permissions": WRITE},
+        "MikeHLee": {"repos": "*", "permissions": WRITE},
+    },
+    "kolmogorov": {
+        "oasis-main": {"repos": ["oasis-claw", "oasis-generation", "oasis-voice", "oasis-cloud"], "permissions": WRITE},
+        "MikeHLee": {"repos": ["ai_research", "shape_of_good_behavior"], "permissions": WRITE},
+    },
+    "house": {
+        "MikeHLee": {"repos": ["exp"], "permissions": WRITE},
+    },
+    "butterbolt": {
+        "oasis-main": {"repos": ["oasis-firmware"], "permissions": WRITE},
+    },
+    "helloworld": {
+        "oasis-main": {"repos": "*", "permissions": READ_ONLY},
+    },
+    "nimbus": {
+        "MikeHLee": {"repos": "*", "permissions": READ_ONLY},
+    },
+}
+
+
+def die(msg, code=1):
+    print(f"claw-gh-minter: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+
+
+def write_private(path, data, mode=0o600):
+    """Write atomically with the final mode set before any byte lands."""
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w" if isinstance(data, str) else "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def app_jwt(app_id, key_path):
+    now = int(time.time())
+    header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    payload = b64url(json.dumps({"iat": now - 60, "exp": now + 540, "iss": str(app_id)}, separators=(",", ":")).encode())
+    signing_input = f"{header}.{payload}".encode()
+    sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", key_path], input=signing_input, capture_output=True, check=True).stdout
+    return f"{header}.{payload}.{b64url(sig)}"
+
+
+def api(method, path, token=None, body=None, kind="Bearer"):
+    req = urllib.request.Request(f"{API}{path}", method=method, data=None if body is None else json.dumps(body).encode())
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("X-GitHub-Api-Version", "2022-11-28")
+    req.add_header("User-Agent", "oasis-claw-gh-minter")
+    if token:
+        req.add_header("Authorization", f"{kind} {token}")
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+            return resp.status, (json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as err:
+        try:
+            detail = json.loads(err.read() or b"{}").get("message", "")
+        except ValueError:
+            detail = ""
+        return err.code, {"message": detail}
+
+
+def apps():
+    return load_json(APPS_FILE, {})
+
+
+def grants():
+    g = load_json(GRANTS_FILE, None)
+    return g["bots"] if g else DEFAULT_GRANTS
+
+
+def installation_for(account, app):
+    jwt = app_jwt(app["app_id"], app["key"])
+    status, body = api("GET", f"/users/{account}/installation", jwt)
+    if status != 200:
+        return None, jwt, f"no installation on {account} (HTTP {status}: {body.get('message', '')})"
+    return body, jwt, None
+
+
+def installation_repos(inst_id, jwt):
+    """Names of the repos this installation can reach (paged)."""
+    status, tok = api("POST", f"/app/installations/{inst_id}/access_tokens", jwt, {"permissions": {"metadata": "read"}})
+    if status != 201:
+        return None
+    names, page = [], 1
+    while True:
+        s, body = api("GET", f"/installation/repositories?per_page=100&page={page}", tok["token"], kind="token")
+        if s != 200:
+            break
+        names += [r["name"] for r in body.get("repositories", [])]
+        if len(body.get("repositories", [])) < 100:
+            break
+        page += 1
+    api("DELETE", "/installation/token", tok["token"], kind="token")
+    return names
+
+
+def mint_one(bot, account, grant, app, log):
+    inst, jwt, err = installation_for(account, app)
+    if err:
+        log(f"{bot}/{account}: {err}")
+        return False
+    perms = {k: v for k, v in (grant.get("permissions") or READ_ONLY).items() if k in APP_PERMISSIONS}
+    body = {"permissions": perms}
+    repos = grant.get("repos", [])
+    if repos != "*":
+        wanted = [r for r in repos if REPO_RE.match(r)]
+        if inst.get("repository_selection") == "selected":
+            have = installation_repos(inst["id"], jwt) or []
+            missing = [r for r in wanted if r not in have]
+            if missing:
+                log(f"{bot}/{account}: not in the App installation, skipped: {', '.join(missing)}")
+            wanted = [r for r in wanted if r in have]
+        if not wanted:
+            log(f"{bot}/{account}: no repo left to grant; no token written")
+            remove_token(bot, account)
+            return False
+        body["repositories"] = wanted
+    status, tok = api("POST", f"/app/installations/{inst['id']}/access_tokens", jwt, body)
+    if status != 201:
+        log(f"{bot}/{account}: mint failed (HTTP {status}: {tok.get('message', '')})")
+        return False
+    record = {
+        "account": account,
+        "token": tok["token"],
+        "expires_at": tok["expires_at"],
+        "repositories": [r["name"] for r in tok.get("repositories", [])] if "repositories" in tok else "*",
+        "permissions": tok.get("permissions", {}),
+        "minted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    write_private(os.path.join(TOKEN_ROOT, bot, f"{account.lower()}.json"), json.dumps(record) + "\n")
+    os.chmod(os.path.join(TOKEN_ROOT, bot), 0o700)
+    return True
+
+
+def remove_token(bot, account):
+    path = os.path.join(TOKEN_ROOT, bot, f"{account.lower()}.json")
+    if os.path.exists(path):
+        os.unlink(path)
+
+
+def cmd_mint(args):
+    a, g = apps(), grants()
+    if not a:
+        die("no App yet; run `claw-gh-minter create-app --account <account>` first")
+    bots = [args.bot] if args.bot else list(g)
+    stamp = time.strftime("%H:%M:%S")
+    ok = fail = 0
+    for bot in bots:
+        if bot not in g:
+            die(f"no grant for bot {bot!r} in {GRANTS_FILE}")
+        for account, grant in g[bot].items():
+            if account not in a:
+                print(f"[{stamp}] {bot}/{account}: no App for this account; skipped")
+                continue
+            if mint_one(bot, account, grant, a[account], lambda m: print(f"[{stamp}] {m}")):
+                ok += 1
+            else:
+                fail += 1
+    print(f"[{stamp}] minted {ok}, failed or skipped {fail}")
+    return 0 if fail == 0 else 2
+
+
+def cmd_revoke(args):
+    folder = os.path.join(TOKEN_ROOT, args.bot)
+    if not os.path.isdir(folder):
+        print(f"{args.bot}: no tokens")
+        return 0
+    for name in sorted(os.listdir(folder)):
+        path = os.path.join(folder, name)
+        rec = load_json(path, {})
+        if rec.get("token"):
+            status, _ = api("DELETE", "/installation/token", rec["token"], kind="token")
+            print(f"{args.bot}/{rec.get('account', name)}: revoke HTTP {status} (204 = revoked)")
+        os.unlink(path)
+    return 0
+
+
+def cmd_status(args):
+    a, g = apps(), grants()
+    print(f"Apps ({APPS_FILE}):")
+    if not a:
+        print("  none yet")
+    for account, app in a.items():
+        line = f"  {account}: app {app['app_id']} ({app.get('slug', '?')})"
+        if args.online:
+            inst, _, err = installation_for(account, app)
+            line += f" — {err}" if err else f" — installed, repos: {inst.get('repository_selection')}"
+        print(line)
+    print(f"Grants ({GRANTS_FILE if os.path.exists(GRANTS_FILE) else 'built-in defaults'}):")
+    now = time.time()
+    for bot, per in g.items():
+        for account, grant in per.items():
+            repos = grant.get("repos")
+            perms = grant.get("permissions") or READ_ONLY
+            mode = "write" if perms.get("contents") == "write" else "read"
+            rec = load_json(os.path.join(TOKEN_ROOT, bot, f"{account.lower()}.json"), None)
+            if rec:
+                exp = calendar.timegm(time.strptime(rec["expires_at"], "%Y-%m-%dT%H:%M:%SZ"))
+                tok = f"token valid {int((exp - now) / 60)} min" if exp > now else "token EXPIRED"
+            else:
+                tok = "no token"
+            print(f"  {bot:11} {account:11} {mode:5} {'all repos' if repos == '*' else ', '.join(repos):48} {tok}")
+    return 0
+
+
+# ── create-app: GitHub's App manifest flow ──────────────────────────────────
+
+def cmd_create_app(args):
+    account = args.account
+    if not NAME_RE.match(account):
+        die("bad account name")
+    if account in apps() and not args.replace:
+        die(f"an App for {account} exists already (use --replace to make a new one)")
+    state = secrets.token_urlsafe(24)
+    port = args.port
+    redirect = f"http://127.0.0.1:{port}/done"
+    manifest = {
+        "name": args.name or f"oasis-claw-bots-{account.lower()}",
+        "url": "https://oasis-x.io",
+        "hook_attributes": {"url": "https://example.invalid/unused", "active": False},
+        "redirect_url": redirect,
+        "public": False,
+        "default_permissions": APP_PERMISSIONS,
+        "default_events": [],
+    }
+    result = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body):
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body.encode())
+
+        def do_GET(self):
+            url = urllib.parse.urlparse(self.path)
+            q = urllib.parse.parse_qs(url.query)
+            if url.path == "/":
+                form = (
+                    f"<!doctype html><meta charset=utf-8><title>Create the GitHub App</title>"
+                    f"<body style='font:15px system-ui;max-width:640px;margin:48px auto'>"
+                    f"<h2>Create the oasis-claw GitHub App for {html.escape(account)}</h2>"
+                    f"<p>Sign in to GitHub as <b>{html.escape(account)}</b> in this browser first. "
+                    f"Then press the button. GitHub shows the App with its permissions; press "
+                    f"<b>Create GitHub App</b> there.</p>"
+                    f"<form action='{WEB}/settings/apps/new?state={state}' method='post'>"
+                    f"<input type='hidden' name='manifest' value='{html.escape(json.dumps(manifest), quote=True)}'>"
+                    f"<button style='font-size:16px;padding:8px 16px'>Continue to GitHub</button></form>"
+                )
+                self._send(200, form)
+            elif url.path == "/done":
+                if q.get("state", [""])[0] != state or "code" not in q:
+                    self._send(400, "<p>This answer did not come from the request this script made. Nothing was saved.</p>")
+                    return
+                status, conv = api("POST", f"/app-manifests/{q['code'][0]}/conversions")
+                if status != 201:
+                    self._send(502, f"<p>GitHub refused the exchange (HTTP {status}). Nothing was saved.</p>")
+                    result["error"] = f"conversion HTTP {status}"
+                else:
+                    key_path = os.path.join(APP_DIR, "keys", f"{account.lower()}.pem")
+                    write_private(key_path, conv["pem"])
+                    data = apps()
+                    data[account] = {"app_id": conv["id"], "slug": conv["slug"], "key": key_path, "owner": conv.get("owner", {}).get("login")}
+                    write_private(APPS_FILE, json.dumps(data, indent=2) + "\n")
+                    result["app"] = data[account]
+                    install = f"{WEB}/apps/{conv['slug']}/installations/new"
+                    self._send(
+                        200,
+                        f"<!doctype html><meta charset=utf-8><body style='font:15px system-ui;max-width:640px;margin:48px auto'>"
+                        f"<h2>App created</h2><p>The key is saved on this Mac (mode 600). Next: "
+                        f"<a href='{html.escape(install)}'>install the App</a> on {html.escape(account)} and choose the repos the bots may reach.</p>",
+                    )
+                threading.Thread(target=server.shutdown, daemon=True).start()
+            else:
+                self._send(404, "not found")
+
+    server = http.server.HTTPServer(("127.0.0.1", port), Handler)
+    print(f"Opening http://127.0.0.1:{port}/ — sign in to GitHub as {account}, then press the button.")
+    webbrowser.open(f"http://127.0.0.1:{port}/")
+    server.serve_forever()
+    if "app" in result:
+        app = result["app"]
+        print(f"Saved App {app['app_id']} ({app['slug']}) for {account}; key file mode 600 at {app['key']}.")
+        print(f"Install it: {WEB}/apps/{app['slug']}/installations/new")
+        return 0
+    die(result.get("error", "stopped before GitHub answered"))
+
+
+# ── launchd ─────────────────────────────────────────────────────────────────
+
+def cmd_install_launchd(args):
+    os.makedirs(APP_DIR, mode=0o700, exist_ok=True)
+    shutil.copy2(os.path.abspath(__file__), INSTALLED_COPY)
+    os.chmod(INSTALLED_COPY, 0o700)
+    if not os.path.exists(GRANTS_FILE):
+        write_private(GRANTS_FILE, json.dumps({"bots": DEFAULT_GRANTS}, indent=2) + "\n")
+        print(f"wrote the starting grants to {GRANTS_FILE}")
+    log = os.path.join(APP_DIR, "minter.log")
+    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>{LAUNCHD_LABEL}</string>
+  <key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>{INSTALLED_COPY}</string><string>mint</string></array>
+  <key>StartInterval</key><integer>{REFRESH_SECONDS}</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
+</dict></plist>
+"""
+    write_private(LAUNCHD_PLIST, plist, 0o644)
+    subprocess.run(["launchctl", "unload", LAUNCHD_PLIST], capture_output=True)
+    subprocess.run(["launchctl", "load", LAUNCHD_PLIST], check=True)
+    print(f"launchd job {LAUNCHD_LABEL} mints every {REFRESH_SECONDS // 60} min; log {log}")
+    return 0
+
+
+def cmd_uninstall_launchd(args):
+    subprocess.run(["launchctl", "unload", LAUNCHD_PLIST], capture_output=True)
+    if os.path.exists(LAUNCHD_PLIST):
+        os.unlink(LAUNCHD_PLIST)
+    print("launchd job removed (tokens already minted stay valid until they expire; use revoke to end them now)")
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog="claw-gh-minter", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("create-app")
+    c.add_argument("--account", required=True)
+    c.add_argument("--name")
+    c.add_argument("--port", type=int, default=18785)
+    c.add_argument("--replace", action="store_true")
+    s = sub.add_parser("status")
+    s.add_argument("--online", action="store_true", help="also ask GitHub about each installation")
+    m = sub.add_parser("mint")
+    m.add_argument("--bot")
+    r = sub.add_parser("revoke")
+    r.add_argument("--bot", required=True)
+    sub.add_parser("install-launchd")
+    sub.add_parser("uninstall-launchd")
+    args = p.parse_args()
+    return {
+        "create-app": cmd_create_app,
+        "status": cmd_status,
+        "mint": cmd_mint,
+        "revoke": cmd_revoke,
+        "install-launchd": cmd_install_launchd,
+        "uninstall-launchd": cmd_uninstall_launchd,
+    }[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

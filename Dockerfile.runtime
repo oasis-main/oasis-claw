@@ -255,9 +255,9 @@ RUN case "${TARGETARCH:-amd64}" in \
     esac && \
     curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_${GH_ARCH}.tar.gz" \
       | tar -xz -C /tmp && \
-    install -m 0755 "/tmp/gh_${GH_CLI_VERSION}_linux_${GH_ARCH}/bin/gh" /usr/local/bin/gh && \
+    install -D -m 0755 "/tmp/gh_${GH_CLI_VERSION}_linux_${GH_ARCH}/bin/gh" /usr/local/libexec/oasis-gh/gh && \
     rm -rf "/tmp/gh_${GH_CLI_VERSION}_linux_${GH_ARCH}" && \
-    gh --version
+    /usr/local/libexec/oasis-gh/gh --version
 
 # ---- git guardrail: shadow `git` with the rollback-safe wrapper -------------
 # Bakes the policy scripts read-only into the image (tamper-resistant — a bot
@@ -272,14 +272,19 @@ COPY scripts/git-policy/ /usr/local/lib/oasis-git-policy/
 RUN chmod +x /usr/local/lib/oasis-git-policy/git-guard.sh \
              /usr/local/lib/oasis-git-policy/git-credential-oasis-gh.sh \
              /usr/local/lib/oasis-git-policy/git-credential-oasis-gh-app \
+             /usr/local/lib/oasis-git-policy/git-credential-oasis-gh-file \
+             /usr/local/lib/oasis-git-policy/gh-oasis \
              /usr/local/lib/oasis-git-policy/hooks/pre-push && \
     ln -sf /usr/local/lib/oasis-git-policy/git-guard.sh                  /usr/local/bin/git && \
     ln -sf /usr/local/lib/oasis-git-policy/git-credential-oasis-gh.sh    /usr/local/bin/git-credential-oasis-gh && \
     ln -sf /usr/local/lib/oasis-git-policy/git-credential-oasis-gh-app   /usr/local/bin/git-credential-oasis-gh-app && \
+    ln -sf /usr/local/lib/oasis-git-policy/git-credential-oasis-gh-file  /usr/local/bin/git-credential-oasis-gh-file && \
+    ln -sf /usr/local/lib/oasis-git-policy/gh-oasis                      /usr/local/bin/gh && \
+    test "$(command -v gh)" = /usr/local/bin/gh && gh --version >/dev/null && \
     test "$(command -v git)" = /usr/local/bin/git && \
     /usr/local/bin/git --version >/dev/null && \
     python3 -c "import ast; ast.parse(open('/usr/local/lib/oasis-git-policy/git-credential-oasis-gh-app').read())" && \
-    echo "[build] git guardrail + credential helpers installed (PAT: oasis-gh, App: oasis-gh-app)"
+    echo "[build] git guardrail + credential helpers installed (PAT: oasis-gh, App: oasis-gh-app, Mac minter: oasis-gh-file + gh wrapper)"
 
 # Entry script: generates openclaw.json with plugin.entries pointing at the
 # baked-in extensions, then execs `openclaw gateway`.

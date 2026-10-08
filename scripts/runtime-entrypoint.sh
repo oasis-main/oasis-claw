@@ -2529,7 +2529,26 @@ git config --global safe.directory '*' 2>/dev/null || true
 # container exits before the gateway ever starts. `--replace-all` collapses
 # any number of existing values (zero, one, or many) down to exactly the one
 # given here, so it is safe regardless of what an earlier boot left behind.
-if [ -n "${GH_APP_ID:-}" ]; then
+if [ -d /run/oasis-gh ]; then
+  # Mac-minted tokens (Mike, 2026-10-08): scripts/claw-gh-minter on the Mac
+  # holds the App keys and writes this bot 1-hour, repo-scoped tokens into its
+  # own read-only folder. The helper picks the token for the repo's account
+  # (useHttpPath gives owner/repo); /usr/local/bin/gh does the same for gh.
+  git config --global user.name  "${OASIS_GIT_USER_NAME:-oasis-claw bot}"
+  git config --global user.email "${OASIS_GIT_USER_EMAIL:-bots@oasis-x.io}"
+  git config --global --replace-all credential."https://github.com".helper oasis-gh-file
+  git config --global --replace-all credential."https://github.com".useHttpPath true
+  # A personal gh sign-in made earlier (House, 2026-08-18) stays as the SECOND
+  # helper: git asks it only when no minted token fits the repo. gh itself
+  # falls back the same way (the wrapper sets GH_TOKEN only for a minted token).
+  # OASIS_GH_TOKEN_DIR=/nonexistent makes the gh wrapper skip the minted
+  # tokens, so this asks about a STORED sign-in only.
+  if GH_TOKEN= OASIS_GH_TOKEN_DIR=/nonexistent gh auth status >/dev/null 2>&1; then
+    git config --global --add credential."https://github.com".helper "!gh auth git-credential"
+    echo "[entrypoint] git: personal gh sign-in kept as the fallback helper"
+  fi
+  echo "[entrypoint] git+gh wired for Mac-minted GitHub tokens ($(ls /run/oasis-gh 2>/dev/null | tr '\n' ' '); push allowlist='${OASIS_GIT_REPOS:-<none set>}')"
+elif [ -n "${GH_APP_ID:-}" ]; then
   # GitHub App mode (preferred): the oasis-gh-app helper mints a SHORT-LIVED,
   # per-repo-scoped installation token on demand from GH_APP_PRIVATE_KEY_B64 —
   # nothing long-lived in .env, centrally revocable. useHttpPath gives the helper
