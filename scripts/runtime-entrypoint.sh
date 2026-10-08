@@ -2437,6 +2437,13 @@ cat <<BANNER
 ==============================================================
 BANNER
 
+# CLAW-049: the gateway resolves its token from the file SecretRef written above,
+# so keep the value out of its environment and out of every process started
+# after this line (the memory self-heal job below, then the gateway and all its
+# exec children; agents.sandbox is off). A bare token self-grants any scope on
+# loopback. The banner above is its last use.
+unset OPENCLAW_GATEWAY_TOKEN
+
 # ---- heartbeat: keep OFF via an empty HEARTBEAT.md (cron-driven fleet) --
 # Standing decision (2026-07-13): NO autonomous heartbeat until a proxy-signal
 # monitor exists — the daily rhythm is driven entirely by openclaw cron
@@ -2619,8 +2626,4 @@ if [ "${OASIS_MEMORY_SELFHEAL:-1}" = "1" ]; then
   ) &
 fi
 
-# CLAW-049: the gateway resolves its token from the file SecretRef written above,
-# so keep the value out of its environment. Every exec child inherits that env
-# (agents.sandbox is off), and a bare token self-grants any scope on loopback.
-unset OPENCLAW_GATEWAY_TOKEN
 exec openclaw gateway --bind "${BIND}" --port "${PORT}"
