@@ -1838,7 +1838,7 @@ elif not existing_primary:
     # openai/gpt-5.5 built-in, which needs an OpenAI key no bot has. Routing the
     # default through the gateway keeps inference on Bedrock (billed to the AWS
     # account) rather than direct-Anthropic credits. Override via .env.
-    fallback_model = "oasis-generation/claude-sonnet-5"
+    fallback_model = "oasis-generation/claude-sonnet-5-5"
     config["agents"]["defaults"]["model"]["primary"] = fallback_model
     _write_seed_marker(primary=fallback_model)
     print(f"[entrypoint] no OPENCLAW_DEFAULT_MODEL set; defaulting to {fallback_model}")
