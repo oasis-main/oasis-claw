@@ -146,6 +146,9 @@ test("minter: signs with the App key, cuts each token to the bot's repos and per
     assert.equal(gh(["pr", "list", "-R", "MikeHLee/exp"]), `token=${rec.token} args=pr list -R MikeHLee/exp`);
     assert.equal(gh(["api", "repos/MikeHLee/exp/pulls"]), `token=${rec.token} args=api repos/MikeHLee/exp/pulls`);
     assert.equal(gh(["pr", "list", "--repo=oasis-main/oasis-claw"]), "token=none args=pr list --repo=oasis-main/oasis-claw");
+    assert.equal(gh(["repo", "view", "MikeHLee/exp", "--json", "name"]), `token=${rec.token} args=repo view MikeHLee/exp --json name`, "repo OWNER/REPO positional");
+    assert.equal(gh(["repo", "clone", "https://github.com/MikeHLee/exp"]), `token=${rec.token} args=repo clone https://github.com/MikeHLee/exp`, "github.com URL");
+    assert.equal(gh(["repo", "view", "oasis-main/oasis-claw"]), "token=none args=repo view oasis-main/oasis-claw", "positional for an account with no token");
     assert.equal(gh(["pr", "list"], { GH_TOKEN: "ghp_explicit" }), "token=ghp_explicit args=pr list", "a token in the env wins");
 
     // Revoke ends the token on GitHub and deletes the file.

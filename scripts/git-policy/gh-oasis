@@ -17,15 +17,22 @@ fi
 
 owner=""
 prev=""
+# `gh repo view|clone|fork|... OWNER/REPO` and github.com URLs name the repo
+# as a plain argument; -R/--repo still wins over them.
+positional=""
 for a in "$@"; do
   case "$prev" in -R|--repo) owner="${a%%/*}" ;; esac
   case "$a" in
     --repo=*) v="${a#--repo=}"; owner="${v%%/*}" ;;
     -R?*) v="${a#-R}"; owner="${v%%/*}" ;;
     repos/*/*|/repos/*/*) v="${a#/}"; v="${v#repos/}"; [ -z "$owner" ] && owner="${v%%/*}" ;;
+    https://github.com/*/*|github.com/*/*) v="${a#https://}"; v="${v#github.com/}"; [ -z "$positional" ] && positional="${v%%/*}" ;;
+    -*|*/*/*|*:*) ;;
+    */*) [ "${1:-}" = repo ] && [ -z "$positional" ] && positional="${a%%/*}" ;;
   esac
   prev="$a"
 done
+[ -z "$owner" ] && owner="$positional"
 [ -z "$owner" ] && [ -n "${GH_REPO:-}" ] && owner="${GH_REPO%%/*}"
 if [ -z "$owner" ]; then
   url="$(git remote get-url origin 2>/dev/null || true)"
