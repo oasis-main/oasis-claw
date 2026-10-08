@@ -57,7 +57,7 @@ FALLBACK_FILES = [
     "bots/docker-compose.bots.yml",
     "bots/docker-compose.yesman-reach.yml",
 ]
-PROVIDERS = ("aws", "scaleway", "modal", "github", "digitalocean", "gcp")
+PROVIDERS = ("aws", "scaleway", "modal", "github", "digitalocean", "gcp", "hetzner")
 
 # (admin profile on Mike's Mac, profile name inside Yes Man's credentials file)
 AWS_ACCOUNTS = [
@@ -72,6 +72,8 @@ ENV_KEYS = {
     "modal": ("MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"),
     "github": ("GH_TOKEN",),
     "digitalocean": ("DIGITALOCEAN_ACCESS_TOKEN",),
+    # Read+write token of the model-archive project (Mike, 2026-10-08).
+    "hetzner": ("HCLOUD_TOKEN",),
 }
 
 # Providers whose credential is a FILE, not a providers.env key (Mike,
@@ -90,8 +92,9 @@ def file_providers():
     return active
 
 
-# A host that must stay blocked for Yes Man (negative control).
-BLOCKED_PROBE = "https://api.hetzner.cloud/v1/servers"
+# A host that must stay blocked for Yes Man (negative control). Hetzner was
+# the control until it became a provider (2026-10-08); Linode is not one.
+BLOCKED_PROBE = "https://api.linode.com/v4/regions"
 
 
 def die(msg):
@@ -293,6 +296,11 @@ def probe(provider):
     elif provider == "gcp":
         r = dexec(["sh", "-c", "command -v gcloud >/dev/null || { echo 'gcloud not staged (claw-infra-tools stage)'; exit 3; }; gcloud projects list --format='value(projectId)' --limit=5 | tr '\\n' ' '"], timeout=120)
         print(f"  gcp: {('projects ' + r.stdout.strip()) if r.returncode == 0 else 'FAILED ' + (r.stdout.strip() or tail(r))}")
+    elif provider == "hetzner":
+        # Counts only: names and IPs stay out of the output.
+        r = dexec(["sh", "-c", "command -v hcloud >/dev/null || { echo 'hcloud not staged (claw-infra-tools stage)'; exit 3; }; "
+                   "printf 'servers %s, volumes %s' \"$(hcloud server list -o noheader | wc -l | tr -d ' ')\" \"$(hcloud volume list -o noheader | wc -l | tr -d ' ')\""], timeout=60)
+        print(f"  hetzner: {r.stdout.strip() if r.returncode == 0 else 'FAILED ' + (r.stdout.strip() or tail(r))}")
     elif provider == "digitalocean":
         # Status and droplet limit only: `account get` also shows the email.
         r = dexec(["sh", "-c", "command -v doctl >/dev/null || { echo 'doctl not staged (claw-infra-tools stage)'; exit 3; }; doctl account get --format Status,DropletLimit --no-header"], timeout=60)
