@@ -57,7 +57,7 @@ FALLBACK_FILES = [
     "bots/docker-compose.bots.yml",
     "bots/docker-compose.yesman-reach.yml",
 ]
-PROVIDERS = ("aws", "scaleway", "modal", "github", "digitalocean", "gcp", "hetzner")
+PROVIDERS = ("aws", "scaleway", "modal", "github", "digitalocean", "gcp", "hetzner", "workspace")
 
 # (admin profile on Mike's Mac, profile name inside Yes Man's credentials file)
 AWS_ACCOUNTS = [
@@ -81,6 +81,10 @@ ENV_KEYS = {
 # Google federation config (scripts/claw-gcp-federation; it holds no secret).
 GH_TOKEN_DIR = SECRETS.parent / "gh-tokens" / "yesman"
 GCP_CRED_CONFIG = SECRETS / "gcp" / "credential-config.json"
+# Google Workspace as hello@ (Mike, 2026-10-09): gog's OAuth client from the
+# oasis-claw-bots project. The refresh token lives in gog's keyring inside the
+# container; the client file on the Mac switches the provider's egress on.
+WORKSPACE_CLIENT = SECRETS / "gog" / "client.json"
 
 
 def file_providers():
@@ -89,6 +93,8 @@ def file_providers():
         active.append("github")
     if GCP_CRED_CONFIG.is_file():
         active.append("gcp")
+    if WORKSPACE_CLIENT.is_file():
+        active.append("workspace")
     return active
 
 
@@ -195,13 +201,17 @@ def write_seed(active):
         f"# {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%MZ')}; providers with keys: {', '.join(active) or 'none'}",
         "# Source: bots/yesman/role.yaml origins.trusted (# provider:<name> tags). Do not edit by hand.",
     ]
+    seen = set()
     for p in active:
-        lines += hosts[p]
+        for h in hosts[p]:
+            if h not in seen:  # a host may serve two providers (oauth2)
+                seen.add(h)
+                lines.append(h)
     SEED.parent.mkdir(parents=True, exist_ok=True)
     tmp = SEED.with_suffix(".txt.tmp")
     tmp.write_text("\n".join(lines) + "\n")
     tmp.replace(SEED)
-    n = sum(len(hosts[p]) for p in active)
+    n = len(seen)
     print(f"egress seed: {n} hosts for {', '.join(active) or 'no provider'} → {SEED.relative_to(REPO)}")
 
 
@@ -301,6 +311,14 @@ def probe(provider):
         r = dexec(["sh", "-c", "command -v hcloud >/dev/null || { echo 'hcloud not staged (claw-infra-tools stage)'; exit 3; }; "
                    "printf 'servers %s, volumes %s' \"$(hcloud server list -o noheader | wc -l | tr -d ' ')\" \"$(hcloud volume list -o noheader | wc -l | tr -d ' ')\""], timeout=60)
         print(f"  hetzner: {r.stdout.strip() if r.returncode == 0 else 'FAILED ' + (r.stdout.strip() or tail(r))}")
+    elif provider == "workspace":
+        # Account emails and services only; no mail, no user data.
+        r = dexec(["gog", "auth", "list", "-j"])
+        try:
+            accts = json.loads(r.stdout).get("accounts", [])
+            print("  workspace: " + (", ".join(f"{a.get('email')} [{','.join(a.get('services') or [])}]" for a in accts) or "client loaded, no account signed in"))
+        except ValueError:
+            print(f"  workspace: FAILED {tail(r)}")
     elif provider == "digitalocean":
         # Status and droplet limit only: `account get` also shows the email.
         r = dexec(["sh", "-c", "command -v doctl >/dev/null || { echo 'doctl not staged (claw-infra-tools stage)'; exit 3; }; doctl account get --format Status,DropletLimit --no-header"], timeout=60)
