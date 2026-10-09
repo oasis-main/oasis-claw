@@ -1280,6 +1280,55 @@ if also:
 elif "alsoAllow" in tools_cfg:
     del tools_cfg["alsoAllow"]
 
+# ---- SSH exec sandbox (CLAW-049 structural fix; pilot, .swarm/SSH_SANDBOX_PILOT.md)
+# Gated on OASIS_SANDBOX_SSH_SOCKET. exec + the file tools then run in a
+# per-bot sidecar over ssh, so agent code never runs where .gateway-token and
+# the device keys live. ssh goes over a Unix socket on a shared volume
+# (oasis-sbx-ssh), so the sidecar shares no network with this container and
+# cannot reach :18789.
+#
+# Sandbox tool policy: OpenClaw's sandbox default allow list drops every plugin
+# tool (mail, memory, find, voice, report_injection). allow ["*"] keeps the
+# tools.profile + alsoAllow surface as it is; the deny list removes the tools
+# that act on this container: gateway (config/restart), nodes, canvas, and
+# browser (Chrome runs here, outside the sidecar).
+#
+# NOT a gate in sandbox mode: tools.exec security/ask and exec-approvals.json.
+# bash-tools.exec.ts skips them for host=sandbox; the sidecar is the boundary
+# and the oasis-reviewer before_tool_call hook still gates every call.
+sbx_socket = os.environ.get("OASIS_SANDBOX_SSH_SOCKET", "").strip()
+sbx_cfg = config["agents"]["defaults"].setdefault("sandbox", {})
+SBX_KEYS = ("mode", "backend", "scope", "workspaceAccess", "ssh")
+if sbx_socket:
+    sbx_key_dir = os.environ.get("OASIS_SANDBOX_SSH_KEY_DIR", "").strip() or "/run/oasis-sbx-keys"
+    sbx_cfg.update({"mode": "all", "backend": "ssh", "scope": "agent", "workspaceAccess": "rw"})
+    sbx_cfg["ssh"] = {
+        "target": os.environ.get("OASIS_SANDBOX_SSH_TARGET", "").strip() or "node@openclaw-sbx:22",
+        "command": "/usr/local/bin/oasis-sbx-ssh",
+        "workspaceRoot": os.environ.get("OASIS_SANDBOX_WORKSPACE_ROOT", "").strip() or "/sandbox-work",
+        "strictHostKeyChecking": True,
+        "updateHostKeys": False,
+        "identityData": {"source": "file", "provider": "sandbox-ssh-identity", "id": "value"},
+        "knownHostsData": {"source": "file", "provider": "sandbox-ssh-known-hosts", "id": "value"},
+    }
+    providers = config.setdefault("secrets", {}).setdefault("providers", {})
+    providers["sandbox-ssh-identity"] = {
+        "source": "file", "path": os.path.join(sbx_key_dir, "identity"), "mode": "singleValue"}
+    providers["sandbox-ssh-known-hosts"] = {
+        "source": "file", "path": os.path.join(sbx_key_dir, "known_hosts"), "mode": "singleValue"}
+    tools_cfg.setdefault("elevated", {})["enabled"] = False
+    tools_cfg.setdefault("sandbox", {})["tools"] = {
+        "allow": ["*"], "deny": ["gateway", "nodes", "canvas", "browser"]}
+    print(f"[entrypoint] exec sandbox: ssh via {sbx_socket} (exec + file tools run in the sidecar)")
+elif sbx_cfg.get("backend") == "ssh":
+    # Pilot rolled back: drop what this block wrote, keep sessionToolsVisibility.
+    for k in SBX_KEYS:
+        sbx_cfg.pop(k, None)
+    for p in ("sandbox-ssh-identity", "sandbox-ssh-known-hosts"):
+        config.get("secrets", {}).get("providers", {}).pop(p, None)
+    tools_cfg.get("sandbox", {}).pop("tools", None)
+    print("[entrypoint] exec sandbox: OFF (ssh pilot config removed)")
+
 # session.reset — the ACTUAL deep-sleep reset, done the framework's way.
 # openclaw natively resets a long-lived conversation session on a schedule
 # (mode "daily", at `atHour` local): it archives the transcript to

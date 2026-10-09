@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""
+claw-sandbox-keys — make the ssh keys for one bot's exec sandbox sidecar
+(CLAW-049 pilot, .swarm/SSH_SANDBOX_PILOT.md).
+
+  scripts/claw-sandbox-keys <bot>          make the keys if they do not exist
+  scripts/claw-sandbox-keys <bot> --rotate replace them (recreate both containers)
+
+Writes bots/.runtime/sandbox-ssh/<bot>/ (gitignored):
+
+  gw/identity       client private key  -> bot container  /run/oasis-sbx-keys (ro)
+  gw/known_hosts    sidecar host key    -> bot container  /run/oasis-sbx-keys (ro)
+  sbx/ssh_host_ed25519_key              -> sidecar        /run/oasis-sbx-keys (ro)
+  sbx/authorized_keys                   -> sidecar        /run/oasis-sbx-keys (ro)
+
+The gateway reads gw/ through file SecretRefs, which refuse a key file that
+is readable by others, so every file is mode 600. Prints fingerprints only.
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+BASE = ROOT / "bots" / ".runtime" / "sandbox-ssh"
+# Must match OASIS_SANDBOX_SSH_TARGET's host (default node@openclaw-sbx:22).
+HOST_ALIAS = "openclaw-sbx"
+
+
+def die(msg):
+    print(f"claw-sandbox-keys: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def keygen(path, comment):
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", comment, "-f", str(path)],
+                   check=True)
+
+
+def fingerprint(pub):
+    out = subprocess.run(["ssh-keygen", "-l", "-f", str(pub)], check=True,
+                         capture_output=True, text=True).stdout.split()
+    return out[1]
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    bot = argv[0]
+    if not re.fullmatch(r"[a-z0-9-]+", bot):
+        die(f"bad bot name: {bot!r}")
+    rotate = "--rotate" in argv[1:]
+    out = BASE / bot
+    if out.exists() and not rotate:
+        die(f"{out} exists; pass --rotate to replace it")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        keygen(tmp / "client", f"oasis-sbx-client-{bot}")
+        keygen(tmp / "host", f"oasis-sbx-host-{bot}")
+        host_pub = (tmp / "host.pub").read_text().split()
+        stage = tmp / "out"
+        (stage / "gw").mkdir(parents=True)
+        (stage / "sbx").mkdir(parents=True)
+        shutil.copy(tmp / "client", stage / "gw" / "identity")
+        (stage / "gw" / "known_hosts").write_text(f"{HOST_ALIAS} {host_pub[0]} {host_pub[1]}\n")
+        shutil.copy(tmp / "host", stage / "sbx" / "ssh_host_ed25519_key")
+        shutil.copy(tmp / "client.pub", stage / "sbx" / "authorized_keys")
+        for d in (stage / "gw", stage / "sbx"):
+            os.chmod(d, 0o700)
+            for f in d.iterdir():
+                os.chmod(f, 0o600)
+        client_fp = fingerprint(tmp / "client.pub")
+        host_fp = fingerprint(tmp / "host.pub")
+        BASE.mkdir(parents=True, exist_ok=True)
+        if out.exists():
+            shutil.rmtree(out)
+        shutil.copytree(stage, out)
+
+    print(f"[sandbox-keys] {bot}: wrote {out.relative_to(ROOT)}/{{gw,sbx}}")
+    print(f"  client key {client_fp}")
+    print(f"  host key   {host_fp}")
+    if rotate:
+        print("  recreate the bot AND its sidecar so both read the new keys")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

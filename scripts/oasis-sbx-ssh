@@ -1,0 +1,6 @@
+#!/bin/sh
+# ssh client for the SSH exec sandbox (CLAW-049 pilot, .swarm/SSH_SANDBOX_PILOT.md).
+# OpenClaw's ssh backend calls this as `agents.defaults.sandbox.ssh.command`
+# with its own -F config. The ProxyCommand reaches the sidecar's sshd over a
+# Unix socket on a shared volume, so the bot and the sidecar share no network.
+exec ssh -o "ProxyCommand=socat - UNIX-CONNECT:${OASIS_SANDBOX_SSH_SOCKET:-/run/sbx/ssh.sock}" "$@"

@@ -286,6 +286,14 @@ RUN chmod +x /usr/local/lib/oasis-git-policy/git-guard.sh \
     python3 -c "import ast; ast.parse(open('/usr/local/lib/oasis-git-policy/git-credential-oasis-gh-app').read())" && \
     echo "[build] git guardrail + credential helpers installed (PAT: oasis-gh, App: oasis-gh-app, Mac minter: oasis-gh-file + gh wrapper)"
 
+# SSH exec sandbox client (CLAW-049 pilot, .swarm/SSH_SANDBOX_PILOT.md).
+# Unused until a bot sets OASIS_SANDBOX_SSH_SOCKET. A late layer, so the
+# cache above stays valid.
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-client socat && \
+    rm -rf /var/lib/apt/lists/*
+COPY scripts/oasis-sbx-ssh /usr/local/bin/oasis-sbx-ssh
+
 # Entry script: generates openclaw.json with plugin.entries pointing at the
 # baked-in extensions, then execs `openclaw gateway`.
 COPY scripts/runtime-entrypoint.sh /usr/local/bin/runtime-entrypoint.sh

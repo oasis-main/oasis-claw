@@ -34,31 +34,61 @@ MAP_FILE = LEARNED_DIR / "client.map"
 BOTS = {"vanhelsing", "yesman", "house", "kolmogorov", "butterbolt"}
 
 
+# CLAW-049 SSH exec sandbox: each sidecar oasis-claw-<bot>-sandbox sits on its
+# own internal network <SBX_NET_PREFIX><bot> with the proxy. Its exec traffic
+# must get the SAME per-bot egress as the bot, so it maps to <bot> too.
+SBX_NET_PREFIX = "oasis-claw_oasis_sbx_"
+SBX_SUFFIX = "-sandbox"
+
+
+def _inspect(net):
+    raw = subprocess.run(
+        ["docker", "network", "inspect", net],
+        capture_output=True, text=True, timeout=15, check=True,
+    ).stdout
+    nets = json.loads(raw)
+    return nets[0] if nets else None
+
+
+def _sbx_networks():
+    raw = subprocess.run(
+        ["docker", "network", "ls", "--format", "{{.Name}}"],
+        capture_output=True, text=True, timeout=15, check=True,
+    ).stdout
+    return sorted(n for n in raw.split() if n.startswith(SBX_NET_PREFIX))
+
+
 def live_map():
-    """{ip: bot} for every partitionable bot currently on the sandbox network."""
+    """{ip: bot} for every partitionable bot (and its exec sidecar) on the sandbox networks."""
     try:
-        raw = subprocess.run(
-            ["docker", "network", "inspect", NETWORK],
-            capture_output=True, text=True, timeout=15, check=True,
-        ).stdout
+        main = _inspect(NETWORK)
+        sbx = [_inspect(n) for n in _sbx_networks()]
     except (subprocess.SubprocessError, FileNotFoundError) as e:
         print(f"[claw-egress-sync] cannot inspect network {NETWORK}: {e}", file=sys.stderr)
         sys.exit(1)
-    nets = json.loads(raw)
-    if not nets:
+    if not main:
         print(f"[claw-egress-sync] network {NETWORK} not found", file=sys.stderr)
         sys.exit(1)
     out = {}
-    for cid, c in (nets[0].get("Containers") or {}).items():
-        name = c.get("Name", "")
-        if not name.startswith("oasis-claw-"):
-            continue
-        bot = name[len("oasis-claw-"):]
-        if bot not in BOTS:
-            continue
-        ip = str(c.get("IPv4Address", "")).split("/")[0].strip()
-        if ip:
-            out[ip] = bot
+    for net in [main] + [n for n in sbx if n]:
+        is_sbx = net.get("Name", "").startswith(SBX_NET_PREFIX)
+        for cid, c in (net.get("Containers") or {}).items():
+            name = c.get("Name", "")
+            if not name.startswith("oasis-claw-"):
+                continue
+            bot = name[len("oasis-claw-"):]
+            if is_sbx:
+                # Only the named sidecar of THIS network's bot counts here.
+                if not bot.endswith(SBX_SUFFIX):
+                    continue
+                bot = bot[: -len(SBX_SUFFIX)]
+                if net["Name"] != SBX_NET_PREFIX + bot:
+                    continue
+            if bot not in BOTS:
+                continue
+            ip = str(c.get("IPv4Address", "")).split("/")[0].strip()
+            if ip:
+                out[ip] = bot
     return out
 
 

@@ -1,0 +1,41 @@
+# Exec sandbox sidecar for the SSH sandbox pilot (CLAW-049,
+# .swarm/SSH_SANDBOX_PILOT.md). The bot's exec and file tools run here over
+# ssh; the gateway token and device keys never exist in this container.
+#
+# Built FROM the bot runtime image so exec keeps the same CLIs, Python
+# packages, git guardrail and Playwright Chromium (compatibility item C1).
+# The runtime ENTRYPOINT is cleared: no gateway, no config, no token here.
+#
+# Run with: read_only, cap_drop ALL, no-new-privileges, tmpfs /tmp, no network
+# shared with the bot. sshd listens only on /run/sbx/ssh.sock (shared volume).
+ARG BASE=oasis-claw-runtime:local
+FROM ${BASE}
+# OpenClaw's ssh backend workspace for agent "main" (buildSshSandboxRuntimeId).
+ARG SBX_WORKSPACE=/sandbox-work/openclaw-ssh-agent-main-25bffc4d/workspace
+USER root
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server socat && \
+    rm -rf /var/lib/apt/lists/* /etc/ssh/ssh_host_* && \
+    # The base image ships the node account locked ("!"); sshd refuses a locked
+    # account even for key auth. "*" = no usable password, not locked.
+    usermod -p '*' node && \
+    mkdir -p /sandbox-work /run/sbx && chown node:node /sandbox-work /run/sbx && \
+    # C3: the old workspace path keeps working for scripts and notes. Only the
+    # link lives here; nothing else of the bot's ~/.openclaw is in this image.
+    rm -rf /home/node/.openclaw && mkdir -p /home/node/.openclaw && \
+    ln -s "${SBX_WORKSPACE}" /home/node/.openclaw/workspace && \
+    chown -h node:node /home/node/.openclaw /home/node/.openclaw/workspace && \
+    # The bot sets core.hooksPath per container at boot; the sidecar has no
+    # entrypoint, so the pre-push backstop is wired system-wide instead.
+    git config --system core.hooksPath /usr/local/lib/oasis-git-policy/hooks
+# HOME is on the read-only root, so caches would fall back into the workspace
+# (Chromium's fontconfig did, in the 2026-10-09 dry run). Point them at /tmp.
+ENV XDG_CACHE_HOME=/tmp/.cache npm_config_cache=/tmp/.npm PIP_CACHE_DIR=/tmp/.pip
+COPY scripts/sandbox/sshd_config /etc/ssh/sshd_config.sbx
+COPY scripts/sandbox/sbx-start.sh /usr/local/bin/sbx-start.sh
+RUN chmod 755 /usr/local/bin/sbx-start.sh
+USER node
+# The runtime image probes the gateway port; the sidecar has no gateway.
+HEALTHCHECK --interval=30s --timeout=3s CMD test -S /run/sbx/ssh.sock
+ENTRYPOINT []
+CMD ["/usr/local/bin/sbx-start.sh"]

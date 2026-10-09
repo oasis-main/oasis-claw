@@ -1,0 +1,17 @@
+# sshd for the SSH exec sandbox sidecar (Dockerfile.sandbox).
+# Runs as uid node in inetd mode under socat; no TCP port, no root, no privsep.
+# Keys come from the read-only mount made by scripts/claw-sandbox-keys.
+HostKey /run/oasis-sbx-keys/ssh_host_ed25519_key
+AuthorizedKeysFile /run/oasis-sbx-keys/authorized_keys
+PidFile none
+UsePAM no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+AllowUsers node
+AllowTcpForwarding no
+AllowAgentForwarding no
+AllowStreamLocalForwarding no
+PermitTunnel no
+X11Forwarding no
+PermitUserEnvironment no
