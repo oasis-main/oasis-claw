@@ -73,8 +73,13 @@ fi
 SA="${SA_NAME}@${project}.iam.gserviceaccount.com"
 PRINCIPAL="principal://iam.googleapis.com/projects/${number}/locations/global/workloadIdentityPools/${POOL}/subject/${AWS_ARN}"
 
+# The service account's calls bill quota to this project, so every API its
+# roles use must be on here too (billing, keys, auth, OAuth, logs).
 run gcloud services enable iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com \
-  cloudresourcemanager.googleapis.com serviceusage.googleapis.com --project "$project"
+  cloudresourcemanager.googleapis.com serviceusage.googleapis.com \
+  cloudbilling.googleapis.com billingbudgets.googleapis.com apikeys.googleapis.com \
+  identitytoolkit.googleapis.com firebase.googleapis.com iap.googleapis.com \
+  logging.googleapis.com monitoring.googleapis.com generativelanguage.googleapis.com --project "$project"
 
 if exists gcloud iam workload-identity-pools describe "$POOL" --location=global --project "$project"; then
   echo "pool $POOL exists"
