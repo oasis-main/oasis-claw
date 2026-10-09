@@ -1649,20 +1649,33 @@ config["tools"]["media"]["audio"]["enabled"] = True
 # NOTE this key is capability-scoped and does NOT disturb images:
 # runner.ts binds `cfg.tools.media[capability]`, so tools.media.video is read
 # only on the video path. See the image block below for why that matters.
-if os.environ.get("OASIS_MEDIA_VIDEO_ENABLE", "").strip() == "1":
-    _video_model = os.environ.get("OASIS_MEDIA_VIDEO_MODEL", "").strip() or "gemini-3.1-flash-lite"
-    config["tools"]["media"].setdefault("video", {})
-    config["tools"]["media"]["video"]["enabled"] = True
-    config["tools"]["media"]["video"]["models"] = [
-        {"provider": "google", "model": _video_model},
-    ]
-    print(f"[entrypoint] media video: ENABLED via google/{_video_model}")
-else:
-    # Leave the key ABSENT rather than enabled-false: an absent capability is
-    # the documented "no route" state, and a stale key from an earlier boot
-    # would otherwise pin a provider this bot cannot reach.
+#
+# 2026-10-09: DEFAULT ROUTE for every bot = scripts/oasis-video-describe (CLI
+# entry). It samples frames with ffmpeg and sends them to the bot's own model
+# through oasis-generation (same key + route as normal turns: no new provider,
+# no new egress, works on the sandboxed bots). With the SSH exec sandbox on,
+# ffmpeg runs in the sidecar, not next to the gateway token. Found by Mike's
+# Telegram test: a GIF arrives as MP4 and no bot could see it.
+# OASIS_MEDIA_VIDEO_ENABLE=1 still adds the Google route, as a fallback.
+# OASIS_MEDIA_VIDEO_DISABLE=1 removes video understanding entirely.
+if os.environ.get("OASIS_MEDIA_VIDEO_DISABLE", "").strip() == "1":
     config["tools"]["media"].pop("video", None)
-    print("[entrypoint] media video: no route (set OASIS_MEDIA_VIDEO_ENABLE=1 on a bot that can reach the provider)")
+    print("[entrypoint] media video: DISABLED (OASIS_MEDIA_VIDEO_DISABLE=1)")
+else:
+    _video_models = [{
+        "type": "cli",
+        "command": "/usr/local/bin/oasis-video-describe",
+        "args": ["--media", "{{MediaPath}}", "--max-chars", "{{MaxChars}}", "--caption", "{{RawBody}}"],
+        "maxChars": 3000,
+        "timeoutSeconds": 240,
+        "capabilities": ["video"],
+    }]
+    if os.environ.get("OASIS_MEDIA_VIDEO_ENABLE", "").strip() == "1":
+        _video_model = os.environ.get("OASIS_MEDIA_VIDEO_MODEL", "").strip() or "gemini-3.1-flash-lite"
+        _video_models.append({"provider": "google", "model": _video_model})
+    config["tools"]["media"]["video"] = {"enabled": True, "maxChars": 3000, "models": _video_models}
+    print("[entrypoint] media video: frames -> oasis-generation (oasis-video-describe)"
+          + (" + google fallback" if len(_video_models) > 1 else ""))
 # 2026-08-24: the openai/gpt-4o-transcribe fallback was REMOVED. It could never
 # fire, for three independent reasons found in the media audit:
 #   1. No bot has an `openai` block under models.providers, so the provider-auth
