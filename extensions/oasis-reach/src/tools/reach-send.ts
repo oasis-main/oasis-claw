@@ -1,4 +1,5 @@
 import { MAIL_KINDS, MAIL_PROTOCOL_VERSION, MAX_BODY_CHARS, MAX_RECIPIENTS, MAX_SUBJECT_CHARS, newMessageId, validateOutbound, type MailKind, type OutboundEnvelope } from "../envelope.js";
+import { checkGrant, DEFAULT_PEER_GRANTS_FILE, loadGrants } from "../grants.js";
 import { writeOutbound, type MailboxConfig } from "../mailbox.js";
 
 function strArray(v: unknown): string[] {
@@ -41,11 +42,16 @@ export function createReachSendTool(config: ReachSendConfig) {
         work_items: { type: "array", items: { type: "string" }, description: 'Optional .swarm work-item ids this message concerns (e.g. "CLAW-076"). Lets sender + recipient (and a later memory_search / fs_grep) track the concrete work — do NOT restate .swarm content here, just point at it.' },
         work_repos: { type: "array", items: { type: "string" }, description: 'Optional repository ids this message concerns (e.g. "oasis-cloud" or "org/repo").' },
         thread_id: { type: "string", description: "Optional thread id to group a conversation." },
+        grant_id: {
+          type: "string",
+          description:
+            'Optional peer grant (e.g. "GRANT-0001") that Mike approved through reach_grant_request. Use the grant\'s thread_id and send only to its grantees; the recipient then sees the grant as verified and need not ask Mike again for work inside it.',
+        },
       },
     },
     async execute(
       _toolCallId: string,
-      args: { to?: string[]; subject?: string; body?: string; kind?: MailKind; refs?: string[]; work_items?: string[]; work_repos?: string[]; thread_id?: string } = {},
+      args: { to?: string[]; subject?: string; body?: string; kind?: MailKind; refs?: string[]; work_items?: string[]; work_repos?: string[]; thread_id?: string; grant_id?: string } = {},
     ) {
       const env: OutboundEnvelope = {
         v: MAIL_PROTOCOL_VERSION,
@@ -57,11 +63,24 @@ export function createReachSendTool(config: ReachSendConfig) {
         refs: strArray(args.refs),
         work: { items: strArray(args.work_items), repos: strArray(args.work_repos) },
         thread_id: typeof args.thread_id === "string" ? args.thread_id : "",
+        ...(typeof args.grant_id === "string" && args.grant_id ? { grant_id: args.grant_id } : {}),
         ts: new Date().toISOString(),
       };
       const v = validateOutbound(env);
       if (!v.ok) {
         return { content: [{ type: "text" as const, text: `reach_send rejected: ${v.errors.join("; ")}` }] };
+      }
+      // CLAW-119: fail fast on a grant that cannot apply, so the bot learns why
+      // here instead of the recipient seeing "does NOT check out".
+      if (env.grant_id) {
+        if (!config.mailbox.self) {
+          return { content: [{ type: "text" as const, text: "reach_send rejected: grant_id needs this bot's mail name (OASIS_REACH_SELF), which is not configured." }] };
+        }
+        const grants = loadGrants(config.mailbox.grantsFile ?? DEFAULT_PEER_GRANTS_FILE);
+        for (const to of env.to) {
+          const c = checkGrant(grants, { grantId: env.grant_id, requester: config.mailbox.self, grantee: to, threadId: env.thread_id });
+          if (!c.ok) return { content: [{ type: "text" as const, text: `reach_send rejected: ${env.grant_id} does not cover ${to}: ${c.reason}.` }] };
+        }
       }
       try {
         writeOutbound(config.mailbox, env);

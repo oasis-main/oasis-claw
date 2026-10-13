@@ -3,6 +3,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { z } from "zod";
 import type { MailboxConfig } from "./src/mailbox.js";
 import { peersWithHistory, unreadCount } from "./src/mailbox.js";
+import { createReachGrantRequestTool } from "./src/tools/reach-grant-request.js";
 import { createReachHelpTool } from "./src/tools/reach-help.js";
 import { createReachInboxTool } from "./src/tools/reach-inbox.js";
 import { createReachReadTool } from "./src/tools/reach-read.js";
@@ -74,6 +75,9 @@ const plugin = {
       // RO: the relay files this bot's delivered outbound originals here, giving
       // reach_thread the "out" side of a conversation.
       sentDir: path.join(mailDir, "sent"),
+      // CLAW-119 peer grants: this bot's mail name and the read-only ledger.
+      self: process.env.OASIS_REACH_SELF || undefined,
+      grantsFile: process.env.OASIS_REACH_GRANTS_FILE || undefined,
     };
 
     api.registerTool(createReachSendTool({ mailbox, knownPeers: cfg.knownPeers }), { name: "reach_send" });
@@ -81,6 +85,9 @@ const plugin = {
     api.registerTool(createReachReadTool({ mailbox }), { name: "reach_read" });
     api.registerTool(createReachThreadTool({ mailbox }), { name: "reach_thread" });
     api.registerTool(createReachHelpTool(), { name: "reach_help" });
+    api.registerTool(createReachGrantRequestTool({ autoreviewerUrl: process.env.OASIS_AUTOREVIEWER_URL }), {
+      name: "reach_grant_request",
+    });
 
     // Unread-COUNT supplement — the only thing injected per turn. No bodies, no
     // subjects: just a nudge to pull. Non-exclusive; coexists with dot-swarm's
@@ -118,7 +125,8 @@ const plugin = {
       mailDir,
       statePath,
       archiveDir: mailbox.archiveDir,
-      tools: ["reach_send", "reach_inbox", "reach_read", "reach_thread", "reach_help"],
+      tools: ["reach_send", "reach_inbox", "reach_read", "reach_thread", "reach_help", "reach_grant_request"],
+      grants: mailbox.self ? `self=${mailbox.self}` : "off (OASIS_REACH_SELF unset)",
       knownPeers: cfg.knownPeers ?? [],
     });
   },

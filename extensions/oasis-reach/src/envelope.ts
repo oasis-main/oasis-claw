@@ -87,6 +87,8 @@ export interface OutboundEnvelope {
   refs: string[];
   work: WorkRefs;
   thread_id: string;
+  /** CLAW-119: optional pointer to a peer grant Mike approved for this thread. */
+  grant_id?: string;
   ts: string;
 }
 
@@ -157,6 +159,10 @@ export function validateOutbound(e: unknown): ValidationResult {
     }
   }
   if (o.thread_id !== undefined && typeof o.thread_id !== "string") errors.push("thread_id: must be a string");
+  if (o.grant_id !== undefined) {
+    if (typeof o.grant_id !== "string" || !/^GRANT-\d{4,}$/.test(o.grant_id)) errors.push("grant_id: must look like GRANT-0001");
+    else if (typeof o.thread_id !== "string" || !o.thread_id) errors.push("grant_id: needs the grant's thread_id");
+  }
   if (typeof o.ts !== "string") errors.push("ts: must be an ISO timestamp string");
 
   return { ok: errors.length === 0, errors };

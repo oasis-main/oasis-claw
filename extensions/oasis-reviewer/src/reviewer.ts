@@ -30,6 +30,17 @@ import {
 } from "./layer2.js";
 import { describeLedgerEntry } from "./infra-ledger.js";
 import {
+  DEFAULT_MAIL_INBOX,
+  DEFAULT_PEER_GRANTS_FILE,
+  describeGrant,
+  grantCoversCall,
+  inboxGrantRef,
+  isLive,
+  loadPeerGrants,
+  verifyGrant,
+  type PeerGrant,
+} from "./peer-grants.js";
+import {
   decide,
   deciderModeFrom,
   injectionState,
@@ -78,6 +89,33 @@ const UNATTENDED_PREFIXES = (process.env.OASIS_REVIEWER_UNATTENDED_PREFIXES ?? "
 // was causing the escalations, so the jobs passed without needing the downgrade.
 function isUnattended(sessionKey: string): boolean {
   return UNATTENDED_PREFIXES.some((p) => sessionKey.startsWith(p) || sessionKey.includes(`:${p}`));
+}
+
+// ── Peer grants tied to a session (CLAW-119 phase 2, 2026-10-13) ─────────────
+// A session holds a grant once it has read (reach_read) a peer message whose
+// grant checks out against the ledger (peer-grants.ts). Grants are re-checked
+// on every call, so a revoke or an expiry takes effect at once. Bounded like
+// the other per-session maps; an evicted session simply loses its grants and
+// is reviewed as before.
+const GRANT_SESSIONS_MAX = 256;
+const grantsBySession = new Map<string, Set<string>>();
+function bindGrant(sessionId: string, grantId: string): void {
+  const set = grantsBySession.get(sessionId) ?? new Set<string>();
+  set.add(grantId);
+  grantsBySession.delete(sessionId);
+  grantsBySession.set(sessionId, set);
+  if (grantsBySession.size > GRANT_SESSIONS_MAX) {
+    const oldest = grantsBySession.keys().next().value;
+    if (oldest !== undefined) grantsBySession.delete(oldest);
+  }
+}
+// Escalations a grant turned into allows, per grant, for max_actions. Counted
+// in this bot's process only, so the limit applies to each grantee separately.
+const grantActionCount = new Map<string, number>();
+
+// The mail waker's session key (scripts/claw-mail-waker.mjs): agent:main:hook:reach-<ts>.
+function isMailWoken(sessionKey: string): boolean {
+  return sessionKey.startsWith("hook:reach-") || sessionKey.includes(":hook:reach-");
 }
 
 // ── Operator-request capture (CLAW-079) ───────────────────────────────────────
@@ -490,6 +528,13 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
   const deciderTimeoutMs = Number(process.env.OASIS_REVIEWER_DECIDER_TIMEOUT_MS ?? "8000") || 8_000;
   let deciderInFlight = 0;
   const DECIDER_MAX_INFLIGHT = 4;
+  // ── Peer grants (CLAW-119 phase 2) — see peer-grants.ts ──
+  const peerGrantsFile = process.env.OASIS_REVIEWER_PEER_GRANTS_FILE || DEFAULT_PEER_GRANTS_FILE;
+  const mailInbox = process.env.OASIS_REVIEWER_MAIL_INBOX || DEFAULT_MAIL_INBOX;
+  // Mike, 2026-10-12: in a run that peer mail woke up, an escalation becomes an
+  // allow only when a grant covers it (reverses CLAW-090 §1-§2 for mail-woken
+  // runs; cron runs keep CLAW-078's downgrade). Off until grants are in use.
+  const mailWakeRequiresGrant = process.env.OASIS_REVIEWER_MAIL_WAKE_REQUIRES_GRANT === "1";
   const runtime = (
     api as unknown as {
       runtime?: {
@@ -584,16 +629,57 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
       // ── Layer 1: hard constraints (per-bot) ──
       decision = evaluateHard({ family, toolName, params, derivedPaths }, hardPolicy);
 
-      // ── Layer 2: constitution (model-judged) ──
-      // Runs on the ambiguous middle (Layer 1 allowed) — and ALWAYS for bots
-      // flagged constitutionalReviewRequired (nimbus/helloworld: judge every ask
-      // for secret-malicious use of google data). Layer 2 may only TIGHTEN.
-      needsConstitution = constitution.length > 0 && (decision.verdict === "allow" || alwaysConstitutional);
-
       const subject = subjectOf(family, params, derivedPaths);
       const paramsJson = safeJson(params);
       const sessionId = ctx?.sessionId ?? "unknown";
       const sessionKey = String(ctx?.sessionKey ?? "");
+
+      // ── Peer grants (CLAW-119 phase 2) ──
+      // Bind: reading a message that cites a grant that checks out ties the
+      // grant to this session. Then every call sees the live grants again.
+      let grantBound: string | null = null;
+      let grantBindRefused: string | null = null;
+      const sid = String(sessionId);
+      const ledgerGrants = loadPeerGrants(peerGrantsFile);
+      if (toolName === "reach_read" && sid !== "unknown" && typeof params?.id === "string") {
+        const ref = inboxGrantRef(mailInbox, params.id);
+        if (ref) {
+          const v = verifyGrant(ledgerGrants, { grantId: ref.grantId, from: ref.from, self: botKey, threadId: ref.threadId });
+          if (v.ok) {
+            bindGrant(sid, v.grant.id);
+            grantBound = v.grant.id;
+          } else {
+            grantBindRefused = `${ref.grantId}: ${v.reason}`;
+          }
+        }
+      }
+      const liveGrants: PeerGrant[] = [...(grantsBySession.get(sid) ?? [])]
+        .map((id) => ledgerGrants.find((g) => g.id === id))
+        .filter((g): g is PeerGrant => !!g && isLive(g) && g.grantees.includes(botKey));
+      // A grant can turn a Layer 1 ESCALATE into an allow, never a deny, never a
+      // NEVER_DOWNGRADE or infra principle, and only if Layer 2 then agrees the
+      // call fits the grant's topic and intent (see grantDowngrade below).
+      const callPaths =
+        derivedPaths && derivedPaths.length > 0 ? [...derivedPaths] : family === "file" && subject ? [subject] : [];
+      const coveringGrant =
+        decision.verdict === "escalate" &&
+        !NEVER_DOWNGRADE.has(decision.principle) &&
+        !INFRA_CARD_PRINCIPLES.has(decision.principle)
+          ? liveGrants.find(
+              (g) =>
+                grantCoversCall(g, { family, paths: callPaths }) &&
+                (!g.max_actions || (grantActionCount.get(g.id) ?? 0) < g.max_actions),
+            )
+          : undefined;
+      const verifiedGrant = liveGrants.length > 0 ? liveGrants.map(describeGrant).join("\n\n") : undefined;
+
+      // ── Layer 2: constitution (model-judged) ──
+      // Runs on the ambiguous middle (Layer 1 allowed) — and ALWAYS for bots
+      // flagged constitutionalReviewRequired (nimbus/helloworld: judge every ask
+      // for secret-malicious use of google data). Layer 2 may only TIGHTEN,
+      // except on a call a peer grant covers (grantDowngrade).
+      needsConstitution =
+        constitution.length > 0 && (decision.verdict === "allow" || alwaysConstitutional || !!coveringGrant);
       const unattended = isUnattended(sessionKey);
       // What Mike asked for this run — the judge's evidence for intent.
       const operatorRequest = requestByRun.get(String(ctx?.runId ?? "")) ?? "";
@@ -630,7 +716,8 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
       // the reviewer would import untrusted text straight into the security
       // component, which buildJudgePrompt is explicitly built to keep out.
       const isOutboundMail = hardPolicy.reviewOutboundMail && toolName === "reach_send";
-      const l2Worthwhile = l2All || alwaysConstitutional || family === "exec" || isWriteLike || family === "web" || isOutboundMail;
+      const l2Worthwhile =
+        l2All || alwaysConstitutional || family === "exec" || isWriteLike || family === "web" || isOutboundMail || !!coveringGrant;
       const l2Eligible = needsConstitution && l2Worthwhile && !!l2Complete && l2Mode !== "off";
 
       // ── Context depth (2026-08-24) — apply the configured tier ──
@@ -708,6 +795,8 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
               l1.principle === "hard:infra-ledger-match" && l1.ledgerEntry
                 ? describeLedgerEntry(l1.ledgerEntry)
                 : undefined,
+            // CLAW-119: trusted, checked against the peer-grant ledger.
+            verifiedGrant,
           },
           { model: l2Model, timeoutMs: l2TimeoutMs, thinkingLevel: l2Thinking, maxTokens: l2MaxTokens },
         );
@@ -725,15 +814,30 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
           CONSENT_SATISFIABLE.has(l1.principle) &&
           !!operatorRequest &&
           r.decision?.verdict === "allow";
+        // ── Peer-grant downgrade (CLAW-119) — the same narrow shape ──
+        // A Layer 1 escalate that a live grant covers (family, paths, action
+        // budget), on a principle outside NEVER_DOWNGRADE and the infra set,
+        // becomes an allow only when the judge — shown the grant as a trusted
+        // block — explicitly allows it. Mike's button press on the grant card
+        // is the consent; the judge confirms the call is inside it.
+        const grantDowngrade =
+          !consentDowngrade && !!coveringGrant && l1.verdict === "escalate" && r.decision?.verdict === "allow";
+        if (grantDowngrade) grantActionCount.set(coveringGrant!.id, (grantActionCount.get(coveringGrant!.id) ?? 0) + 1);
         const combined = consentDowngrade
           ? {
               verdict: "allow" as const,
               principle: `${l1.principle}+operator-consent`,
               reason: `${r.decision?.reason ?? "constitution allowed"} — Mike requested this in the same run, so the authoring approval is already given`,
             }
-          : r.decision
-            ? tightenOnly(l1, r.decision)
-            : null;
+          : grantDowngrade
+            ? {
+                verdict: "allow" as const,
+                principle: `${l1.principle}+peer-grant`,
+                reason: `${coveringGrant!.id} (approved by Mike) covers this call and the judge agreed it is inside the grant's topic and intent`,
+              }
+            : r.decision
+              ? tightenOnly(l1, r.decision)
+              : null;
         // ── INERT-READ BACKSTOP (CLAW-090) ──
         // Layer 2 may tighten, but ESCALATING A READ is never the right
         // tightening. A read the judge believes is malicious should be DENIED
@@ -857,6 +961,7 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
           l2InertReadKept: inertReadKept || undefined,
           l2FailClosed: !r.decision && alwaysConstitutional,
           l2RetryHint: r.decision?.retryHint ?? null,
+          grantDowngrade: grantDowngrade || undefined,
         };
       }
 
@@ -879,6 +984,17 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
             verdict: "deny",
             principle: decision.principle,
             reason: `${decision.reason} — no approver in an unattended run (${sessionKey}); failing closed`,
+          };
+        } else if (mailWakeRequiresGrant && isMailWoken(sessionKey)) {
+          // CLAW-119: peer mail woke this run and no grant covered the call
+          // (a covered call was already allowed above). A peer's request alone
+          // is not Mike's consent, so this fails closed instead of downgrading.
+          decision = {
+            verdict: "deny",
+            principle: `${decision.principle}+mail-wake-no-grant`,
+            reason: `${decision.reason} — peer mail woke this run and no peer grant from Mike covers this call; failing closed`,
+            retryHint:
+              "reply to the requester that this step needs a peer grant: the requester can ask Mike for one with reach_grant_request, then resend on that thread with the grant_id",
           };
         } else {
           downgraded = true;
@@ -906,6 +1022,12 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         downgraded,
         // CLAW-116: an unattended infra escalation sent to Mike as a card.
         infraCardUnattended: infraCardUnattended || undefined,
+        // CLAW-119 peer grants: bound on this call, refused on this call, live
+        // for this session, and the grant that covered an escalation (if any).
+        grantBound: grantBound ?? undefined,
+        grantBindRefused: grantBindRefused ?? undefined,
+        liveGrants: liveGrants.length ? liveGrants.map((g) => g.id) : undefined,
+        coveringGrant: coveringGrant?.id ?? undefined,
         agentId: ctx?.agentId ?? null,
         toolCallId: event.toolCallId ?? null,
         toolName,
@@ -1058,6 +1180,7 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
             lastAssistantMessage: effectiveLastAssistantMessage,
             sessionTranscript: sessionTranscript || undefined,
             sessionTranscriptTruncated,
+            verifiedGrant,
           },
           // No agentId: passing it is treated as a target-agent OVERRIDE and
           // rejected ("Plugin LLM completion cannot override the target agent").
