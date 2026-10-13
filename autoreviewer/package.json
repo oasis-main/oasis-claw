@@ -1,0 +1,10 @@
+{
+  "name": "@oasis-claw/autoreviewer",
+  "version": "0.1.0",
+  "description": "Non-openclaw Telegram bot for fleet-wide intents: peer grants (CLAW-119), later fleet monitoring and maintenance.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}

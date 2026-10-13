@@ -1,0 +1,87 @@
+## ── autoreviewer bot (CLAW-119) ──────────────────────────────────────────────
+##
+## A non-openclaw Telegram bot for FLEET-WIDE intents: peer grants first, fleet
+## monitoring and maintenance later. Design: .swarm/PEER_GRANTS.md.
+## Single-bot approval cards do NOT come here; they stay in each bot's chat.
+##
+## Mike's one-time setup (the build cannot do these steps):
+##   1. Create the bot with @BotFather and save its token, one line, in
+##      ~/Library/Application Support/oasis-x/autoreviewer/telegram-token (chmod 600).
+##   2. Send the new bot any message from your own Telegram account, so it can
+##      write to you.
+##   3. Copy autoreviewer/.env.example to autoreviewer/.env (gitignored) and set
+##      AUTOREVIEWER_OWNER_ID and AUTOREVIEWER_BOTS. The chat defaults to the
+##      owner's DM with the bot.
+##   4. Write the container -> bot list for scripts/claw-autoreviewer-map
+##      (see its header; the file is outside the repo).
+##   5. make autoreviewer-map && make autoreviewer-up
+##
+## Trust boundary:
+##   - The token and the client map are mounted read-only and are NOT mounted
+##     into any bot. The grant ledger directory is read-write HERE ONLY; the
+##     bots get it read-only (phase 2).
+##   - Internal networks only. The one route out is the egress proxy, whose
+##     base allowlist holds api.telegram.org.
+##   - Bots reach this service at http://oasis-autoreviewer:8791. They can
+##     propose and read; no route decides a grant.
+
+name: oasis-autoreviewer
+
+services:
+  autoreviewer:
+    image: node:22-bookworm-slim
+    container_name: oasis-autoreviewer
+    command: ["node", "/app/src/main.mjs"]
+    user: "node"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - "no-new-privileges:true"
+    mem_limit: 128m
+    pids_limit: 64
+    restart: unless-stopped
+    environment:
+      AUTOREVIEWER_TELEGRAM_TOKEN_FILE: /run/autoreviewer/telegram-token
+      AUTOREVIEWER_OWNER_ID: "${AUTOREVIEWER_OWNER_ID:?set AUTOREVIEWER_OWNER_ID in autoreviewer/.env}"
+      AUTOREVIEWER_CHAT_ID: "${AUTOREVIEWER_CHAT_ID:-}"
+      AUTOREVIEWER_LEDGER_DIR: /approvals/peer-grants
+      AUTOREVIEWER_CLIENT_MAP: /run/autoreviewer/client.map
+      AUTOREVIEWER_BOTS: "${AUTOREVIEWER_BOTS:?set AUTOREVIEWER_BOTS in autoreviewer/.env}"
+      AUTOREVIEWER_MAIL_ROUTES: /config/claw-mail-routes.json
+      AUTOREVIEWER_TTL_BUTTONS: "${AUTOREVIEWER_TTL_BUTTONS:-1,4,24}"
+      HTTPS_PROXY: "http://oasis-egress-proxy:3128"
+    volumes:
+      - type: bind
+        source: ./src
+        target: /app/src
+        read_only: true
+      - type: bind
+        source: ${HOME}/Library/Application Support/oasis-x/autoreviewer
+        target: /run/autoreviewer
+        read_only: true
+      - type: bind
+        source: ${HOME}/Library/Application Support/oasis-x/approvals/peer-grants
+        target: /approvals/peer-grants
+      - type: bind
+        source: ${AUTOREVIEWER_MAIL_ROUTES_FILE:-../scripts/claw-mail-routes.json}
+        target: /config/claw-mail-routes.json
+        read_only: true
+    networks:
+      oasis_sandboxed: {}
+      oasis_decider: {}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8791/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  # The five sandboxed bots and the egress proxy.
+  oasis_sandboxed:
+    external: true
+    name: oasis-claw_oasis_sandboxed
+  # The non-sandboxed bots (internal, no route out).
+  oasis_decider:
+    external: true
+    name: oasis-claw_oasis_decider

@@ -1,0 +1,239 @@
+// The autoreviewer bot's Telegram side (CLAW-119): grant cards, button
+// presses and slash commands, for Mike only.
+//
+// Scope (Mike, 2026-10-12): this chat is for FLEET-WIDE intents. A card about
+// one bot's own action stays in that bot's own chat through openclaw. New
+// fleet monitoring and maintenance commands register through
+// bot.commands.register() and need no change to the update loop.
+//
+// Authority: an update counts only when it comes from Mike's Telegram user ID
+// in the configured chat. Everything else is dropped and logged. A button
+// press decides a grant only if the press is on that grant's own card.
+
+import {
+  CALLBACK,
+  decidedCardText,
+  grantCardText,
+  grantKeyboard,
+  grantSummaryLine,
+  outcomeLine,
+  parseCallback,
+} from "./cards.mjs";
+
+export class CommandRegistry {
+  constructor() {
+    this.commands = new Map();
+  }
+
+  /** @param {{name: string, description: string, run: (args: string, ctx: object) => Promise<string|void>|string|void}} def */
+  register(def) {
+    if (!/^[a-z][a-z0-9_]{0,31}$/.test(def.name)) throw new Error(`bad command name ${def.name}`);
+    this.commands.set(def.name, def);
+  }
+
+  get(name) {
+    return this.commands.get(name) ?? null;
+  }
+
+  /** For setMyCommands. */
+  menu() {
+    return [...this.commands.values()].map((c) => ({ command: c.name, description: c.description.slice(0, 256) }));
+  }
+}
+
+export class AutoreviewerBot {
+  /**
+   * @param {object} o
+   * @param {import("./telegram.mjs").TelegramClient} o.telegram
+   * @param {import("./ledger.mjs").GrantLedger} o.ledger
+   * @param {number} o.ownerId   Mike's Telegram user ID
+   * @param {number} o.chatId    the autoreviewer chat (Mike's DM with the bot by default)
+   * @param {number[]} [o.ttlButtons]
+   * @param {(row: object) => void} [o.log]
+   * @param {() => number} [o.now]
+   */
+  constructor({ telegram, ledger, ownerId, chatId, ttlButtons = [1, 4, 24], log = () => {}, now = Date.now }) {
+    if (!Number.isSafeInteger(ownerId) || !Number.isSafeInteger(chatId)) throw new Error("ownerId and chatId must be integers");
+    this.telegram = telegram;
+    this.ledger = ledger;
+    this.ownerId = ownerId;
+    this.chatId = chatId;
+    this.ttlButtons = ttlButtons;
+    this.log = log;
+    this.now = now;
+    this.startedAt = now();
+    this.lastPollOkAt = null;
+    this.offset = 0;
+    this.commands = new CommandRegistry();
+    this.registerBuiltins();
+  }
+
+  isMike(fromId, chatId) {
+    return fromId === this.ownerId && chatId === this.chatId;
+  }
+
+  // ── grant cards ──
+
+  async sendGrantCard(grant) {
+    const msg = await this.telegram.sendMessage(this.chatId, grantCardText(grant), grantKeyboard(grant, this.ttlButtons));
+    this.ledger.setCard(grant.id, { chat_id: this.chatId, message_id: msg.message_id });
+    return msg;
+  }
+
+  async refreshCard(grant) {
+    if (!grant.card) return;
+    try {
+      await this.telegram.editMessageText(grant.card.chat_id, grant.card.message_id, decidedCardText(grant));
+    } catch (err) {
+      this.log({ event: "card_edit_failed", id: grant.id, error: String(err.message ?? err) });
+    }
+  }
+
+  /** After a sweep: close the cards of lapsed proposals and expired grants. */
+  async onSwept(changed) {
+    for (const g of changed) await this.refreshCard(g);
+  }
+
+  // ── updates ──
+
+  async handleUpdate(update) {
+    if (update.callback_query) return this.handleCallback(update.callback_query);
+    if (update.message) return this.handleMessage(update.message);
+  }
+
+  async handleCallback(cq) {
+    const chatId = cq.message?.chat?.id;
+    if (!this.isMike(cq.from?.id, chatId)) {
+      this.log({ event: "dropped_callback", from: cq.from?.id ?? null, chat: chatId ?? null });
+      return;
+    }
+    const parsed = parseCallback(cq.data);
+    if (!parsed) {
+      await this.telegram.answerCallbackQuery(cq.id, "Unknown button.");
+      return;
+    }
+    const grant = this.ledger.get(parsed.id);
+    if (!grant) {
+      await this.telegram.answerCallbackQuery(cq.id, `No grant ${parsed.id}.`);
+      return;
+    }
+    try {
+      if (parsed.kind === "decide") {
+        // A press decides a grant only on that grant's own card, so an old or
+        // copied keyboard cannot decide a different grant.
+        if (!grant.card || grant.card.message_id !== cq.message.message_id) {
+          await this.telegram.answerCallbackQuery(cq.id, "This button is not on the card for that grant.");
+          return;
+        }
+        const g = this.ledger.decide(parsed.id, parsed.ttlHours, `telegram:${cq.from.id}`);
+        this.log({ event: g.status, id: g.id, ttl_hours: parsed.ttlHours });
+        await this.refreshCard(g);
+        await this.telegram.answerCallbackQuery(cq.id, outcomeLine(g));
+      } else {
+        const g = this.ledger.revoke(parsed.id, "revoked from Telegram", `telegram:${cq.from.id}`);
+        this.log({ event: "revoked", id: g.id });
+        await this.refreshCard(g);
+        await this.telegram.answerCallbackQuery(cq.id, `${g.id} revoked.`);
+      }
+    } catch (err) {
+      await this.telegram.answerCallbackQuery(cq.id, String(err.message ?? err).slice(0, 190));
+      if (parsed.kind === "decide") await this.refreshCard(grant);
+    }
+  }
+
+  async handleMessage(msg) {
+    if (!this.isMike(msg.from?.id, msg.chat?.id)) {
+      this.log({ event: "dropped_message", from: msg.from?.id ?? null, chat: msg.chat?.id ?? null });
+      return;
+    }
+    const m = /^\/([a-z][a-z0-9_]*)(?:@\S+)?(?:\s+([\s\S]*))?$/i.exec(String(msg.text ?? "").trim());
+    if (!m) {
+      await this.telegram.sendMessage(this.chatId, "Send a command. /help lists them.");
+      return;
+    }
+    const cmd = this.commands.get(m[1].toLowerCase());
+    if (!cmd) {
+      await this.telegram.sendMessage(this.chatId, `Unknown command /${m[1]}. /help lists the commands.`);
+      return;
+    }
+    let reply;
+    try {
+      reply = await cmd.run((m[2] ?? "").trim(), { bot: this, message: msg });
+    } catch (err) {
+      reply = `/${cmd.name} failed: ${String(err.message ?? err).slice(0, 300)}`;
+    }
+    if (reply) await this.telegram.sendMessage(this.chatId, reply);
+  }
+
+  // ── polling ──
+
+  async pollOnce(timeoutS = 50) {
+    const updates = await this.telegram.getUpdates(this.offset, timeoutS);
+    this.lastPollOkAt = this.now();
+    for (const u of updates) {
+      this.offset = Math.max(this.offset, u.update_id + 1);
+      try {
+        await this.handleUpdate(u);
+      } catch (err) {
+        this.log({ event: "update_failed", update_id: u.update_id, error: String(err.message ?? err) });
+      }
+    }
+    return updates.length;
+  }
+
+  // ── built-in commands ──
+
+  registerBuiltins() {
+    this.commands.register({
+      name: "help",
+      description: "List the commands",
+      run: () =>
+        [
+          "Autoreviewer bot: fleet-wide intents only. Single-bot approvals stay in each bot's own chat.",
+          "",
+          ...[...this.commands.commands.values()].map((c) => `/${c.name}: ${c.description}`),
+        ].join("\n"),
+    });
+    this.commands.register({
+      name: "grants",
+      description: "Active grants and open proposals, with Revoke buttons",
+      run: async () => {
+        this.ledger.sweep();
+        const live = this.ledger.list({ statuses: ["active", "proposed"] });
+        if (live.length === 0) return "No active grants and no open proposals.";
+        for (const g of live) {
+          await this.telegram.sendMessage(this.chatId, grantSummaryLine(g), {
+            inline_keyboard: [[{ text: `Revoke ${g.id}`, callback_data: CALLBACK.revoke(g.id) }]],
+          });
+        }
+        return undefined;
+      },
+    });
+    this.commands.register({
+      name: "revoke",
+      description: "Revoke a grant: /revoke GRANT-0001 [reason]",
+      run: async (args) => {
+        const [id, ...rest] = args.split(/\s+/);
+        if (!/^GRANT-\d{4,}$/.test(id ?? "")) return "Usage: /revoke GRANT-0001 [reason]";
+        const g = this.ledger.revoke(id, rest.join(" "), `telegram:${this.ownerId}`);
+        this.log({ event: "revoked", id: g.id });
+        await this.refreshCard(g);
+        return `${g.id} revoked.`;
+      },
+    });
+    this.commands.register({
+      name: "status",
+      description: "Autoreviewer bot health and grant counts",
+      run: () => {
+        this.ledger.sweep();
+        const counts = {};
+        for (const g of this.ledger.list()) counts[g.status] = (counts[g.status] ?? 0) + 1;
+        const up = Math.round((this.now() - this.startedAt) / 60000);
+        return [
+          `Up ${up} min. Last poll ${this.lastPollOkAt ? new Date(this.lastPollOkAt).toISOString() : "never"}.`,
+          `Grants: ${Object.entries(counts).map(([k, v]) => `${k} ${v}`).join(", ") || "none"}.`,
+        ].join("\n");
+      },
+    });
+  }
+}

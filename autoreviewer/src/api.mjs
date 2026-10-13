@@ -1,0 +1,118 @@
+// The autoreviewer bot's fleet-facing HTTP interface (CLAW-119).
+//
+// Bots may PROPOSE a grant and READ grants. No route decides, activates or
+// revokes a grant: only Mike's button press in Telegram (bot.mjs) does that.
+// The requester is the bot that the caller's source address maps to
+// (clientmap.mjs); a "requester" field in the body is ignored. An unmapped
+// address gets 403 on every route except /healthz.
+//
+//   GET  /healthz
+//   POST /v1/grants              body: grantees, thread_id, topic, intent, ttl_hours,
+//                                      [families], [path_prefixes], [max_actions]
+//   GET  /v1/grants[?status=active]
+//   GET  /v1/grants/<id>[?wait_ms=N]   long-poll while the grant is still proposed
+
+import { createServer } from "node:http";
+import { GrantError } from "./ledger.mjs";
+
+const BODY_MAX = 16 * 1024;
+const WAIT_MAX_MS = 10 * 60 * 1000;
+const WAIT_STEP_MS = 500;
+
+function publicGrant(g) {
+  const { card, ...rest } = g;
+  return rest;
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > BODY_MAX) {
+        reject(new GrantError("body too large", 413));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      try {
+        resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {});
+      } catch {
+        reject(new GrantError("body is not JSON"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+/**
+ * @param {object} o
+ * @param {import("./ledger.mjs").GrantLedger} o.ledger
+ * @param {import("./clientmap.mjs").ClientMap} o.clientMap
+ * @param {import("./bot.mjs").AutoreviewerBot} o.bot
+ * @param {(row: object) => void} [o.log]
+ */
+export function createApi({ ledger, clientMap, bot, log = () => {} }) {
+  return createServer(async (req, res) => {
+    const send = (status, obj) => {
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(obj));
+    };
+    try {
+      const url = new URL(req.url ?? "/", "http://autoreviewer");
+      if (req.method === "GET" && url.pathname === "/healthz") return send(200, { ok: true });
+
+      const caller = clientMap.botFor(req.socket.remoteAddress);
+      if (!caller) {
+        log({ event: "refused_unmapped", address: req.socket.remoteAddress, path: url.pathname });
+        return send(403, { error: "caller address is not a mapped fleet bot" });
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/grants") {
+        const body = await readBody(req);
+        const { grant, duplicate } = ledger.propose(caller, body);
+        log({ event: duplicate ? "proposal_duplicate" : "proposed", id: grant.id, requester: caller });
+        if (!duplicate) {
+          try {
+            await bot.sendGrantCard(grant);
+          } catch (err) {
+            // No card means Mike cannot answer; close the proposal at once.
+            ledger.revoke(grant.id, "the card could not be sent to Mike", "autoreviewer");
+            log({ event: "card_send_failed", id: grant.id, error: String(err.message ?? err) });
+            return send(502, { error: "the card could not be sent to Mike", grant: publicGrant(grant) });
+          }
+        }
+        return send(duplicate ? 200 : 201, { grant: publicGrant(grant), duplicate });
+      }
+
+      if (req.method === "GET" && url.pathname === "/v1/grants") {
+        ledger.sweep();
+        const status = url.searchParams.get("status");
+        return send(200, { grants: ledger.list(status ? { statuses: [status] } : {}).map(publicGrant) });
+      }
+
+      const m = /^\/v1\/grants\/(GRANT-\d{4,})$/.exec(url.pathname);
+      if (req.method === "GET" && m) {
+        const waitMs = Math.min(Math.max(Number(url.searchParams.get("wait_ms") ?? 0) || 0, 0), WAIT_MAX_MS);
+        const started = Date.now();
+        let g = ledger.get(m[1]);
+        if (!g) return send(404, { error: `no grant ${m[1]}` });
+        while (g.status === "proposed" && Date.now() - started < waitMs && !res.destroyed) {
+          await new Promise((r) => setTimeout(r, WAIT_STEP_MS));
+          ledger.sweep();
+          g = ledger.get(m[1]);
+        }
+        return send(200, { grant: publicGrant(g) });
+      }
+
+      return send(404, { error: "no such route" });
+    } catch (err) {
+      const status = err instanceof GrantError ? err.status : 500;
+      if (status === 500) log({ event: "api_error", error: String(err.message ?? err) });
+      return send(status, { error: String(err.message ?? err) });
+    }
+  });
+}

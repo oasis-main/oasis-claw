@@ -388,3 +388,23 @@ egress-check: ## verify client.map still matches live bot IPs (CLAW-050 isolatio
 
 egress-sync: ## regenerate client.map from live bot IPs after a restart/recreate
 	@python3 ./scripts/claw-egress-sync
+
+# ── autoreviewer bot (CLAW-119) ──────────────────────────────────────────────
+# Non-openclaw Telegram bot for fleet-wide intents. Setup: the header of
+# autoreviewer/docker-compose.autoreviewer.yml.
+AUTOREVIEWER_COMPOSE := $(COMPOSE_CMD) --env-file autoreviewer/.env -f autoreviewer/docker-compose.autoreviewer.yml
+
+autoreviewer-test: ## run the autoreviewer bot's tests (no container)
+	@cd autoreviewer && node --test test/*.test.mjs
+
+autoreviewer-map: ## write the autoreviewer source-address -> bot map from live bot addresses
+	@python3 ./scripts/claw-autoreviewer-map
+
+autoreviewer-up: _require-engine ## start the autoreviewer bot
+	$(AUTOREVIEWER_COMPOSE) up -d autoreviewer
+
+autoreviewer-down: _require-engine ## stop the autoreviewer bot (grants stay in the ledger)
+	$(AUTOREVIEWER_COMPOSE) down
+
+autoreviewer-logs: _require-engine ## tail the autoreviewer bot's log
+	$(AUTOREVIEWER_COMPOSE) logs -f autoreviewer
