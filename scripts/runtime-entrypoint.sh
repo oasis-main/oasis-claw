@@ -1146,7 +1146,8 @@ else:
 # (exact-match, incl. its structured filters — grep "from: house" or a work-item
 # id) for any bot with OASIS_FIND_ROOTS set. Two cheap general primitives beat
 # one purpose-built tool with its own ranking code and a second model call.
-REACH_TOOLS = ("reach_send", "reach_inbox", "reach_read", "reach_thread", "reach_help")
+# CLAW-119: reach_grant_request (peer grants) — keep in sync with the manifest.
+REACH_TOOLS = ("reach_send", "reach_inbox", "reach_read", "reach_thread", "reach_help", "reach_grant_request")
 if os.environ.get("OASIS_REACH_ENABLE", "") == "1":
     for t in REACH_TOOLS:
         if t not in also:
