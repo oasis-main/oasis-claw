@@ -417,6 +417,29 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
     }
   };
 
+  // ── Approval-card outcomes (2026-10-12) ──
+  // Mike's answer on a card is the only ground-truth label the fleet produces,
+  // and until now it was recorded nowhere: openclaw calls onResolution, but the
+  // reviewer registered none. One phase:"approval_resolution" row per card
+  // holds the card, the context the judge had, and the outcome, so a card can
+  // be labelled from that single row. resolution is allow-once | allow-always
+  // | deny | timeout | cancelled. allow-always is NOT persisted anywhere for
+  // plugin approvals; it unblocks this one call exactly like allow-once.
+  const onCardResolution = (cardKind: "infra" | "reviewer", context: Record<string, unknown>) => {
+    const requestedAt = Date.now();
+    return (resolution: string): void => {
+      write({
+        ...context,
+        ts: new Date().toISOString(),
+        phase: "approval_resolution",
+        cardKind,
+        resolution,
+        requestedAt: new Date(requestedAt).toISOString(),
+        waitMs: Date.now() - requestedAt,
+      });
+    };
+  };
+
   // Resolve this container's identity + per-bot policy once at register.
   const policy = policyFile ? loadPolicyFile(policyFile) : null;
   const agentName = process.env.OASIS_AGENT_NAME ?? "";
@@ -547,6 +570,9 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
     // Mike as an approval card (hardPolicy.infraApprovalCard). Read at the
     // requireApproval return below, which sits outside the try block.
     let infraCardUnattended = false;
+    // Labeling record for an approval card (see onCardResolution). Filled in
+    // the try block, read at the requireApproval returns below it.
+    let cardContext: Record<string, unknown> = {};
     try {
       toolName = String(event.toolName ?? "unknown");
       const toolKind = event.toolKind as string | undefined;
@@ -928,6 +954,25 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         enforced: mode === "enforce" && decision.verdict !== "allow",
       });
 
+      cardContext = {
+        bot: botKey,
+        sessionId,
+        sessionKey: sessionKey || null,
+        unattended,
+        toolCallId: event.toolCallId ?? null,
+        toolName,
+        family,
+        subject,
+        params: paramsJson,
+        principle: decision.principle,
+        reason: decision.reason,
+        l2Verdict: (l2Row?.l2Verdict as string | null | undefined) ?? null,
+        l2Reason: (l2Row?.l2Reason as string | null | undefined) ?? null,
+        operatorRequest: clipForCard(operatorRequest),
+        standingRequest: clipForCard(effectiveStandingRequest),
+        lastAssistantMessage: clipForCard(effectiveLastAssistantMessage),
+      };
+
       // ── Decision-model SHADOW (CLAW-118): fire-and-forget, never awaited ──
       // Asked on the calls Layer 2 judges (so every row has a judge verdict to
       // compare against) and on every report_injection self-report. Runs after
@@ -978,6 +1023,10 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
               decRevision: r.revision ? r.revision.slice(0, 12) : null,
               decError: r.error ?? null,
               decTimedOut: r.timedOut || undefined,
+              // The exact input the model saw. Without it a training row
+              // cannot be rebuilt: the before_tool_call row keeps only
+              // hadOperatorRequest, not the request text (GEN-007 phase 1).
+              decState: state,
               enforced: false,
             });
           })
@@ -1172,10 +1221,12 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         .filter(Boolean)
         .join("\n")
         .slice(0, 256);
+      const title = `NEEDS MIKE: infrastructure change (${botKey})`.slice(0, 80);
       return {
         requireApproval: {
-          title: `NEEDS MIKE: infrastructure change (${botKey})`.slice(0, 80),
+          title,
           description,
+          onResolution: onCardResolution("infra", { ...cardContext, cardTitle: title, cardDescription: description }),
           severity: "warning" as const,
           // Unattended: the mail waker ends the turn at CLAW_WAKER_TIMEOUT_S
           // (600 s), and the export + plan already used part of it, so the card
@@ -1192,13 +1243,16 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
       const retrySuffix = decision.retryHint
         ? `\nIf you'd rather retry now instead of waiting on approval: ${decision.retryHint}`
         : "";
+      const title = "Reviewer approval required";
+      const description = capApprovalDescription(
+        decision.reason,
+        `\n(rule: ${decision.principle}, bot: ${botKey}, tool: ${toolName})${retrySuffix}`,
+      );
       return {
         requireApproval: {
-          title: "Reviewer approval required",
-          description: capApprovalDescription(
-            decision.reason,
-            `\n(rule: ${decision.principle}, bot: ${botKey}, tool: ${toolName})${retrySuffix}`,
-          ),
+          title,
+          description,
+          onResolution: onCardResolution("reviewer", { ...cardContext, cardTitle: title, cardDescription: description }),
           severity: "warning" as const,
           // 10 min (= MAX_PLUGIN_APPROVAL_TIMEOUT_MS, the runtime ceiling): the
           // operator copy-pastes `/approve <id> <decision>` from a Telegram DM,
@@ -1348,6 +1402,14 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
  * bot / tool line and the retry hint whole where possible; shorten the reason.
  */
 export const APPROVAL_DESCRIPTION_MAX = 512;
+
+/** Context text on an approval_resolution row: enough to label, bounded. */
+const CARD_CONTEXT_CHARS = 2000;
+function clipForCard(s: string): string | null {
+  const t = s.trim();
+  if (!t) return null;
+  return t.length > CARD_CONTEXT_CHARS ? `${t.slice(0, CARD_CONTEXT_CHARS)}…` : t;
+}
 export function capApprovalDescription(reason: string, suffix: string, max = APPROVAL_DESCRIPTION_MAX): string {
   const full = `${reason}${suffix}`;
   if (full.length <= max) return full;

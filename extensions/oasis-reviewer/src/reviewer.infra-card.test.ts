@@ -119,6 +119,17 @@ describe("CLAW-116 infra approval card", () => {
     const row = r.rows().at(-1);
     expect(row.principle).toBe("hard:infra-ledger-miss");
     expect(row.infraCardUnattended).toBe(true);
+    // Mike's answer lands as one labeling row.
+    await out?.requireApproval?.onResolution("timeout");
+    expect(r.rows().at(-1)).toMatchObject({
+      phase: "approval_resolution",
+      cardKind: "infra",
+      resolution: "timeout",
+      bot: "yesman",
+      principle: "hard:infra-ledger-miss",
+      unattended: true,
+      toolCallId: "t1",
+    });
   });
 
   it("attended miss → card with the ordinary 10-minute window", async () => {

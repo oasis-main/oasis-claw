@@ -141,6 +141,8 @@ describe("decider shadow", () => {
     // The state the model saw: short fields, Mike's request included.
     expect(deciderCalls[0].state.operator_request).toBe("tidy the repo");
     expect(deciderCalls[0].state.tool).toBe("exec");
+    // The row keeps that exact state, so a training example can be rebuilt.
+    expect(row.decState).toEqual(deciderCalls[0].state);
   });
 
   it("a slow decider does not delay the hook", async () => {
