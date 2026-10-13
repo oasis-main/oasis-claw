@@ -103,7 +103,7 @@ export type LlmComplete = (params: {
   agentId?: string;
   thinkingLevel?: string;
   signal?: AbortSignal;
-}) => Promise<{ text: string }>;
+}) => Promise<{ text: string; usage?: unknown }>;
 
 const NONCE_BYTES = 12;
 
@@ -257,6 +257,13 @@ export interface JudgeResult {
   timedOut?: boolean;
   /** The deadline actually applied, so a caller can name it in its message. */
   timeoutMs: number;
+  /**
+   * Replies that came back with NO text before the deadline (2026-10-13). One
+   * empty reply is retried once inside the same deadline; see judgeConstitution.
+   */
+  emptyReplies?: number;
+  /** Provider usage of the last reply that came back empty, for diagnosis. */
+  emptyUsage?: unknown;
 }
 
 /** Call the model to judge the call. Bounded by timeoutMs; never throws. */
@@ -270,51 +277,69 @@ export async function judgeConstitution(
   const ac = new AbortController();
   const timeoutMs = opts.timeoutMs ?? 20_000;
   const timer = setTimeout(() => ac.abort(), timeoutMs);
+  // EMPTY-REPLY RETRY (2026-10-13). On 7 days of fleet audit, 64 of 1,933
+  // judged calls got a reply with no text at all, before the deadline, with
+  // thinking at "minimal" and 2048 tokens (so not the 2026-08-03 budget
+  // failure). On bots with constitutionalReviewRequired each one is a
+  // fail-closed deny; Hello World's mail to a peer was blocked this way. The
+  // same calls mostly pass on the next try, so ONE retry is made inside the
+  // same deadline. A reply WITH text (verdict or garbage) is never retried.
+  let emptyReplies = 0;
+  let emptyUsage: unknown;
   try {
-    const res = await complete({
-      systemPrompt: system,
-      messages: [{ role: "user", content: user }],
-      ...(opts.model ? { model: opts.model } : {}),
-      ...(opts.agentId ? { agentId: opts.agentId } : {}),
-      // Without this, the call silently inherits the CALLING AGENT's own
-      // thinking level (Nimbus runs "high"). Extended thinking is charged
-      // against the same maxTokens budget as the visible response, so a high
-      // thinking level can consume the entire budget on reasoning and leave
-      // ZERO tokens for the verdict — res.text comes back empty, no error, no
-      // parse-fail text, just a silent fail-closed deny (2026-08-03, Nimbus:
-      // several denies with l2Verdict/l2Error/l2ParseFail all null).
-      // "off" fixed that but throws out the reasoning entirely — Mike's call
-      // (2026-08-03): an INDEPENDENT reviewer should still think a little,
-      // not pattern-match blind. "minimal" is the cheapest non-off rung on
-      // openclaw's ladder (off < minimal < low < medium < high < xhigh <
-      // max) — real deliberation, bounded. Paired with the much larger
-      // maxTokens below as the hard ceiling, so minimal-level thinking can
-      // never plausibly exhaust the budget before the verdict gets written.
-      // A caller MAY raise thinkingLevel via opts (e.g. reviewer.ts's
-      // OASIS_REVIEWER_L2_THINKING) but MUST raise maxTokens to match —
-      // "minimal" is the level proven safe at 2048; anything higher without
-      // more room reproduces the exact 2026-08-03 failure below, one rung
-      // worse per rung raised.
-      thinkingLevel: opts.thinkingLevel ?? "minimal",
-      // Was 220, then 320 (2026-07-30) to fix a truncated-explanation case.
-      // Raised again (2026-08-03) alongside thinkingLevel:"minimal" above —
-      // that reasoning needs its own room on top of the JSON verdict, and
-      // this is the hard cap on the two combined. Still a ~1-2s cost for a
-      // per-call judge; cheap relative to getting a real verdict every time.
-      maxTokens: opts.maxTokens ?? 2048,
-      temperature: 0,
-      purpose: "oasis-reviewer:layer2-constitution",
-      signal: ac.signal,
-    });
-    return {
-      decision: parseVerdict(res.text),
-      raw: (res.text ?? "").slice(0, 500),
-      ms: Date.now() - started,
-      // Set even here: an aborted call can RESOLVE with empty text rather than
-      // reject. See JudgeResult.timedOut.
-      timedOut: ac.signal.aborted,
-      timeoutMs,
-    };
+    for (;;) {
+      const res = await complete({
+        systemPrompt: system,
+        messages: [{ role: "user", content: user }],
+        ...(opts.model ? { model: opts.model } : {}),
+        ...(opts.agentId ? { agentId: opts.agentId } : {}),
+        // Without this, the call silently inherits the CALLING AGENT's own
+        // thinking level (Nimbus runs "high"). Extended thinking is charged
+        // against the same maxTokens budget as the visible response, so a high
+        // thinking level can consume the entire budget on reasoning and leave
+        // ZERO tokens for the verdict — res.text comes back empty, no error, no
+        // parse-fail text, just a silent fail-closed deny (2026-08-03, Nimbus:
+        // several denies with l2Verdict/l2Error/l2ParseFail all null).
+        // "off" fixed that but throws out the reasoning entirely — Mike's call
+        // (2026-08-03): an INDEPENDENT reviewer should still think a little,
+        // not pattern-match blind. "minimal" is the cheapest non-off rung on
+        // openclaw's ladder (off < minimal < low < medium < high < xhigh <
+        // max) — real deliberation, bounded. Paired with the much larger
+        // maxTokens below as the hard ceiling, so minimal-level thinking can
+        // never plausibly exhaust the budget before the verdict gets written.
+        // A caller MAY raise thinkingLevel via opts (e.g. reviewer.ts's
+        // OASIS_REVIEWER_L2_THINKING) but MUST raise maxTokens to match —
+        // "minimal" is the level proven safe at 2048; anything higher without
+        // more room reproduces the exact 2026-08-03 failure below, one rung
+        // worse per rung raised.
+        thinkingLevel: opts.thinkingLevel ?? "minimal",
+        // Was 220, then 320 (2026-07-30) to fix a truncated-explanation case.
+        // Raised again (2026-08-03) alongside thinkingLevel:"minimal" above —
+        // that reasoning needs its own room on top of the JSON verdict, and
+        // this is the hard cap on the two combined. Still a ~1-2s cost for a
+        // per-call judge; cheap relative to getting a real verdict every time.
+        maxTokens: opts.maxTokens ?? 2048,
+        temperature: 0,
+        purpose: "oasis-reviewer:layer2-constitution",
+        signal: ac.signal,
+      });
+      const empty = !(res.text ?? "").trim();
+      if (empty && !ac.signal.aborted) {
+        emptyReplies++;
+        emptyUsage = res.usage;
+        if (emptyReplies < 2) continue;
+      }
+      return {
+        decision: parseVerdict(res.text),
+        raw: (res.text ?? "").slice(0, 500),
+        ms: Date.now() - started,
+        // Set even here: an aborted call can RESOLVE with empty text rather than
+        // reject. See JudgeResult.timedOut.
+        timedOut: ac.signal.aborted,
+        timeoutMs,
+        ...(emptyReplies ? { emptyReplies, emptyUsage } : {}),
+      };
+    }
   } catch (err) {
     return {
       decision: null,
@@ -323,6 +348,7 @@ export async function judgeConstitution(
       ms: Date.now() - started,
       timedOut: ac.signal.aborted,
       timeoutMs,
+      ...(emptyReplies ? { emptyReplies, emptyUsage } : {}),
     };
   } finally {
     clearTimeout(timer);

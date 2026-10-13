@@ -955,6 +955,10 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
           // knowledge of what the bot's env said at the time.
           l2TimedOut: r.timedOut || undefined,
           l2TimeoutMs: r.timeoutMs,
+          // 2026-10-13: empty replies (retried once) and the provider usage of
+          // the empty one, so the cause can be read off the audit.
+          l2EmptyReplies: r.emptyReplies,
+          l2EmptyUsage: r.emptyUsage,
           l2Tightened: !!combined && !inertReadKept && combined.verdict !== l1.verdict,
           // Records every escalate-on-an-inert-read the backstop absorbed, so
           // the constitution's own drift stays measurable after the prose fix.

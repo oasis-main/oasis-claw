@@ -96,6 +96,9 @@ services:
       # Repeated in bots/docker-compose.bots.yml for the same reason as the
       # loop guard above.
       OASIS_REVIEWER_DECIDER: ${OASIS_REVIEWER_DECIDER:-shadow}
+      # CLAW-119: in a run peer mail woke up, an escalation needs a peer grant
+      # (else fail closed). Off by default; fleets that run the autoreviewer bot set 1.
+      OASIS_REVIEWER_MAIL_WAKE_REQUIRES_GRANT: ${OASIS_REVIEWER_MAIL_WAKE_REQUIRES_GRANT:-0}
       OASIS_REVIEWER_DECIDER_URL: ${OASIS_REVIEWER_DECIDER_URL:-http://oasis-decider:8790}
       # Shadow calls are never awaited, so a long timeout costs nothing. 8 s
       # (the code default) timed out 39 of 78 calls in a multi-bot burst.
