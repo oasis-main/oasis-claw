@@ -77,6 +77,19 @@ export function createReachSendTool(config: ReachSendConfig) {
           return { content: [{ type: "text" as const, text: "reach_send rejected: grant_id needs this bot's mail name (OASIS_REACH_SELF), which is not configured." }] };
         }
         const grants = loadGrants(config.mailbox.grantsFile ?? DEFAULT_PEER_GRANTS_FILE);
+        // A grantee replying on the thread: say what to do, not only what failed
+        // (live test 2026-10-13: the grantee attached the grant to its reply).
+        const own = grants.find((g) => g.id === env.grant_id);
+        if (own && own.requester !== config.mailbox.self && own.grantees.includes(config.mailbox.self)) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `reach_send rejected: you are a grantee of ${env.grant_id}, not its requester (${own.requester}). A grant covers only the requester's mail. Reply on thread "${own.thread_id}" without grant_id.`,
+              },
+            ],
+          };
+        }
         for (const to of env.to) {
           const c = checkGrant(grants, { grantId: env.grant_id, requester: config.mailbox.self, grantee: to, threadId: env.thread_id });
           if (!c.ok) return { content: [{ type: "text" as const, text: `reach_send rejected: ${env.grant_id} does not cover ${to}: ${c.reason}.` }] };

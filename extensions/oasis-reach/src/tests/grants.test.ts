@@ -121,6 +121,13 @@ describe("reach_send with grant_id", () => {
     expect(readdirSync(join(cfg.mailDir, "outbox")).filter((f) => f.endsWith(".json"))).toHaveLength(0);
   });
 
+  it("a grantee replying with the grant id is told to reply without it", async () => {
+    const cfg = setup("beta");
+    const r = await send(cfg, { to: ["alpha"], thread_id: "t_map", grant_id: "GRANT-0001" });
+    expect(r.content[0].text).toContain("you are a grantee of GRANT-0001");
+    expect(r.content[0].text).toContain('Reply on thread "t_map" without grant_id');
+  });
+
   it("NEGATIVE CONTROL: a sender that is not the requester cannot use the grant", async () => {
     const cfg = setup("gamma");
     const r = await send(cfg, { to: ["beta"], thread_id: "t_map", grant_id: "GRANT-0001" });
