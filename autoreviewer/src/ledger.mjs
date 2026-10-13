@@ -134,9 +134,13 @@ export class GrantLedger {
     }
 
     this.sweep();
+    // An identical request returns the open proposal, or the grant that is
+    // already active, so a bot that asks again after Mike answered gets the
+    // live grant and Mike gets no second card (live test, 2026-10-13).
+    const now0 = this.now();
     const same = this.data.grants.find(
       (g) =>
-        g.status === "proposed" &&
+        (g.status === "proposed" || (g.status === "active" && Date.parse(g.expires) > now0)) &&
         g.requester === requester &&
         g.thread_id === threadId &&
         g.topic === topic &&

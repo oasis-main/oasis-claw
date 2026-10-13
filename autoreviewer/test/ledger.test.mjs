@@ -72,6 +72,26 @@ describe("GrantLedger.propose", () => {
     assert.equal(l.list().length, 1);
   });
 
+  it("returns the active grant for an identical request, not a new proposal", () => {
+    const { l } = ledger();
+    const a = l.propose("alpha", PROPOSAL).grant;
+    l.decide(a.id, 4, "x");
+    const again = l.propose("alpha", { ...PROPOSAL });
+    assert.equal(again.duplicate, true);
+    assert.equal(again.grant.id, a.id);
+    assert.equal(again.grant.status, "active");
+    assert.equal(l.list().length, 1);
+  });
+
+  it("NEGATIVE CONTROL: a denied grant does not count as a duplicate", () => {
+    const { l } = ledger();
+    const a = l.propose("alpha", PROPOSAL).grant;
+    l.decide(a.id, null, "x");
+    const again = l.propose("alpha", { ...PROPOSAL });
+    assert.equal(again.duplicate, false);
+    assert.notEqual(again.grant.id, a.id);
+  });
+
   it("limits open proposals for one requester", () => {
     const { l } = ledger();
     for (let i = 0; i < MAX_OPEN_PER_REQUESTER; i++) l.propose("alpha", { ...PROPOSAL, thread_id: `t_${i}` });
