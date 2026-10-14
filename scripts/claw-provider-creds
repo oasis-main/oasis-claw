@@ -9,7 +9,7 @@ every repository:
 
   ~/Library/Application Support/oasis-x/yesman-secrets/
     providers.env      env_file for Yes Man only: SCW_*, MODAL_TOKEN_*, GH_TOKEN,
-                       DIGITALOCEAN_ACCESS_TOKEN
+                       DIGITALOCEAN_ACCESS_TOKEN, STRIPE_API_KEY (a RESTRICTED key)
     aws/credentials    mounted read-only at /home/node/.aws in Yes Man:
     aws/config         profiles oasis-dev, oasis-prod, default (personal account)
 
@@ -24,7 +24,7 @@ nothing. So egress is derived from the keys:
   scripts/claw-provider-creds revoke <p>     # remove provider p's key (aws: also deletes the IAM
                                              # keys) and its egress, restart
 
-Providers: aws, scaleway, modal, github, digitalocean, gcp. Each host in bots/yesman/role.yaml
+Providers: aws, scaleway, modal, github, digitalocean, gcp, hetzner, workspace, stripe. Each host in bots/yesman/role.yaml
 origins.trusted carries a `# provider:<name>` tag; `apply` writes
 sandbox/egress-proxy/seeds/yesman/allowlist.txt with only the hosts of the
 providers that have keys. `apply` refuses while the known secret files still sit
@@ -57,7 +57,7 @@ FALLBACK_FILES = [
     "bots/docker-compose.bots.yml",
     "bots/docker-compose.yesman-reach.yml",
 ]
-PROVIDERS = ("aws", "scaleway", "modal", "github", "digitalocean", "gcp", "hetzner", "workspace")
+PROVIDERS = ("aws", "scaleway", "modal", "github", "digitalocean", "gcp", "hetzner", "workspace", "stripe")
 
 # (admin profile on Mike's Mac, profile name inside Yes Man's credentials file)
 AWS_ACCOUNTS = [
@@ -74,6 +74,11 @@ ENV_KEYS = {
     "digitalocean": ("DIGITALOCEAN_ACCESS_TOKEN",),
     # Read+write token of the model-archive project (Mike, 2026-10-08).
     "hetzner": ("HCLOUD_TOKEN",),
+    # Stripe (Mike, 2026-10-14): a RESTRICTED key (rk_...) for draft invoices.
+    # Finalize, send, pay, refunds and payouts are infra-gated in the reviewer
+    # (an approval card every time). A later design moves the key out of Yes
+    # Man into a broker (CLAW-120).
+    "stripe": ("STRIPE_API_KEY",),
 }
 
 # Providers whose credential is a FILE, not a providers.env key (Mike,
@@ -271,6 +276,22 @@ except Exception as e:
     print(f"FAILED {type(e).__name__}")
 """
 
+PY_STRIPE = r"""
+import os, urllib.request, urllib.error, base64
+k = os.environ.get("STRIPE_API_KEY", "")
+kind = ("restricted " if k.startswith("rk_") else "FULL SECRET KEY (use a restricted key) " if k.startswith("sk_") else "unknown ")
+kind += "live" if "_live_" in k else "test" if "_test_" in k else "?"
+req = urllib.request.Request("https://api.stripe.com/v1/invoices?limit=1",
+    headers={"Authorization": "Basic " + base64.b64encode((k + ":").encode()).decode()})
+try:
+    with urllib.request.urlopen(req, timeout=20) as r:
+        print(f"{kind} key; invoices read HTTP {r.status}")
+except urllib.error.HTTPError as e:
+    print(f"{kind} key; invoices read FAILED HTTP {e.code}")
+except Exception as e:
+    print(f"{kind} key; FAILED {type(e).__name__}")
+"""
+
 PY_BLOCKED = r"""
 import sys, urllib.error, urllib.request
 try:
@@ -319,6 +340,10 @@ def probe(provider):
             print("  workspace: " + (", ".join(f"{a.get('email')} [{','.join(a.get('services') or [])}]" for a in accts) or "client loaded, no account signed in"))
         except ValueError:
             print(f"  workspace: FAILED {tail(r)}")
+    elif provider == "stripe":
+        # Key TYPE and one read only; the key itself is never printed.
+        r = dexec(["python3", "-c", PY_STRIPE], timeout=60)
+        print(f"  stripe: {r.stdout.strip() or tail(r)}")
     elif provider == "digitalocean":
         # Status and droplet limit only: `account get` also shows the email.
         r = dexec(["sh", "-c", "command -v doctl >/dev/null || { echo 'doctl not staged (claw-infra-tools stage)'; exit 3; }; doctl account get --format Status,DropletLimit --no-header"], timeout=60)
