@@ -8,6 +8,9 @@ export const CALLBACK = {
   grant: (id, hours) => `g:${id}:${hours}`,
   deny: (id) => `g:${id}:deny`,
   revoke: (id) => `r:${id}`,
+  ghApprove: (id) => `h:${id}:ok`,
+  ghDeny: (id) => `h:${id}:no`,
+  ghRevoke: (id) => `hr:${id}`,
 };
 
 export function parseCallback(data) {
@@ -15,6 +18,10 @@ export function parseCallback(data) {
   if (m) return { kind: "decide", id: m[1], ttlHours: m[2] === "deny" ? null : Number(m[2]) };
   const r = /^r:(GRANT-\d{4,})$/.exec(String(data ?? ""));
   if (r) return { kind: "revoke", id: r[1] };
+  const h = /^h:(GH-\d{4,}):(ok|no)$/.exec(String(data ?? ""));
+  if (h) return { kind: "gh-decide", id: h[1], approve: h[2] === "ok" };
+  const hr = /^hr:(GH-\d{4,})$/.exec(String(data ?? ""));
+  if (hr) return { kind: "gh-revoke", id: hr[1] };
   return null;
 }
 
@@ -85,4 +92,47 @@ export function grantKeyboard(g, ttlButtons) {
 export function grantSummaryLine(g) {
   const when = g.status === "active" ? `until ${utc(g.expires)}` : `lapses ${utc(g.proposal_expires)}`;
   return `${g.id} [${g.status}] ${g.requester} -> ${g.grantees.join(", ")} (${g.thread_id}), ${when}\n  ${g.topic}`;
+}
+
+// ── GitHub access requests (CLAW-121) ──
+
+export function ghCardText(r) {
+  return [
+    `GITHUB ACCESS REQUEST ${r.id}`,
+    `Requested by: ${r.requester}`,
+    `For bot: ${r.bot}`,
+    `Account: ${r.account}`,
+    `Repos: ${r.repos.join(", ")}`,
+    `Access: ${r.access === "write" ? "WRITE (contents, pull requests, issues)" : "read"}`,
+    "Durable until revoked (/ghrevoke). The minter applies it within 30 minutes.",
+    "",
+    `Reason (written by ${r.requester}):`,
+    r.reason,
+  ].join("\n");
+}
+
+export function ghOutcome(r, minter) {
+  switch (r.status) {
+    case "approved":
+      return `APPROVED by Mike. Minter: ${minter ?? "not applied yet"}.`;
+    case "denied":
+      return "DENIED by Mike.";
+    case "revoked":
+      return "REVOKED. The minter drops it on its next run; a live token can last up to 1 h more.";
+    default:
+      return "";
+  }
+}
+
+export function ghDecidedText(r, minter) {
+  return `${ghCardText(r)}\n\n>> ${ghOutcome(r, minter)}`;
+}
+
+export function ghKeyboard(r) {
+  return {
+    inline_keyboard: [[
+      { text: "Approve", callback_data: CALLBACK.ghApprove(r.id) },
+      { text: "Deny", callback_data: CALLBACK.ghDeny(r.id) },
+    ]],
+  };
 }

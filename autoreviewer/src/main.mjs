@@ -10,12 +10,18 @@
 //   AUTOREVIEWER_MAIL_ROUTES          scripts/claw-mail-routes.json; a grant needs a relay route requester -> grantee
 //   AUTOREVIEWER_TTL_BUTTONS          default "1,4,24"
 //   AUTOREVIEWER_LISTEN               default 0.0.0.0:8791
+//   AUTOREVIEWER_GH_DIR               GitHub access requests folder (CLAW-121; unset = feature off)
+//   AUTOREVIEWER_GH_ACCOUNTS          GitHub accounts with a minter App, comma list
+//   AUTOREVIEWER_GH_REQUESTERS        bots that may request GitHub access, comma list
+//   AUTOREVIEWER_SNAPSHOT             fleet snapshot (scripts/claw-fleet-snapshot.mjs), read-only
 //   HTTPS_PROXY                       the fleet egress proxy, the only route to api.telegram.org
 
 import { readFileSync } from "node:fs";
 import { AutoreviewerBot } from "./bot.mjs";
 import { createApi } from "./api.mjs";
 import { ClientMap } from "./clientmap.mjs";
+import { GithubGrantStore } from "./ghgrants.mjs";
+import { registerMonitorCommands } from "./monitor.mjs";
 import { GrantLedger } from "./ledger.mjs";
 import { TelegramClient } from "./telegram.mjs";
 
@@ -53,10 +59,20 @@ const canMail = (from, to) => {
 const ledger = new GrantLedger(env.AUTOREVIEWER_LEDGER_DIR || "/approvals/peer-grants", { bots, canMail });
 const clientMap = new ClientMap(required("AUTOREVIEWER_CLIENT_MAP"));
 const telegram = new TelegramClient({ token, proxy: env.HTTPS_PROXY || env.https_proxy });
-const bot = new AutoreviewerBot({ telegram, ledger, ownerId, chatId, ttlButtons, log });
+const list = (v) => String(v ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+const ghStore = env.AUTOREVIEWER_GH_DIR && list(env.AUTOREVIEWER_GH_ACCOUNTS).length
+  ? new GithubGrantStore(env.AUTOREVIEWER_GH_DIR, {
+      bots,
+      accounts: list(env.AUTOREVIEWER_GH_ACCOUNTS),
+      requesters: list(env.AUTOREVIEWER_GH_REQUESTERS),
+    })
+  : null;
+const bot = new AutoreviewerBot({ telegram, ledger, ghStore, ownerId, chatId, ttlButtons, log });
 ledger.onSweep = (changed) => bot.onSwept(changed);
+// CLAW-122: fleet monitoring commands over the Mac's sanitized snapshot.
+registerMonitorCommands(bot.commands, env.AUTOREVIEWER_SNAPSHOT || "/run/fleet-snapshot/snapshot.json");
 
-createApi({ ledger, clientMap, bot, log }).listen(Number(port), host, () =>
+createApi({ ledger, clientMap, bot, ghStore, log }).listen(Number(port), host, () =>
   log({ event: "listening", host, port: Number(port), bots, ttlButtons }),
 );
 

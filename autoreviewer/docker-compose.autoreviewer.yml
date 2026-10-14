@@ -50,6 +50,12 @@ services:
       AUTOREVIEWER_BOTS: "${AUTOREVIEWER_BOTS:?set AUTOREVIEWER_BOTS in autoreviewer/.env}"
       AUTOREVIEWER_MAIL_ROUTES: /config/claw-mail-routes.json
       AUTOREVIEWER_TTL_BUTTONS: "${AUTOREVIEWER_TTL_BUTTONS:-1,4,24}"
+      # CLAW-121: card-gated GitHub access requests (feature off when the accounts are unset).
+      AUTOREVIEWER_GH_DIR: /approvals/github-grants
+      AUTOREVIEWER_GH_ACCOUNTS: "${AUTOREVIEWER_GH_ACCOUNTS:-}"
+      AUTOREVIEWER_GH_REQUESTERS: "${AUTOREVIEWER_GH_REQUESTERS:-}"
+      # CLAW-122: sanitized fleet snapshot (scripts/claw-fleet-snapshot.mjs), read-only.
+      AUTOREVIEWER_SNAPSHOT: /run/fleet-snapshot/snapshot.json
       HTTPS_PROXY: "http://oasis-egress-proxy:3128"
     volumes:
       - type: bind
@@ -63,6 +69,15 @@ services:
       - type: bind
         source: ${HOME}/Library/Application Support/oasis-x/approvals/peer-grants
         target: /approvals/peer-grants
+      # CLAW-121: approved GitHub requests; the Mac minter merges them. NOT the
+      # github-app folder (that one holds the App keys and grants.json).
+      - type: bind
+        source: ${HOME}/Library/Application Support/oasis-x/github-grants
+        target: /approvals/github-grants
+      - type: bind
+        source: ${HOME}/Library/Application Support/oasis-x/fleet-snapshot
+        target: /run/fleet-snapshot
+        read_only: true
       - type: bind
         source: ${AUTOREVIEWER_MAIL_ROUTES_FILE:-../scripts/claw-mail-routes.json}
         target: /config/claw-mail-routes.json

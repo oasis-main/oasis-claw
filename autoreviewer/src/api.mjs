@@ -11,6 +11,8 @@
 //                                      [families], [path_prefixes], [max_actions]
 //   GET  /v1/grants[?status=active]
 //   GET  /v1/grants/<id>[?wait_ms=N]   long-poll while the grant is still proposed
+//   POST /v1/github-grants       body: bot, account, repos[], access ("read"|"write"), reason
+//   GET  /v1/github-grants/<id>[?wait_ms=N]   (CLAW-121; requesters are configured)
 
 import { createServer } from "node:http";
 import { GrantError } from "./ledger.mjs";
@@ -55,7 +57,7 @@ function readBody(req) {
  * @param {import("./bot.mjs").AutoreviewerBot} o.bot
  * @param {(row: object) => void} [o.log]
  */
-export function createApi({ ledger, clientMap, bot, log = () => {} }) {
+export function createApi({ ledger, clientMap, bot, ghStore = null, log = () => {} }) {
   return createServer(async (req, res) => {
     const send = (status, obj) => {
       res.writeHead(status, { "Content-Type": "application/json" });
@@ -92,6 +94,40 @@ export function createApi({ ledger, clientMap, bot, log = () => {} }) {
         ledger.sweep();
         const status = url.searchParams.get("status");
         return send(200, { grants: ledger.list(status ? { statuses: [status] } : {}).map(publicGrant) });
+      }
+
+      if (url.pathname.startsWith("/v1/github-grants")) {
+        if (!ghStore) return send(404, { error: "GitHub requests are not configured" });
+        if (req.method === "POST" && url.pathname === "/v1/github-grants") {
+          const body = await readBody(req);
+          const { request, duplicate } = ghStore.propose(caller, body);
+          log({ event: duplicate ? "github_duplicate" : "github_proposed", id: request.id, requester: caller, bot: request.bot });
+          if (!duplicate) {
+            try {
+              await bot.sendGhCard(request);
+            } catch (err) {
+              ghStore.revoke(request.id, "autoreviewer");
+              log({ event: "card_send_failed", id: request.id, error: String(err.message ?? err) });
+              return send(502, { error: "the card could not be sent to Mike" });
+            }
+          }
+          const { card, ...pub } = request;
+          return send(duplicate ? 200 : 201, { request: pub, duplicate });
+        }
+        const gm = /^\/v1\/github-grants\/(GH-\d{4,})$/.exec(url.pathname);
+        if (req.method === "GET" && gm) {
+          const waitMs = Math.min(Math.max(Number(url.searchParams.get("wait_ms") ?? 0) || 0, 0), WAIT_MAX_MS);
+          const started = Date.now();
+          let r = ghStore.get(gm[1]);
+          if (!r) return send(404, { error: `no request ${gm[1]}` });
+          while (r.status === "proposed" && Date.now() - started < waitMs && !res.destroyed) {
+            await new Promise((ok) => setTimeout(ok, WAIT_STEP_MS));
+            r = ghStore.get(gm[1]);
+          }
+          const { card, ...pub } = r;
+          return send(200, { request: pub, minter: ghStore.minterStatus()[r.id] ?? null });
+        }
+        return send(404, { error: "no such route" });
       }
 
       const m = /^\/v1\/grants\/(GRANT-\d{4,})$/.exec(url.pathname);

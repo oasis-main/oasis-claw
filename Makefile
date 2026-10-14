@@ -408,3 +408,34 @@ autoreviewer-down: _require-engine ## stop the autoreviewer bot (grants stay in 
 
 autoreviewer-logs: _require-engine ## tail the autoreviewer bot's log
 	$(AUTOREVIEWER_COMPOSE) logs -f autoreviewer
+
+# ── fleet snapshot for the autoreviewer bot (CLAW-122) ───────────────────────
+# Sanitized metadata only (scripts/claw-fleet-snapshot.mjs header). launchd
+# cannot run files inside ~/Documents, so install copies the script out first;
+# re-run after editing it.
+FLEET_SNAPSHOT_DIR   := $(HOME)/Library/Application Support/oasis-x/fleet-snapshot
+FLEET_SNAPSHOT_PLIST := $(HOME)/Library/LaunchAgents/com.oasis-x.fleet-snapshot.plist
+
+fleet-snapshot: ## write the fleet snapshot once (sanitized metadata for /fleet, /bot, /denials, /mail)
+	@node scripts/claw-fleet-snapshot.mjs
+
+fleet-snapshot-install: ## (re)install the 2-minute fleet snapshot launchd job
+	@mkdir -p "$(FLEET_SNAPSHOT_DIR)"
+	@cp scripts/claw-fleet-snapshot.mjs "$(FLEET_SNAPSHOT_DIR)/claw-fleet-snapshot.mjs"
+	@printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+	  '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+	  '<plist version="1.0"><dict>' \
+	  '<key>Label</key><string>com.oasis-x.fleet-snapshot</string>' \
+	  '<key>ProgramArguments</key><array><string>/usr/local/bin/node</string><string>$(FLEET_SNAPSHOT_DIR)/claw-fleet-snapshot.mjs</string></array>' \
+	  '<key>EnvironmentVariables</key><dict><key>HOME</key><string>$(HOME)</string><key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string></dict>' \
+	  '<key>StartInterval</key><integer>120</integer><key>RunAtLoad</key><true/>' \
+	  '<key>StandardOutPath</key><string>$(HOME)/Library/Logs/fleet-snapshot.log</string>' \
+	  '<key>StandardErrorPath</key><string>$(HOME)/Library/Logs/fleet-snapshot.log</string>' \
+	  '</dict></plist>' > "$(FLEET_SNAPSHOT_PLIST)"
+	@launchctl bootout gui/$$(id -u)/com.oasis-x.fleet-snapshot 2>/dev/null || true
+	@launchctl bootstrap gui/$$(id -u) "$(FLEET_SNAPSHOT_PLIST)"
+	@echo "fleet snapshot: every 2 min -> $(FLEET_SNAPSHOT_DIR)/snapshot.json (log ~/Library/Logs/fleet-snapshot.log)"
+
+fleet-snapshot-status: ## age of the fleet snapshot and the last launchd exit code
+	@ls -la "$(FLEET_SNAPSHOT_DIR)/snapshot.json" 2>/dev/null || echo "no snapshot yet"
+	@launchctl print gui/$$(id -u)/com.oasis-x.fleet-snapshot 2>/dev/null | grep -E "last exit|state" || echo "launchd job not loaded"

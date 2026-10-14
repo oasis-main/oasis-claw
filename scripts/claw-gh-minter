@@ -60,6 +60,11 @@ APP_DIR = os.path.join(SUPPORT, "github-app")
 TOKEN_ROOT = os.path.join(SUPPORT, "gh-tokens")
 APPS_FILE = os.path.join(APP_DIR, "apps.json")
 GRANTS_FILE = os.path.join(APP_DIR, "grants.json")
+# CLAW-121: GitHub access requests Mike approved on the autoreviewer bot's cards.
+# That bot writes this folder; it never sees grants.json or the App keys.
+GH_REQUESTS_DIR = os.environ.get("OASIS_GH_REQUESTS_DIR") or os.path.join(SUPPORT, "github-grants")
+GH_APPROVED_FILE = os.path.join(GH_REQUESTS_DIR, "approved.json")
+GH_STATUS_FILE = os.path.join(GH_REQUESTS_DIR, "status.json")
 API = os.environ.get("OASIS_GH_API", "https://api.github.com").rstrip("/")
 WEB = os.environ.get("OASIS_GH_WEB", "https://github.com").rstrip("/")
 LAUNCHD_LABEL = "com.oasis-x.gh-minter"
@@ -176,9 +181,65 @@ def apps():
     return load_json(APPS_FILE, {})
 
 
-def grants():
+def base_grants():
     g = load_json(GRANTS_FILE, None)
     return g["bots"] if g else DEFAULT_GRANTS
+
+
+def merge_approved(base, approved):
+    """Merge approved card requests into the base grants. Returns (grants, status).
+
+    One token per bot per account means one {repos, permissions} pair, so a
+    request is applied only when it cannot widen anything:
+      - no entry for that bot/account: add one (named repos, read or write);
+      - an entry with a repo LIST: add the repos; write wins only when the
+        entry is already write (a read list + a write request is a conflict,
+        because the write would also cover the listed read repos);
+      - an entry for ALL repos: applied only if it already gives this access;
+        otherwise a conflict (merging would widen it to write on every repo).
+    A conflict is reported to the autoreviewer bot and changes nothing.
+    """
+    out = json.loads(json.dumps(base))
+    status = {}
+    for r in approved:
+        if r.get("status") != "approved":
+            continue
+        bot, account, repos, access = r.get("bot"), r.get("account"), list(r.get("repos") or []), r.get("access")
+        if not (bot and account and repos and access in ("read", "write")):
+            status[r.get("id", "?")] = "conflict: malformed request"
+            continue
+        perms = WRITE if access == "write" else READ_ONLY
+        entry = out.setdefault(bot, {}).get(account)
+        if entry is None:
+            out[bot][account] = {"repos": sorted(repos), "permissions": dict(perms)}
+            status[r["id"]] = "applied"
+            continue
+        is_write = (entry.get("permissions") or READ_ONLY).get("contents") == "write"
+        if entry.get("repos") == "*":
+            if is_write or access == "read":
+                status[r["id"]] = "applied (already covered by an all-repos grant)"
+            else:
+                status[r["id"]] = f"conflict: {bot} has READ on all {account} repos; a Mac edit of grants.json is needed"
+            continue
+        if access == "write" and not is_write:
+            status[r["id"]] = f"conflict: {bot} has a READ list on {account}; a Mac edit of grants.json is needed"
+            continue
+        entry["repos"] = sorted(set(entry.get("repos") or []) | set(repos))
+        status[r["id"]] = "applied"
+    return out, status
+
+
+def grants():
+    base = base_grants()
+    approved = (load_json(GH_APPROVED_FILE, {}) or {}).get("requests", [])
+    merged, status = merge_approved(base, approved)
+    if approved and os.path.isdir(GH_REQUESTS_DIR):
+        tmp = GH_STATUS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(status, f, indent=2)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, GH_STATUS_FILE)
+    return merged
 
 
 def installation_for(account, app):

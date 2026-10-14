@@ -13,6 +13,9 @@
 import {
   CALLBACK,
   decidedCardText,
+  ghCardText,
+  ghDecidedText,
+  ghKeyboard,
   grantCardText,
   grantKeyboard,
   grantSummaryLine,
@@ -52,10 +55,11 @@ export class AutoreviewerBot {
    * @param {(row: object) => void} [o.log]
    * @param {() => number} [o.now]
    */
-  constructor({ telegram, ledger, ownerId, chatId, ttlButtons = [1, 4, 24], log = () => {}, now = Date.now }) {
+  constructor({ telegram, ledger, ghStore = null, ownerId, chatId, ttlButtons = [1, 4, 24], log = () => {}, now = Date.now }) {
     if (!Number.isSafeInteger(ownerId) || !Number.isSafeInteger(chatId)) throw new Error("ownerId and chatId must be integers");
     this.telegram = telegram;
     this.ledger = ledger;
+    this.ghStore = ghStore;
     this.ownerId = ownerId;
     this.chatId = chatId;
     this.ttlButtons = ttlButtons;
@@ -89,6 +93,22 @@ export class AutoreviewerBot {
     }
   }
 
+  async sendGhCard(request) {
+    const msg = await this.telegram.sendMessage(this.chatId, ghCardText(request), ghKeyboard(request));
+    this.ghStore.setCard(request.id, { chat_id: this.chatId, message_id: msg.message_id });
+    return msg;
+  }
+
+  async refreshGhCard(request) {
+    if (!request.card) return;
+    try {
+      const minter = this.ghStore.minterStatus()[request.id];
+      await this.telegram.editMessageText(request.card.chat_id, request.card.message_id, ghDecidedText(request, minter));
+    } catch (err) {
+      this.log({ event: "card_edit_failed", id: request.id, error: String(err.message ?? err) });
+    }
+  }
+
   /** After a sweep: close the cards of lapsed proposals and expired grants. */
   async onSwept(changed) {
     for (const g of changed) await this.refreshCard(g);
@@ -112,6 +132,7 @@ export class AutoreviewerBot {
       await this.telegram.answerCallbackQuery(cq.id, "Unknown button.");
       return;
     }
+    if (parsed.kind === "gh-decide" || parsed.kind === "gh-revoke") return this.handleGhCallback(cq, parsed);
     const grant = this.ledger.get(parsed.id);
     if (!grant) {
       await this.telegram.answerCallbackQuery(cq.id, `No grant ${parsed.id}.`);
@@ -138,6 +159,31 @@ export class AutoreviewerBot {
     } catch (err) {
       await this.telegram.answerCallbackQuery(cq.id, String(err.message ?? err).slice(0, 190));
       if (parsed.kind === "decide") await this.refreshCard(grant);
+    }
+  }
+
+  async handleGhCallback(cq, parsed) {
+    const r = this.ghStore?.get(parsed.id);
+    if (!r) {
+      await this.telegram.answerCallbackQuery(cq.id, `No request ${parsed.id}.`);
+      return;
+    }
+    try {
+      if (parsed.kind === "gh-decide") {
+        // Same rule as grants: a press decides only on that request's own card.
+        if (!r.card || r.card.message_id !== cq.message.message_id) {
+          await this.telegram.answerCallbackQuery(cq.id, "This button is not on the card for that request.");
+          return;
+        }
+        this.ghStore.decide(parsed.id, parsed.approve, `telegram:${cq.from.id}`);
+      } else {
+        this.ghStore.revoke(parsed.id, `telegram:${cq.from.id}`);
+      }
+      this.log({ event: `github_${r.status}`, id: r.id, bot: r.bot, account: r.account, repos: r.repos, access: r.access });
+      await this.refreshGhCard(r);
+      await this.telegram.answerCallbackQuery(cq.id, `${r.id} ${r.status}.`);
+    } catch (err) {
+      await this.telegram.answerCallbackQuery(cq.id, String(err.message ?? err).slice(0, 190));
     }
   }
 
@@ -219,6 +265,37 @@ export class AutoreviewerBot {
         this.log({ event: "revoked", id: g.id });
         await this.refreshCard(g);
         return `${g.id} revoked.`;
+      },
+    });
+    this.commands.register({
+      name: "ghgrants",
+      description: "GitHub access requests: open and approved, with Revoke buttons",
+      run: async () => {
+        if (!this.ghStore) return "GitHub requests are not configured.";
+        const live = this.ghStore.list(["proposed", "approved"]);
+        if (live.length === 0) return "No open or approved GitHub requests.";
+        const minter = this.ghStore.minterStatus();
+        for (const r of live) {
+          await this.telegram.sendMessage(
+            this.chatId,
+            `${r.id} [${r.status}] ${r.bot} ${r.access} on ${r.account}: ${r.repos.join(", ")}\n  minter: ${minter[r.id] ?? "not applied yet"}`,
+            { inline_keyboard: [[{ text: `Revoke ${r.id}`, callback_data: CALLBACK.ghRevoke(r.id) }]] },
+          );
+        }
+        return undefined;
+      },
+    });
+    this.commands.register({
+      name: "ghrevoke",
+      description: "Revoke a GitHub request: /ghrevoke GH-0001",
+      run: async (args) => {
+        if (!this.ghStore) return "GitHub requests are not configured.";
+        const id = args.split(/\s+/)[0];
+        if (!/^GH-\d{4,}$/.test(id ?? "")) return "Usage: /ghrevoke GH-0001";
+        const r = this.ghStore.revoke(id, `telegram:${this.ownerId}`);
+        this.log({ event: "github_revoked", id: r.id });
+        await this.refreshGhCard(r);
+        return `${r.id} revoked. The minter drops it on its next run.`;
       },
     });
     this.commands.register({
