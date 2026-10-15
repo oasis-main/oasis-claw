@@ -341,12 +341,12 @@ def probe(provider):
     elif provider == "hetzner":
         # Counts only: names and IPs stay out of the output.
         r = dexec(["sh", "-c", "command -v hcloud >/dev/null || { echo 'hcloud not staged (claw-infra-tools stage)'; exit 3; }; "
-                   "printf 'servers %s, volumes %s' \"$(hcloud server list -o noheader | wc -l | tr -d ' ')\" \"$(hcloud volume list -o noheader | wc -l | tr -d ' ')\""], timeout=60)
+                   "printf 'servers %s, volumes %s' \"$(hcloud server list -o noheader | grep -c . )\" \"$(hcloud volume list -o noheader | grep -c . )\""], timeout=60)
         print(f"  hetzner: {r.stdout.strip() if r.returncode == 0 else 'FAILED ' + (r.stdout.strip() or tail(r))}")
         if "HCLOUD_TOKEN_GENERATION" in env_values():
             r = dexec(["sh", "-c", "command -v hcloud >/dev/null || exit 3; "
-                       "printf 'servers %s, firewalls %s' \"$(HCLOUD_TOKEN=\"$HCLOUD_TOKEN_GENERATION\" hcloud server list -o noheader | wc -l | tr -d ' ')\" "
-                       "\"$(HCLOUD_TOKEN=\"$HCLOUD_TOKEN_GENERATION\" hcloud firewall list -o noheader | wc -l | tr -d ' ')\""], timeout=60)
+                       "printf 'servers %s, firewalls %s' \"$(HCLOUD_TOKEN=\"$HCLOUD_TOKEN_GENERATION\" hcloud server list -o noheader | grep -c . )\" "
+                       "\"$(HCLOUD_TOKEN=\"$HCLOUD_TOKEN_GENERATION\" hcloud firewall list -o noheader | grep -c . )\""], timeout=60)
             print(f"  hetzner (oasis-generation project): {r.stdout.strip() if r.returncode == 0 else 'FAILED ' + (r.stdout.strip() or tail(r))}")
     elif provider == "workspace":
         # Account emails and services only; no mail, no user data.
