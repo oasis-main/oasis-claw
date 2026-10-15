@@ -22,6 +22,7 @@ import {
   outcomeLine,
   parseCallback,
 } from "./cards.mjs";
+import { githubNotices, grantNotices } from "./mailer.mjs";
 
 export class CommandRegistry {
   constructor() {
@@ -55,11 +56,12 @@ export class AutoreviewerBot {
    * @param {(row: object) => void} [o.log]
    * @param {() => number} [o.now]
    */
-  constructor({ telegram, ledger, ghStore = null, ownerId, chatId, ttlButtons = [1, 4, 24], log = () => {}, now = Date.now }) {
+  constructor({ telegram, ledger, ghStore = null, mailer = null, ownerId, chatId, ttlButtons = [1, 4, 24], log = () => {}, now = Date.now }) {
     if (!Number.isSafeInteger(ownerId) || !Number.isSafeInteger(chatId)) throw new Error("ownerId and chatId must be integers");
     this.telegram = telegram;
     this.ledger = ledger;
     this.ghStore = ghStore;
+    this.mailer = mailer;
     this.ownerId = ownerId;
     this.chatId = chatId;
     this.ttlButtons = ttlButtons;
@@ -109,9 +111,23 @@ export class AutoreviewerBot {
     }
   }
 
+  /** CLAW-123: mail the bots a decision concerns (requester, grantees). */
+  notifyGrant(g) {
+    if (!this.mailer) return;
+    for (const n of grantNotices(g)) this.mailer.send({ ...n, thread: `grant-${g.id}` });
+  }
+
+  notifyGithub(r) {
+    if (!this.mailer) return;
+    for (const n of githubNotices(r)) this.mailer.send({ ...n, thread: `grant-${r.id}` });
+  }
+
   /** After a sweep: close the cards of lapsed proposals and expired grants. */
   async onSwept(changed) {
-    for (const g of changed) await this.refreshCard(g);
+    for (const g of changed) {
+      await this.refreshCard(g);
+      if (g.status === "lapsed") this.notifyGrant(g);
+    }
   }
 
   // ── updates ──
@@ -149,11 +165,13 @@ export class AutoreviewerBot {
         const g = this.ledger.decide(parsed.id, parsed.ttlHours, `telegram:${cq.from.id}`);
         this.log({ event: g.status, id: g.id, ttl_hours: parsed.ttlHours });
         await this.refreshCard(g);
+        this.notifyGrant(g);
         await this.telegram.answerCallbackQuery(cq.id, outcomeLine(g));
       } else {
         const g = this.ledger.revoke(parsed.id, "revoked from Telegram", `telegram:${cq.from.id}`);
         this.log({ event: "revoked", id: g.id });
         await this.refreshCard(g);
+        this.notifyGrant(g);
         await this.telegram.answerCallbackQuery(cq.id, `${g.id} revoked.`);
       }
     } catch (err) {
@@ -181,6 +199,7 @@ export class AutoreviewerBot {
       }
       this.log({ event: `github_${r.status}`, id: r.id, bot: r.bot, account: r.account, repos: r.repos, access: r.access });
       await this.refreshGhCard(r);
+      this.notifyGithub(r);
       await this.telegram.answerCallbackQuery(cq.id, `${r.id} ${r.status}.`);
     } catch (err) {
       await this.telegram.answerCallbackQuery(cq.id, String(err.message ?? err).slice(0, 190));
@@ -264,6 +283,7 @@ export class AutoreviewerBot {
         const g = this.ledger.revoke(id, rest.join(" "), `telegram:${this.ownerId}`);
         this.log({ event: "revoked", id: g.id });
         await this.refreshCard(g);
+        this.notifyGrant(g);
         return `${g.id} revoked.`;
       },
     });
@@ -295,6 +315,7 @@ export class AutoreviewerBot {
         const r = this.ghStore.revoke(id, `telegram:${this.ownerId}`);
         this.log({ event: "github_revoked", id: r.id });
         await this.refreshGhCard(r);
+        this.notifyGithub(r);
         return `${r.id} revoked. The minter drops it on its next run.`;
       },
     });

@@ -58,6 +58,9 @@ services:
       AUTOREVIEWER_SNAPSHOT: /run/fleet-snapshot/snapshot.json
       # CLAW-122: writable state (the /watch list). Only this container mounts it.
       AUTOREVIEWER_STATE_DIR: /var/lib/autoreviewer
+      # CLAW-123: grant notices by fleet mail. This container mounts ONLY its own
+      # outbox; the host relay stamps from=autoreviewer and checks the routes.
+      AUTOREVIEWER_MAIL_OUTBOX: /mail/outbox
       HTTPS_PROXY: "http://oasis-egress-proxy:3128"
     volumes:
       - type: bind
@@ -76,6 +79,9 @@ services:
       - type: bind
         source: ${HOME}/Library/Application Support/oasis-x/github-grants
         target: /approvals/github-grants
+      - type: bind
+        source: ${AUTOREVIEWER_MAIL_DIR:-../../../.claw-mail/autoreviewer}/outbox
+        target: /mail/outbox
       - type: bind
         source: ${HOME}/Library/Application Support/oasis-x/autoreviewer-state
         target: /var/lib/autoreviewer

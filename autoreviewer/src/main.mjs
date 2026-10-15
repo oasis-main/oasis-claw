@@ -13,6 +13,7 @@
 //   AUTOREVIEWER_GH_DIR               GitHub access requests folder (CLAW-121; unset = feature off)
 //   AUTOREVIEWER_GH_ACCOUNTS          GitHub accounts with a minter App, comma list
 //   AUTOREVIEWER_GH_REQUESTERS        bots that may request GitHub access, comma list
+//   AUTOREVIEWER_MAIL_OUTBOX          this bot's mail outbox (sender "autoreviewer"); unset = no grant notices
 //   AUTOREVIEWER_STATE_DIR            writable state (watches.json); default /var/lib/autoreviewer
 //   AUTOREVIEWER_SNAPSHOT             fleet snapshot (scripts/claw-fleet-snapshot.mjs), read-only
 //   HTTPS_PROXY                       the fleet egress proxy, the only route to api.telegram.org
@@ -22,6 +23,7 @@ import { AutoreviewerBot } from "./bot.mjs";
 import { createApi } from "./api.mjs";
 import { ClientMap } from "./clientmap.mjs";
 import { GithubGrantStore } from "./ghgrants.mjs";
+import { Mailer } from "./mailer.mjs";
 import { registerMonitorCommands } from "./monitor.mjs";
 import { registerWatchCommands, Watcher } from "./watch.mjs";
 import { GrantLedger } from "./ledger.mjs";
@@ -69,7 +71,9 @@ const ghStore = env.AUTOREVIEWER_GH_DIR && list(env.AUTOREVIEWER_GH_ACCOUNTS).le
       requesters: list(env.AUTOREVIEWER_GH_REQUESTERS),
     })
   : null;
-const bot = new AutoreviewerBot({ telegram, ledger, ghStore, ownerId, chatId, ttlButtons, log });
+// CLAW-123: grant notices by fleet mail (unset outbox = off).
+const mailer = new Mailer({ outbox: env.AUTOREVIEWER_MAIL_OUTBOX || null, log });
+const bot = new AutoreviewerBot({ telegram, ledger, ghStore, mailer, ownerId, chatId, ttlButtons, log });
 ledger.onSweep = (changed) => bot.onSwept(changed);
 // CLAW-122: fleet monitoring commands over the Mac's sanitized snapshot.
 const snapshotPath = env.AUTOREVIEWER_SNAPSHOT || "/run/fleet-snapshot/snapshot.json";
