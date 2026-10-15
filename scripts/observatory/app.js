@@ -474,6 +474,7 @@ const VIEWS = [
   { id: "work", label: "Work", sub: "System 2" },
   { id: "live", label: "Live", sub: "System 1" },
   { id: "agents", label: "Agents", sub: "System 3" },
+  { id: "approvals", label: "Approvals", sub: "Cards · grants · ledger" },
   { id: "settings", label: "Settings", sub: "You · background" },
 ];
 
@@ -661,7 +662,112 @@ function renderView() {
   if (app.view === "work") renderWork();
   else if (app.view === "live") renderLive();
   else if (app.view === "settings") renderSettings();
+  else if (app.view === "approvals") renderApprovals();
   else renderAgents();
+}
+
+// ── Approvals (CLAW-122 slice 2) ──────────────────────────────────────────────
+// Read-only. Everything Mike approves, in one place: requests waiting for him,
+// live peer grants with the time left, GitHub access requests and what the
+// minter did with them, the infra ledger, and approval-card outcomes. Every
+// decision is made in the autoreviewer Telegram chat (one authenticated path).
+
+function until(v) {
+  const ms = toMs(v);
+  if (ms == null) return "—";
+  const m = Math.round((ms - Date.now()) / 60000);
+  if (m <= 0) return "now";
+  if (m < 90) return `in ${m} min`;
+  const hr = Math.round(m / 60);
+  return hr < 48 ? `in ${hr} h` : `in ${Math.round(hr / 24)} d`;
+}
+
+function apTable(headers, rows) {
+  return h("div", { class: "table-wrap" }, h("table", { class: "table" }, h("thead", null, h("tr", null, headers.map((t) => h("th", { text: t })))), h("tbody", null, rows)));
+}
+
+const apState = (st) => h("span", { class: `state s-${cls(st)}`, text: st });
+const botName = (key) => botLabel(botByKey(key)) || key;
+
+function grantLimits(g) {
+  const parts = [];
+  if (g.families) parts.push(`families: ${g.families.join(", ")}`);
+  if (g.path_prefixes) parts.push(`paths: ${g.path_prefixes.join(", ")}`);
+  if (g.max_actions) parts.push(`≤ ${g.max_actions} actions`);
+  return parts.join(" · ") || "topic and intent only";
+}
+
+function renderApprovals() {
+  const body = h("div", null, placeholder("Reading the approval ledgers…"));
+  const draw = async () => {
+    let d;
+    try {
+      d = await api("/api/approvals");
+    } catch (err) {
+      body.replaceChildren(errorBox(err));
+      return;
+    }
+    const chat = d.telegram ? `@${d.telegram}` : "the autoreviewer Telegram chat";
+    const waitingGrants = d.grants.filter((g) => g.status === "proposed");
+    const waitingGh = d.github.filter((r) => r.status === "proposed");
+    const waiting = [
+      ...waitingGrants.map((g) =>
+        h("tr", null, h("td", null, h("span", { class: "mono", text: g.id })), h("td", { text: "peer grant" }),
+          h("td", { text: `${botName(g.requester)} → ${g.grantees.map(botName).join(", ")}` }),
+          h("td", { class: "item-title", text: g.topic }), h("td", { text: `lapses ${until(g.proposal_expires)}` }))),
+      ...waitingGh.map((r) =>
+        h("tr", null, h("td", null, h("span", { class: "mono", text: r.id })), h("td", { text: "GitHub access" }),
+          h("td", { text: `${botName(r.requester)} for ${botName(r.bot)}` }),
+          h("td", { class: "item-title", text: `${r.access} on ${r.account}: ${r.repos.join(", ")}` }), h("td", { text: `asked ${ago(r.proposed_at)}` }))),
+    ];
+    const grants = d.grants.filter((g) => g.status !== "proposed").map((g) =>
+      h("tr", null,
+        h("td", null, h("span", { class: "mono", text: g.id })),
+        h("td", null, apState(g.status)),
+        h("td", { text: `${botName(g.requester)} → ${g.grantees.map(botName).join(", ")}` }),
+        h("td", null, h("div", { class: "mono small", text: g.thread })),
+        h("td", { class: "item-title" }, h("div", { text: g.topic }), h("div", { class: "muted small", text: g.intent }), h("div", { class: "muted small", text: grantLimits(g) })),
+        h("td", { text: g.status === "active" ? `ends ${until(g.expires)}` : g.expires ? `ended ${ago(g.expires)}` : "—" })));
+    const github = d.github.map((r) =>
+      h("tr", null,
+        h("td", null, h("span", { class: "mono", text: r.id })),
+        h("td", null, apState(r.status)),
+        h("td", { text: botName(r.bot) }),
+        h("td", { text: `${r.access} · ${r.account}: ${r.repos.join(", ")}` }),
+        h("td", { class: "item-title" }, h("div", { text: r.minter ?? (r.status === "approved" ? "minter has not run yet" : "—") }), h("div", { class: "muted small", text: r.reason })),
+        h("td", { text: ago(r.decided_at ?? r.proposed_at) })));
+    const infra = d.infra.map((e) =>
+      h("tr", null,
+        h("td", null, h("span", { class: "mono", text: e.id })),
+        h("td", null, apState(e.status)),
+        h("td", { class: "item-title" }, h("div", { text: e.title }), h("div", { class: "muted small", text: e.limits.join(" · ") })),
+        h("td", { text: e.requesters.map(botName).join(", ") || "—" }),
+        h("td", { text: e.expires ?? "—" })));
+    const cards = d.cards.map((c) => {
+      const outcomes = Object.entries(c.cards24h).map(([k, v]) => `${k} ${v}`).join(", ");
+      return h("tr", null,
+        h("td", { text: botName(c.bot) }),
+        h("td", { text: c.health_only ? "health only" : outcomes || "none" }),
+        h("td", { class: "item-title" }, c.escalations.length
+          ? c.escalations.map((x) => h("div", { class: "small", text: `${when(x.ts)} · ${x.tool} [${x.principle}] ${x.reason}` }))
+          : h("span", { class: "muted", text: "—" })));
+    });
+    body.replaceChildren(
+      section(`Waiting for you (${waiting.length})`, `Decide in ${chat}. This page only shows the state.`,
+        waiting.length ? apTable(["ID", "Kind", "Who", "What", "When"], waiting) : empty("Nothing is waiting for a decision.")),
+      section("Peer grants", "Mike's standing permission for one mail thread (at most 24 h). Revoke with /revoke in the chat.",
+        grants.length ? apTable(["ID", "State", "Requester → grantees", "Thread", "Topic, intent, limits", "Time"], grants) : empty("No peer grants in the last 24 h.")),
+      section("GitHub access requests", "Approved requests reach the bot within 30 min, when the Mac minter runs. Revoke with /ghrevoke in the chat.",
+        github.length ? apTable(["ID", "State", "Bot", "Access", "Minter result, reason", "When"], github) : empty("No GitHub access requests yet.")),
+      section("Infra ledger", "Entries the reviewer matches before the applier bot may apply an infrastructure change. Change them on the Mac with scripts/claw-approvals.",
+        apTable(["ID", "State", "Entry and limits", "For", "Until"], infra)),
+      section("Approval cards, last 24 h", `Card outcomes and the latest escalations per bot, from the fleet snapshot${d.snapshot_at ? ` (${ago(d.snapshot_at)})` : " (no snapshot yet)"}.`,
+        apTable(["Bot", "Outcomes", "Latest escalations"], cards)),
+    );
+  };
+  mainEl.append(body);
+  draw();
+  every(15_000, draw);
 }
 
 // ── System 2: work ────────────────────────────────────────────────────────────

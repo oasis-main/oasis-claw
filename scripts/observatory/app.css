@@ -663,3 +663,9 @@ body.swarm-solo .anim-panel > .fb-row { padding: 6px 8px; }
   .step { grid-template-columns: 1fr; gap: 2px; }
   .step-zoom, .step-out, .step-more, .step-note { margin-left: 8px; }
 }
+
+/* Approvals view (CLAW-122): grant and request states. */
+.state.s-active, .state.s-approved { color: var(--ok, #3fb950); }
+.state.s-proposed { color: var(--warn); }
+.state.s-revoked, .state.s-denied, .state.s-expired, .state.s-lapsed { color: var(--muted); text-decoration: line-through; }
+.table td .mono { white-space: nowrap; }

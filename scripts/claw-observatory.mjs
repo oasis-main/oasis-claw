@@ -2369,6 +2369,58 @@ async function routeControlUi(req, url, ctx) {
   return [405, { error: "method not allowed here" }];
 }
 
+// ── approvals panel (CLAW-122 slice 2) ────────────────────────────────────────
+// Read-only view of everything Mike approves: peer grants (autoreviewer bot),
+// GitHub access requests and the minter's result, the infra ledger, and the
+// approval-card outcomes in the fleet snapshot. Decisions stay in Telegram:
+// this page has no approve route, so there is one authenticated decision path.
+const OASIS_SUPPORT = path.join(HOME, "Library", "Application Support", "oasis-x");
+
+function readJsonQuiet(file, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+export function readApprovals(support = OASIS_SUPPORT, now = Date.now()) {
+  const DAY = 86_400_000;
+  const recent = (iso) => iso && now - Date.parse(iso) <= DAY;
+  const grants = (readJsonQuiet(path.join(support, "approvals", "peer-grants", "peer-grants.json"), {}).grants ?? [])
+    .filter((g) => g.status === "proposed" || g.status === "active" || recent(g.approved_at) || recent(g.proposed_at))
+    .map((g) => ({
+      id: g.id, status: g.status, requester: g.requester, grantees: g.grantees ?? [], thread: g.thread_id,
+      topic: g.topic, intent: g.intent, families: g.families, path_prefixes: g.path_prefixes, max_actions: g.max_actions,
+      proposed_at: g.proposed_at, proposal_expires: g.proposal_expires, approved_at: g.approved_at, expires: g.expires,
+    }));
+  const ghStatus = readJsonQuiet(path.join(support, "github-grants", "status.json"), {});
+  const github = (readJsonQuiet(path.join(support, "github-grants", "approved.json"), {}).requests ?? []).map((r) => ({
+    id: r.id, status: r.status, requester: r.requester, bot: r.bot, account: r.account, repos: r.repos ?? [], access: r.access,
+    reason: r.reason, proposed_at: r.proposed_at, decided_at: r.decided_at, minter: ghStatus[r.id] ?? null,
+  }));
+  const infra = (readJsonQuiet(path.join(support, "approvals", "infra-ledger.json"), {}).entries ?? []).map((e) => ({
+    id: e.id, status: e.status, title: e.title, requesters: e.requesters ?? [], dirs: e.dir_prefixes ?? [],
+    patterns: e.command_patterns ?? [], limits: e.limits ?? [], expires: e.expires ?? null, approved_at: e.approved_at ?? null,
+  }));
+  const snap = readJsonQuiet(path.join(support, "fleet-snapshot", "snapshot.json"), null);
+  const cards = snap
+    ? Object.entries(snap.bots ?? {}).map(([bot, b]) => ({
+        bot,
+        health_only: !!b.health_only,
+        cards24h: b.reviewer?.cards24h ?? {},
+        escalations: (b.reviewer?.recent ?? []).filter((x) => x.verdict === "escalate").slice(0, 5),
+      }))
+    : [];
+  let telegram = null;
+  try {
+    telegram = fs.readFileSync(path.join(support, "autoreviewer", "telegram-username"), "utf8").trim().replace(/^@/, "") || null;
+  } catch {
+    telegram = null;
+  }
+  return { generated_at: new Date(now).toISOString(), snapshot_at: snap?.generated_at ?? null, telegram, grants, github, infra, cards };
+}
+
 async function routeApi(url, ctx) {
   const parts = url.pathname.split("/").filter(Boolean);
   const fleet = () => cached(ctx, "fleet", 4000, ctx.discover);
@@ -2392,6 +2444,10 @@ async function routeApi(url, ctx) {
         snapshot: { dir: ctx.snapshotDir, last: snapshot },
       },
     ];
+  }
+
+  if (parts.length === 2 && parts[1] === "approvals") {
+    return [200, await cached(ctx, "approvals", 5000, async () => readApprovals())];
   }
 
   if (parts.length === 2 && parts[1] === "colony") {
