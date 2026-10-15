@@ -56,6 +56,8 @@ services:
       AUTOREVIEWER_GH_REQUESTERS: "${AUTOREVIEWER_GH_REQUESTERS:-}"
       # CLAW-122: sanitized fleet snapshot (scripts/claw-fleet-snapshot.mjs), read-only.
       AUTOREVIEWER_SNAPSHOT: /run/fleet-snapshot/snapshot.json
+      # CLAW-122: writable state (the /watch list). Only this container mounts it.
+      AUTOREVIEWER_STATE_DIR: /var/lib/autoreviewer
       HTTPS_PROXY: "http://oasis-egress-proxy:3128"
     volumes:
       - type: bind
@@ -74,6 +76,9 @@ services:
       - type: bind
         source: ${HOME}/Library/Application Support/oasis-x/github-grants
         target: /approvals/github-grants
+      - type: bind
+        source: ${HOME}/Library/Application Support/oasis-x/autoreviewer-state
+        target: /var/lib/autoreviewer
       - type: bind
         source: ${HOME}/Library/Application Support/oasis-x/fleet-snapshot
         target: /run/fleet-snapshot

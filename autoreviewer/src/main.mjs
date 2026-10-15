@@ -13,6 +13,7 @@
 //   AUTOREVIEWER_GH_DIR               GitHub access requests folder (CLAW-121; unset = feature off)
 //   AUTOREVIEWER_GH_ACCOUNTS          GitHub accounts with a minter App, comma list
 //   AUTOREVIEWER_GH_REQUESTERS        bots that may request GitHub access, comma list
+//   AUTOREVIEWER_STATE_DIR            writable state (watches.json); default /var/lib/autoreviewer
 //   AUTOREVIEWER_SNAPSHOT             fleet snapshot (scripts/claw-fleet-snapshot.mjs), read-only
 //   HTTPS_PROXY                       the fleet egress proxy, the only route to api.telegram.org
 
@@ -22,6 +23,7 @@ import { createApi } from "./api.mjs";
 import { ClientMap } from "./clientmap.mjs";
 import { GithubGrantStore } from "./ghgrants.mjs";
 import { registerMonitorCommands } from "./monitor.mjs";
+import { registerWatchCommands, Watcher } from "./watch.mjs";
 import { GrantLedger } from "./ledger.mjs";
 import { TelegramClient } from "./telegram.mjs";
 
@@ -70,7 +72,18 @@ const ghStore = env.AUTOREVIEWER_GH_DIR && list(env.AUTOREVIEWER_GH_ACCOUNTS).le
 const bot = new AutoreviewerBot({ telegram, ledger, ghStore, ownerId, chatId, ttlButtons, log });
 ledger.onSweep = (changed) => bot.onSwept(changed);
 // CLAW-122: fleet monitoring commands over the Mac's sanitized snapshot.
-registerMonitorCommands(bot.commands, env.AUTOREVIEWER_SNAPSHOT || "/run/fleet-snapshot/snapshot.json");
+const snapshotPath = env.AUTOREVIEWER_SNAPSHOT || "/run/fleet-snapshot/snapshot.json";
+registerMonitorCommands(bot.commands, snapshotPath);
+// CLAW-122 slice 3: /watch alerts, checked every minute against the snapshot.
+const watcher = new Watcher({
+  stateFile: `${env.AUTOREVIEWER_STATE_DIR || "/var/lib/autoreviewer"}/watches.json`,
+  snapshotPath,
+  notify: (text) => telegram.sendMessage(chatId, text),
+});
+registerWatchCommands(bot.commands, watcher, bots);
+setInterval(() => {
+  watcher.tick().catch((err) => log({ event: "watch_tick_failed", error: String(err.message ?? err) }));
+}, 60_000).unref();
 
 createApi({ ledger, clientMap, bot, ghStore, log }).listen(Number(port), host, () =>
   log({ event: "listening", host, port: Number(port), bots, ttlButtons }),
