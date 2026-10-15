@@ -1,4 +1,5 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { label, parseRouteArg, renderRouteStatus, resolveApiKey, routeRequest, type RouteTarget, type SelfRoute } from "./genroute.js";
 import { z } from "zod";
 
 const configSchema = z.object({
@@ -420,9 +421,40 @@ const plugin = {
       },
     });
 
+    // ── /genroute: local vs cloud oasis-generation for THIS bot (GEN-008) ──
+    apiAny.registerCommand({
+      name: "genroute",
+      description:
+        "Serve this bot's oasis-generation calls from the local (Mac) or cloud (Hetzner VM) gateway. Usage: /genroute local|cloud|status",
+      acceptsArgs: true,
+      requireAuth: true,
+      handler: async (ctx) => {
+        const want = parseRouteArg(ctx.args ?? "");
+        if (want === null) return { text: "⚠️ Usage: /genroute local | /genroute cloud | /genroute status" };
+        const cfgNow = runtime.config.current() as {
+          models?: { providers?: Record<string, { baseUrl?: string; apiKey?: unknown }> };
+        };
+        const prov = cfgNow.models?.providers?.["oasis-generation"];
+        const token = resolveApiKey(prov?.apiKey);
+        if (!prov?.baseUrl || !token) {
+          return { text: "⚠️ No oasis-generation provider (baseUrl + token) on this bot." };
+        }
+        if (want === "status") {
+          const res = await routeRequest(prov.baseUrl, token, "GET");
+          return { text: res.ok ? renderRouteStatus(res.body as unknown as SelfRoute) : `⚠️ ${res.error}` };
+        }
+        const res = await routeRequest(prov.baseUrl, token, "PUT", want);
+        if (!res.ok) return { text: `⚠️ ${res.error}` };
+        api.logger.info("model-switcher: /genroute", { from: res.body.from, to: res.body.to });
+        return {
+          text: `✅ oasis-generation route: ${label(res.body.from as RouteTarget)} → ${label(res.body.to as RouteTarget)}\nThe next model call uses it.`,
+        };
+      },
+    });
+
     api.logger.info("model-switcher plugin loaded", {
       tools: ["switch_model", "current_model", "list_model_tiers"],
-      commands: ["/setmodel"],
+      commands: ["/setmodel", "/genroute"],
       allowedProviders: allowedProviders ?? "(unrestricted)",
       tierProviders: Object.keys(TIER_CATALOG),
     });

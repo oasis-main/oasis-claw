@@ -1891,6 +1891,76 @@ async function routeSettings(req, url, ctx) {
   return [200, result];
 }
 
+// ── oasis-generation route switch (GEN-008) ─────────────────────────────────
+//
+// Each bot's model calls go to the Mac gateway. The gateway serves them itself
+// ("local") or forwards them to the Hetzner VM gateway ("remote"), per bot.
+// This page switches any bot through the gateway's admin API. The admin token
+// is a file only this host process reads; no bot holds it, and the browser
+// never sees it.
+
+const GEN_ADMIN_URL = process.env.OASIS_GENERATION_ADMIN_URL ?? "http://127.0.0.1:8800";
+const GEN_ADMIN_TOKEN_FILE =
+  process.env.OASIS_GENERATION_ADMIN_TOKEN_FILE ??
+  path.join(HOME, "Library", "Application Support", "oasis-x", "generation", "admin-token");
+const GENROUTE_PATH_RE = /^\/api\/genroute(?:\/([a-z0-9-]{1,40}))?$/;
+const GEN_TARGETS = new Set(["local", "remote"]);
+// Observatory bot key -> gateway client name, where they differ. The gateway
+// names a client by its service token entry (ADM-050), the observatory by the
+// container name.
+const GEN_CLIENT_OF = { helloworld: "hello-world" };
+export const genClientOf = (key) => GEN_CLIENT_OF[key] ?? key;
+const genKeyOf = (client) => Object.keys(GEN_CLIENT_OF).find((k) => GEN_CLIENT_OF[k] === client) ?? client;
+const isGenrouteWrite = (method, pathname) => method === "PUT" && /^\/api\/genroute\/[a-z0-9-]{1,40}$/.test(pathname);
+
+/** Call the gateway admin API. Returns [status, json]; never exposes the token. */
+export async function genAdmin(method, apiPath, body, { url = GEN_ADMIN_URL, tokenFile = GEN_ADMIN_TOKEN_FILE, fetchImpl = fetch } = {}) {
+  let token;
+  try {
+    token = fs.readFileSync(tokenFile, "utf8").trim();
+  } catch {
+    return [503, { error: "no gateway admin token file on this Mac" }];
+  }
+  if (!token) return [503, { error: "the gateway admin token file is empty" }];
+  try {
+    const res = await fetchImpl(`${url}${apiPath}`, {
+      method,
+      headers: { authorization: `Bearer ${token}`, ...(body ? { "content-type": "application/json" } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(5000),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) return [res.status, { error: typeof json.detail === "string" ? json.detail : `gateway HTTP ${res.status}` }];
+    return [200, json];
+  } catch (err) {
+    return [502, { error: `oasis-generation gateway unreachable: ${err.name}` }];
+  }
+}
+
+/** /api/genroute          GET  every client's route + whether a remote exists
+ *  /api/genroute/<bot>    PUT  { target: "local" | "remote" } */
+async function routeGenroute(req, url, ctx) {
+  const [, key] = GENROUTE_PATH_RE.exec(url.pathname) ?? [];
+  if (!key) {
+    if (req.method !== "GET") return [405, { error: "method not allowed here" }];
+    const [status, body] = await ctx.genAdmin("GET", "/admin/routing");
+    if (status === 200 && body?.clients) {
+      body.clients = Object.fromEntries(Object.entries(body.clients).map(([c, t]) => [genKeyOf(c), t]));
+    }
+    return [status, body];
+  }
+  if (req.method !== "PUT") return [405, { error: "method not allowed here" }];
+  let body;
+  try {
+    body = JSON.parse((await readBody(req, 1024)).toString("utf8"));
+  } catch (err) {
+    if (err.status) throw err;
+    return [400, { error: "the body is not valid JSON" }];
+  }
+  if (!GEN_TARGETS.has(body?.target)) return [400, { error: "target must be local or remote" }];
+  return ctx.genAdmin("PUT", `/admin/routing/${encodeURIComponent(genClientOf(key))}`, { target: body.target });
+}
+
 // ── observatory HTTP server ──────────────────────────────────────────────────
 
 const SECURITY_HEADERS = {
@@ -1922,7 +1992,7 @@ export function checkRequest(req, port) {
     return null;
   }
   const pathname = String(req.url ?? "").split("?")[0];
-  if (!WRITE_METHODS.has(req.method) || !(isFeedbackPath(pathname) || isControlUiWrite(pathname) || isSettingsWrite(req.method, pathname))) {
+  if (!WRITE_METHODS.has(req.method) || !(isFeedbackPath(pathname) || isControlUiWrite(pathname) || isSettingsWrite(req.method, pathname) || isGenrouteWrite(req.method, pathname))) {
     return { status: 405, error: "read-only" };
   }
   // A browser always sends Origin with a POST, PUT or DELETE fetch. A write
@@ -2551,6 +2621,7 @@ export function createObservatoryServer(ctx) {
   ctx.writeUserMd ??= (bot, baseHash, text) =>
     collect(bot.container, collectUserMd, ["write", baseHash, Buffer.from(text, "utf8").toString("base64")]);
   ctx.keepUserMdHistory ??= (key, text) => keepUserMdHistory(USER_MD_HISTORY_DIR, key, text);
+  ctx.genAdmin ??= (method, apiPath, body) => genAdmin(method, apiPath, body);
   return http.createServer((req, res) => {
     const refused = checkRequest(req, ctx.port);
     if (refused) {
@@ -2621,6 +2692,13 @@ export function createObservatoryServer(ctx) {
           if (err.status === 413) res.once("finish", () => req.destroy());
           sendJson(res, err.status ?? 502, { error: err.message });
         },
+      );
+      return;
+    }
+    if (GENROUTE_PATH_RE.test(url.pathname)) {
+      routeGenroute(req, url, ctx).then(
+        ([status, body]) => sendJson(res, status, body),
+        (err) => sendJson(res, err.status ?? 502, { error: err.message }),
       );
       return;
     }

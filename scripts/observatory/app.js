@@ -231,6 +231,63 @@ function refreshIcons() {
   }
 }
 
+// ── model gateway switch (GEN-008) ───────────────────────────────────────────
+// Where one agent's model calls are served: the Mac gateway ("local") or the
+// Hetzner VM gateway ("remote"). The observatory server holds the gateway admin
+// token; this page only names the agent and the target.
+
+const genRoute = { data: null, at: 0, loading: null };
+
+function readGenRoute(force) {
+  if (!force && genRoute.data && Date.now() - genRoute.at < 15_000) return Promise.resolve(genRoute.data);
+  genRoute.loading ??= api("/api/genroute")
+    .then((d) => {
+      genRoute.data = d;
+      genRoute.at = Date.now();
+      return d;
+    })
+    .finally(() => (genRoute.loading = null));
+  return genRoute.loading;
+}
+
+function genRouteControl(bot) {
+  const box = h("div", { class: "pill-bar genroute", role: "group", "aria-label": `Model gateway for ${botLabel(bot)}` });
+  const label = () => h("span", { class: "muted small", text: "Models:" });
+  const draw = (d, err) => {
+    const cur = d?.clients?.[bot.key];
+    if (err || cur === undefined) {
+      box.replaceChildren(label(), h("span", { class: "muted small", text: err ? err.message : "no gateway client for this agent" }));
+      return;
+    }
+    const pill = (target, text) => {
+      const off = target === "remote" && !d.remote_configured;
+      return h("button", {
+        type: "button",
+        class: `pill small${cur === target ? " active" : ""}`,
+        "aria-pressed": String(cur === target),
+        disabled: off,
+        title: off ? "No cloud gateway is configured yet" : target === "remote" ? "Serve from the Hetzner VM gateway" : "Serve from the Mac gateway",
+        text,
+        onclick: async () => {
+          if (cur === target) return;
+          box.classList.add("busy");
+          try {
+            await api(`/api/genroute/${encodeURIComponent(bot.key)}`, { method: "PUT", type: "application/json", body: JSON.stringify({ target }) });
+            draw(await readGenRoute(true));
+          } catch (e) {
+            draw(d, e);
+          } finally {
+            box.classList.remove("busy");
+          }
+        },
+      });
+    };
+    box.replaceChildren(label(), pill("local", "Local"), pill("remote", "Cloud"));
+  };
+  readGenRoute(false).then((d) => draw(d), (e) => draw(null, e));
+  return box;
+}
+
 function controlUiLink(bot, text = "Control UI ↗") {
   if (!openUrlFor(bot?.key)) {
     return h("span", { class: "muted small", title: "No reachable Control UI", text: `Control UI: ${bot?.controlUi?.via ?? "unknown"}` });
@@ -1894,6 +1951,7 @@ function renderAgents() {
           app.agents.q = v;
           drawBody();
         }),
+        genRouteControl(bot),
         controlUiLink(bot),
       ),
       tabs,
