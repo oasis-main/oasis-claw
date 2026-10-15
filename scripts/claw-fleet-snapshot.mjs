@@ -19,7 +19,7 @@
 // Usage: node scripts/claw-fleet-snapshot.mjs [--print]
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync, openSync, readSync, closeSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync, openSync, readSync, closeSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -112,14 +112,120 @@ function reviewerSummary(container) {
   }
 }
 
-function statusFile(bot) {
+// ── CLAW-124: open items, NEEDS FROM MIKE, morning runs, the brief ──────────
+// Day boundaries are New York days: the morning sessions and the 08:00 digest
+// run on New York time.
+export function nyDate(ms) {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(ms));
+}
+
+/** STATUS.md (PLAYBOOK section 3) -> fields. Unknown lines are ignored. */
+export function parseStatus(text) {
+  const out = { status: null, next: null, needs: [], blockers: null, open: [] };
+  let inOpen = false;
+  for (const raw of String(text ?? "").split("\n")) {
+    const line = raw.trim();
+    if (/^#+\s*OPEN\b/i.test(line)) { inOpen = true; continue; }
+    if (/^#+\s/.test(line)) { inOpen = false; continue; }
+    if (inOpen) {
+      const m = /^[-*]\s+(.+)$/.exec(line);
+      if (!m) continue;
+      const parts = m[1].split("|").map((x) => x.trim());
+      const field = (name) => parts.find((x) => x.toLowerCase().startsWith(`${name}:`))?.slice(name.length + 1).trim() || null;
+      const directive = field("directive");
+      out.open.push({ item: redact(parts[0], 120), next: field("next") ? redact(field("next"), 160) : null, directive: directive && /^DIR-\d+$/i.test(directive) ? directive.toUpperCase() : null });
+      continue;
+    }
+    const kv = /^(STATUS|NEXT|NEEDS FROM MIKE|BLOCKERS):\s*(.*)$/i.exec(line);
+    if (!kv) continue;
+    const key = kv[1].toUpperCase(), val = kv[2].trim();
+    if (key === "STATUS") out.status = redact(val, 200);
+    else if (key === "NEXT") out.next = redact(val, 200);
+    else if (key === "BLOCKERS") out.blockers = /^none\.?$/i.test(val) ? null : redact(val, 200);
+    else if (val && !/^none\.?$/i.test(val)) out.needs.push(redact(val, 200));
+  }
+  out.open = out.open.slice(0, 12);
+  out.needs = out.needs.slice(0, 8);
+  return out;
+}
+
+/**
+ * Stale = the same open item with the same next step on two or more New York days.
+ * history: { [bot]: { [item]: { first_seen, next, next_since } } } (mutated).
+ */
+export function markStale(bot, open, history, today) {
+  const prev = history[bot] ?? {};
+  const cur = {};
+  for (const o of open) {
+    const h = prev[o.item];
+    const nextSince = h && h.next === o.next ? h.next_since : today;
+    cur[o.item] = { first_seen: h?.first_seen ?? today, next: o.next, next_since: nextSince };
+    const days = Math.round((Date.parse(today) - Date.parse(nextSince)) / 86_400_000);
+    o.since = cur[o.item].first_seen;
+    o.stale = days >= 2;
+  }
+  history[bot] = cur;
+  return open;
+}
+
+function statusFile(bot, history, today) {
   const p = join(FLEET_BOARD, "status", bot, "STATUS.md");
   if (!existsSync(p)) return null;
   const st = statSync(p);
   const text = readFileSync(p, "utf8");
   // The template still in place means the bot has not written yet.
   const filled = /^STATUS:\s*\S/m.test(text) && !/^STATUS: <one line>/m.test(text);
-  return { updated_at: st.mtime.toISOString().slice(0, 19) + "Z", filled, text: filled ? redact(text.replace(/^#.*\n/, ""), 900) : null };
+  const parsed = filled ? parseStatus(text) : null;
+  if (parsed) markStale(bot, parsed.open, history, today);
+  return {
+    updated_at: st.mtime.toISOString().slice(0, 19) + "Z",
+    updated_today: nyDate(st.mtimeMs) === today,
+    filled,
+    text: filled ? redact(text.replace(/^#.*\n/, "").replace(/\n#+\s*OPEN[\s\S]*$/i, ""), 900) : null,
+    parsed,
+  };
+}
+
+// `openclaw cron list` costs about 4 s per bot, so the morning-job state is
+// refreshed at most every 10 minutes and cached beside the snapshot.
+const MORNING_CACHE_MS = 10 * 60 * 1000;
+function morningJobs(containers, cache) {
+  if (cache.at && Date.now() - cache.at < MORNING_CACHE_MS) return cache.bots;
+  const out = {};
+  for (const [container, bot] of Object.entries(containers)) {
+    if (HEALTH_ONLY.has(bot)) continue;
+    try {
+      const d = JSON.parse(docker(["exec", container, "openclaw", "cron", "list", "--json"], 30_000));
+      const jobs = (Array.isArray(d) ? d : d.jobs ?? []).filter((j) => String(j.declarationKey ?? "").startsWith("fleet-morning-"));
+      out[bot] = jobs.map((j) => ({
+        key: j.declarationKey,
+        enabled: !!j.enabled,
+        cron: j.schedule?.expr ?? null,
+        next_at: j.state?.nextRunAtMs ? new Date(j.state.nextRunAtMs).toISOString() : null,
+        last_at: j.state?.lastRunAtMs ? new Date(j.state.lastRunAtMs).toISOString() : null,
+        last_status: j.state?.lastStatus ?? null,
+        last_minutes: j.state?.lastDurationMs != null ? Math.round(j.state.lastDurationMs / 60000) : null,
+        errors: j.state?.consecutiveErrors ?? 0,
+      }));
+    } catch (err) {
+      out[bot] = { error: redact(err.message, 100) };
+    }
+  }
+  cache.at = Date.now();
+  cache.bots = out;
+  return out;
+}
+
+/** The newest BRIEF-<date>.md (the coordinator writes it at 07:45). Bot-written text: redacted, cut. */
+function latestBrief() {
+  let names = [];
+  try { names = readdirSync(FLEET_BOARD).filter((n) => /^BRIEF-\d{4}-\d{2}-\d{2}\.md$/.test(n)).sort(); } catch { return null; }
+  const name = names.at(-1);
+  if (!name) return null;
+  const p = join(FLEET_BOARD, name);
+  const raw = readFileSync(p, "utf8");
+  const text = String(raw).split("\n").map((l) => redact(l, 400)).join("\n").slice(0, 3000);
+  return { date: name.slice(6, 16), updated_at: statSync(p).mtime.toISOString().slice(0, 19) + "Z", text };
 }
 
 function mailSummary() {
@@ -155,22 +261,38 @@ function ledgers() {
   return { infra };
 }
 
-export function build() {
+export function build({ persist = true } = {}) {
   const containers = readJson(CONTAINERS, {});
+  const today = nyDate(Date.now());
+  const historyPath = join(OUT_DIR, "open-history.json");
+  const history = readJson(historyPath, {});
+  const cachePath = join(OUT_DIR, "morning-cache.json");
+  const cache = readJson(cachePath, {});
+  const morning = morningJobs(containers, cache);
   const bots = {};
   for (const [container, bot] of Object.entries(containers)) {
     const h = health(container);
     bots[bot] = HEALTH_ONLY.has(bot)
       ? { ...h, health_only: true }
-      : { ...h, reviewer: h.status === "running" ? reviewerSummary(container) : null, status_file: statusFile(bot) };
+      : {
+          ...h,
+          reviewer: h.status === "running" ? reviewerSummary(container) : null,
+          status_file: statusFile(bot, history, today),
+          morning: morning[bot] ?? [],
+        };
   }
-  return { generated_at: new Date().toISOString(), bots, mail: mailSummary(), ledgers: ledgers() };
+  if (persist) {
+    mkdirSync(OUT_DIR, { recursive: true });
+    writeFileSync(historyPath, JSON.stringify(history, null, 2) + "\n");
+    writeFileSync(cachePath, JSON.stringify(cache) + "\n");
+  }
+  return { generated_at: new Date().toISOString(), today, bots, brief: latestBrief(), mail: mailSummary(), ledgers: ledgers() };
 }
 
 // pathToFileURL, not `file://${argv[1]}`: the installed copy lives under
 // "Application Support", and the space is %20 in import.meta.url.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const snap = build();
+  const snap = build({ persist: !process.argv.includes("--print") });
   if (process.argv.includes("--print")) {
     process.stdout.write(JSON.stringify(snap, null, 2) + "\n");
   } else {

@@ -11,6 +11,8 @@
 //                                      [families], [path_prefixes], [max_actions]
 //   GET  /v1/grants[?status=active]
 //   GET  /v1/grants/<id>[?wait_ms=N]   long-poll while the grant is still proposed
+//   POST /v1/directives          body: bot, goal, [may], [must_not], [lane], [ttl_hours<=168]
+//                                (CLAW-124; a bot for itself, a coordinator for any bot)
 //   POST /v1/github-grants       body: bot, account, repos[], access ("read"|"write"), reason
 //   GET  /v1/github-grants/<id>[?wait_ms=N]   (CLAW-121; requesters are configured)
 
@@ -57,7 +59,7 @@ function readBody(req) {
  * @param {import("./bot.mjs").AutoreviewerBot} o.bot
  * @param {(row: object) => void} [o.log]
  */
-export function createApi({ ledger, clientMap, bot, ghStore = null, log = () => {} }) {
+export function createApi({ ledger, clientMap, bot, ghStore = null, coordinators = [], log = () => {} }) {
   return createServer(async (req, res) => {
     const send = (status, obj) => {
       res.writeHead(status, { "Content-Type": "application/json" });
@@ -94,6 +96,19 @@ export function createApi({ ledger, clientMap, bot, ghStore = null, log = () => 
         ledger.sweep();
         const status = url.searchParams.get("status");
         return send(200, { grants: ledger.list(status ? { statuses: [status] } : {}).map(publicGrant) });
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/directives") {
+        const body = await readBody(req);
+        const d = ledger.proposeDirective(caller, body, { coordinators });
+        log({ event: "directive_proposed", id: d.id, proposer: caller, bot: d.grantees[0] });
+        try {
+          await bot.sendDirectiveCard(d);
+        } catch (err) {
+          ledger.revoke(d.id, "the card could not be sent to Mike", "autoreviewer");
+          return send(502, { error: "the card could not be sent to Mike" });
+        }
+        return send(201, { directive: publicGrant(d) });
       }
 
       if (url.pathname.startsWith("/v1/github-grants")) {

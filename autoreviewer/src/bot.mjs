@@ -13,16 +13,21 @@
 import {
   CALLBACK,
   decidedCardText,
+  directiveCardText,
+  directiveDecidedText,
+  directiveKeyboard,
   ghCardText,
   ghDecidedText,
   ghKeyboard,
+  parseDirectiveCommand,
+  utc,
   grantCardText,
   grantKeyboard,
   grantSummaryLine,
   outcomeLine,
   parseCallback,
 } from "./cards.mjs";
-import { githubNotices, grantNotices } from "./mailer.mjs";
+import { directiveNotices, githubNotices, grantNotices } from "./mailer.mjs";
 
 export class CommandRegistry {
   constructor() {
@@ -56,12 +61,13 @@ export class AutoreviewerBot {
    * @param {(row: object) => void} [o.log]
    * @param {() => number} [o.now]
    */
-  constructor({ telegram, ledger, ghStore = null, mailer = null, ownerId, chatId, ttlButtons = [1, 4, 24], log = () => {}, now = Date.now }) {
+  constructor({ telegram, ledger, ghStore = null, mailer = null, coordinator = null, ownerId, chatId, ttlButtons = [1, 4, 24], log = () => {}, now = Date.now }) {
     if (!Number.isSafeInteger(ownerId) || !Number.isSafeInteger(chatId)) throw new Error("ownerId and chatId must be integers");
     this.telegram = telegram;
     this.ledger = ledger;
     this.ghStore = ghStore;
     this.mailer = mailer;
+    this.coordinator = coordinator;
     this.ownerId = ownerId;
     this.chatId = chatId;
     this.ttlButtons = ttlButtons;
@@ -71,6 +77,8 @@ export class AutoreviewerBot {
     this.lastPollOkAt = null;
     this.offset = 0;
     this.commands = new CommandRegistry();
+    // Buttons owned by optional features (e.g. the digest's "Watch" button).
+    this.callbackHandlers = new Map();
     this.registerBuiltins();
   }
 
@@ -89,7 +97,8 @@ export class AutoreviewerBot {
   async refreshCard(grant) {
     if (!grant.card) return;
     try {
-      await this.telegram.editMessageText(grant.card.chat_id, grant.card.message_id, decidedCardText(grant));
+      const text = grant.kind === "directive" ? directiveDecidedText(grant) : decidedCardText(grant);
+      await this.telegram.editMessageText(grant.card.chat_id, grant.card.message_id, text);
     } catch (err) {
       this.log({ event: "card_edit_failed", id: grant.id, error: String(err.message ?? err) });
     }
@@ -114,8 +123,59 @@ export class AutoreviewerBot {
   /** CLAW-123: mail the bots a decision concerns (requester, grantees). */
   notifyGrant(g) {
     if (!this.mailer) return;
-    for (const n of grantNotices(g)) this.mailer.send({ ...n, thread: `grant-${g.id}` });
+    const notices = g.kind === "directive" ? directiveNotices(g, this.coordinator) : grantNotices(g);
+    for (const n of notices) this.mailer.send({ ...n, thread: `grant-${g.id}` });
   }
+
+  // ── directives (CLAW-124) ──
+
+  async sendDirectiveCard(d) {
+    const msg = await this.telegram.sendMessage(this.chatId, directiveCardText(d), directiveKeyboard(d));
+    this.ledger.setCard(d.id, { chat_id: this.chatId, message_id: msg.message_id });
+    return msg;
+  }
+
+  /** One reminder card per directive, 24 h before it ends, with Renew. */
+  async remindDirectives() {
+    for (const d of this.ledger.dueReminders()) {
+      try {
+        await this.telegram.sendMessage(
+          this.chatId,
+          `Directive ${d.id} for ${d.grantees[0]} ends ${utc(d.expires)}.\nGoal: ${d.topic}`,
+          { inline_keyboard: [[{ text: "Renew 7 d", callback_data: CALLBACK.dirRenew(d.id) }, { text: `Revoke ${d.id}`, callback_data: CALLBACK.revoke(d.id) }]] },
+        );
+        this.ledger.markReminded(d.id);
+      } catch (err) {
+        this.log({ event: "reminder_failed", id: d.id, error: String(err.message ?? err) });
+      }
+    }
+  }
+
+  async handleDirectiveCallback(cq, parsed) {
+    const d = this.ledger.get(parsed.id);
+    if (!d || d.kind !== "directive") {
+      await this.telegram.answerCallbackQuery(cq.id, `No directive ${parsed.id}.`);
+      return;
+    }
+    try {
+      if (parsed.kind === "dir-decide") {
+        if (!d.card || d.card.message_id !== cq.message.message_id) {
+          await this.telegram.answerCallbackQuery(cq.id, "This button is not on the card for that directive.");
+          return;
+        }
+        this.ledger.decide(parsed.id, parsed.hours, `telegram:${cq.from.id}`);
+      } else {
+        this.ledger.renew(parsed.id, 168, `telegram:${cq.from.id}`);
+      }
+      this.log({ event: parsed.kind === "dir-renew" ? "directive_renewed" : `directive_${d.status}`, id: d.id, bot: d.grantees[0] });
+      await this.refreshCard(d);
+      if (parsed.kind === "dir-decide") this.notifyGrant(d);
+      await this.telegram.answerCallbackQuery(cq.id, d.status === "active" ? `${d.id} active until ${utc(d.expires)}` : `${d.id} ${d.status}`);
+    } catch (err) {
+      await this.telegram.answerCallbackQuery(cq.id, String(err.message ?? err).slice(0, 190));
+    }
+  }
+
 
   notifyGithub(r) {
     if (!this.mailer) return;
@@ -126,7 +186,7 @@ export class AutoreviewerBot {
   async onSwept(changed) {
     for (const g of changed) {
       await this.refreshCard(g);
-      if (g.status === "lapsed") this.notifyGrant(g);
+      if (g.status === "lapsed" || (g.kind === "directive" && g.status === "expired")) this.notifyGrant(g);
     }
   }
 
@@ -149,6 +209,20 @@ export class AutoreviewerBot {
       return;
     }
     if (parsed.kind === "gh-decide" || parsed.kind === "gh-revoke") return this.handleGhCallback(cq, parsed);
+    if (parsed.kind === "dir-decide" || parsed.kind === "dir-renew") return this.handleDirectiveCallback(cq, parsed);
+    const extra = this.callbackHandlers.get(parsed.kind);
+    if (extra) {
+      try {
+        await this.telegram.answerCallbackQuery(cq.id, String(await extra(parsed)).slice(0, 190));
+      } catch (err) {
+        await this.telegram.answerCallbackQuery(cq.id, String(err.message ?? err).slice(0, 190));
+      }
+      return;
+    }
+    if (!parsed.id) {
+      await this.telegram.answerCallbackQuery(cq.id, "This button is not active here.");
+      return;
+    }
     const grant = this.ledger.get(parsed.id);
     if (!grant) {
       await this.telegram.answerCallbackQuery(cq.id, `No grant ${parsed.id}.`);
@@ -264,7 +338,7 @@ export class AutoreviewerBot {
       description: "Active grants and open proposals, with Revoke buttons",
       run: async () => {
         this.ledger.sweep();
-        const live = this.ledger.list({ statuses: ["active", "proposed"] });
+        const live = this.ledger.list({ statuses: ["active", "proposed"] }).filter((g) => g.kind !== "directive");
         if (live.length === 0) return "No active grants and no open proposals.";
         for (const g of live) {
           await this.telegram.sendMessage(this.chatId, grantSummaryLine(g), {
@@ -279,7 +353,7 @@ export class AutoreviewerBot {
       description: "Revoke a grant: /revoke GRANT-0001 [reason]",
       run: async (args) => {
         const [id, ...rest] = args.split(/\s+/);
-        if (!/^GRANT-\d{4,}$/.test(id ?? "")) return "Usage: /revoke GRANT-0001 [reason]";
+        if (!/^(?:GRANT|DIR)-\d{4,}$/.test(id ?? "")) return "Usage: /revoke GRANT-0001 or DIR-0001 [reason]";
         const g = this.ledger.revoke(id, rest.join(" "), `telegram:${this.ownerId}`);
         this.log({ event: "revoked", id: g.id });
         await this.refreshCard(g);
@@ -317,6 +391,34 @@ export class AutoreviewerBot {
         await this.refreshGhCard(r);
         this.notifyGithub(r);
         return `${r.id} revoked. The minter drops it on its next run.`;
+      },
+    });
+    this.commands.register({
+      name: "directive",
+      description: "Set a standing directive (rolling 7 d): /directive <bot> <goal> | may: … | must not: … | lane: … | days: N",
+      run: async (args) => {
+        const parsed = parseDirectiveCommand(args);
+        if (!parsed) return "Usage: /directive <bot> <goal> | may: … | must not: … | lane: … | days: N (default 7)";
+        const d = this.ledger.proposeDirective("mike", parsed);
+        await this.sendDirectiveCard(d);
+        return undefined;
+      },
+    });
+    this.commands.register({
+      name: "directives",
+      description: "Standing directives with time left, Renew and Revoke buttons",
+      run: async () => {
+        this.ledger.sweep();
+        const live = this.ledger.list({ statuses: ["active", "proposed"] }).filter((g) => g.kind === "directive");
+        if (!live.length) return "No standing directives. /directive <bot> <goal> sets one.";
+        for (const d of live) {
+          await this.telegram.sendMessage(
+            this.chatId,
+            `${d.id} [${d.status}] ${d.grantees[0]}${d.lane ? ` (${d.lane})` : ""}${d.expires ? ` until ${utc(d.expires)}` : ""}\n  ${d.topic}`,
+            { inline_keyboard: [[...(d.status === "active" ? [{ text: "Renew 7 d", callback_data: CALLBACK.dirRenew(d.id) }] : []), { text: `Revoke ${d.id}`, callback_data: CALLBACK.revoke(d.id) }]] },
+          );
+        }
+        return undefined;
       },
     });
     this.commands.register({

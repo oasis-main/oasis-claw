@@ -11,17 +11,27 @@ export const CALLBACK = {
   ghApprove: (id) => `h:${id}:ok`,
   ghDeny: (id) => `h:${id}:no`,
   ghRevoke: (id) => `hr:${id}`,
+  dirApprove: (id, hours) => `d:${id}:${hours}`,
+  dirDeny: (id) => `d:${id}:no`,
+  dirRenew: (id) => `dr:${id}`,
+  watch: (bot) => `w:${bot}`,
 };
 
 export function parseCallback(data) {
   const m = /^g:(GRANT-\d{4,}):(\d{1,2}|deny)$/.exec(String(data ?? ""));
   if (m) return { kind: "decide", id: m[1], ttlHours: m[2] === "deny" ? null : Number(m[2]) };
-  const r = /^r:(GRANT-\d{4,})$/.exec(String(data ?? ""));
+  const d = /^d:(DIR-\d{4,}):(\d{1,3}|no)$/.exec(String(data ?? ""));
+  if (d) return { kind: "dir-decide", id: d[1], hours: d[2] === "no" ? null : Number(d[2]) };
+  const dr = /^dr:(DIR-\d{4,})$/.exec(String(data ?? ""));
+  if (dr) return { kind: "dir-renew", id: dr[1] };
+  const r = /^r:((?:GRANT|DIR)-\d{4,})$/.exec(String(data ?? ""));
   if (r) return { kind: "revoke", id: r[1] };
   const h = /^h:(GH-\d{4,}):(ok|no)$/.exec(String(data ?? ""));
   if (h) return { kind: "gh-decide", id: h[1], approve: h[2] === "ok" };
   const hr = /^hr:(GH-\d{4,})$/.exec(String(data ?? ""));
   if (hr) return { kind: "gh-revoke", id: hr[1] };
+  const w = /^w:([a-z][a-z0-9_-]{0,31})$/.exec(String(data ?? ""));
+  if (w) return { kind: "watch", bot: w[1] };
   return null;
 }
 
@@ -135,4 +145,59 @@ export function ghKeyboard(r) {
       { text: "Deny", callback_data: CALLBACK.ghDeny(r.id) },
     ]],
   };
+}
+
+// ── Directives (CLAW-124) ──
+
+export function directiveCardText(d) {
+  return [
+    `STANDING DIRECTIVE ${d.id} for ${d.grantees[0]}${d.lane ? ` (${d.lane})` : ""}`,
+    `Proposed by: ${d.requester === "mike" ? "you" : d.requester}`,
+    `Length asked: ${Math.round(d.requested_ttl_hours / 24 * 10) / 10} days (rolling)`,
+    "",
+    `Goal: ${d.topic}`,
+    `May: ${d.intent}`,
+    `Must not: ${d.must_not}`,
+    d.path_prefixes ? `Paths: ${d.path_prefixes.join(", ")}` : null,
+    "",
+    "Covers this bot's own work in any session. Never covers deletes, data out, infra, money or trades.",
+  ].filter((x) => x !== null).join("\n");
+}
+
+export function directiveDecidedText(d) {
+  const tail =
+    d.status === "active" ? `ACTIVE until ${utc(d.expires)}.` :
+    d.status === "denied" ? "DENIED." :
+    d.status === "revoked" ? "REVOKED." :
+    d.status === "expired" ? `ENDED ${utc(d.expires)}.` :
+    d.status === "lapsed" ? "LAPSED: no answer." : "";
+  return `${directiveCardText(d)}\n\n>> ${tail}`;
+}
+
+export function directiveKeyboard(d) {
+  return {
+    inline_keyboard: [
+      [
+        { text: "Approve 7 d", callback_data: CALLBACK.dirApprove(d.id, 168) },
+        { text: "Approve 3 d", callback_data: CALLBACK.dirApprove(d.id, 72) },
+      ],
+      [{ text: "Deny", callback_data: CALLBACK.dirDeny(d.id) }],
+    ],
+  };
+}
+
+/** Parse "/directive <bot> <goal> | may: … | must not: … | lane: …". */
+export function parseDirectiveCommand(args) {
+  const [head, ...parts] = String(args ?? "").split("|").map((x) => x.trim());
+  const m = /^(\S+)\s+([\s\S]+)$/.exec(head ?? "");
+  if (!m) return null;
+  const out = { bot: m[1].toLowerCase(), goal: m[2].trim() };
+  for (const p of parts) {
+    const kv = /^(may|must not|must_not|lane|days)\s*:\s*([\s\S]*)$/i.exec(p);
+    if (!kv) continue;
+    const key = kv[1].toLowerCase().replace(" ", "_");
+    if (key === "days") out.ttl_hours = Math.round(Number(kv[2]) * 24);
+    else out[key] = kv[2].trim();
+  }
+  return out;
 }

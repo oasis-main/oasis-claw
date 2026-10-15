@@ -22,6 +22,10 @@ import { join } from "node:path";
 
 export interface PeerGrant {
   id: string;
+  /** CLAW-124: "directive" = Mike's standing approval for one bot's lane, any session. */
+  kind?: "directive";
+  lane?: string | null;
+  must_not?: string;
   status: "proposed" | "active" | "denied" | "revoked" | "lapsed" | "expired";
   requester: string;
   grantees: string[];
@@ -77,6 +81,7 @@ export function verifyGrant(
   if (!GRANT_ID_RE.test(c.grantId)) return { ok: false, reason: "malformed grant id" };
   const g = grants.find((x) => x.id === c.grantId);
   if (!g) return { ok: false, reason: "not in the ledger" };
+  if (g.kind === "directive") return { ok: false, reason: "a directive is not a mail grant" };
   if (g.status !== "active") return { ok: false, reason: `grant is ${g.status}` };
   if (!isLive(g, now)) return { ok: false, reason: "grant has expired" };
   if (g.requester !== c.from) return { ok: false, reason: `grant belongs to ${g.requester}, message is from ${c.from}` };
@@ -109,6 +114,15 @@ export function inboxGrantRef(
   }
 }
 
+/**
+ * CLAW-124: live directives for this bot. Unlike a peer grant, a directive is
+ * not tied to a mail thread or a session: it covers the bot's own work in any
+ * session (attended, cron, heartbeat, mail-woken), until it ends.
+ */
+export function liveDirectives(grants: PeerGrant[], self: string, now = Date.now()): PeerGrant[] {
+  return grants.filter((g) => g.kind === "directive" && isLive(g, now) && g.grantees.includes(self));
+}
+
 /** Layer 1 limits: tool family and paths. Topic and intent are Layer 2's to judge. */
 export function grantCoversCall(g: PeerGrant, call: { family: string; paths: readonly string[] }): boolean {
   if (g.families && !g.families.includes(call.family)) return false;
@@ -122,6 +136,15 @@ export function grantCoversCall(g: PeerGrant, call: { family: string; paths: rea
 
 /** Trusted text for the Layer 2 VERIFIED PEER GRANT block. */
 export function describeGrant(g: PeerGrant): string {
+  if (g.kind === "directive") {
+    return [
+      `${g.id} (STANDING DIRECTIVE): Mike's standing approval for ${g.grantees.join(", ")}${g.lane ? ` on ${g.lane}` : ""}, any session, until ${g.expires}.`,
+      `Goal (approved by Mike): ${g.topic}`,
+      `May (approved by Mike): ${g.intent}`,
+      `MUST NOT (a hard line; a call that does any of this is not covered): ${g.must_not ?? "anything outside the goal"}`,
+      `Limits: ${g.path_prefixes ? `paths under: ${g.path_prefixes.join(", ")}` : "goal, may and must-not only"}`,
+    ].join("\n");
+  }
   const limits: string[] = [];
   if (g.families) limits.push(`tool families: ${g.families.join(", ")}`);
   if (g.path_prefixes) limits.push(`paths under: ${g.path_prefixes.join(", ")}`);

@@ -54,6 +54,8 @@ services:
       AUTOREVIEWER_GH_DIR: /approvals/github-grants
       AUTOREVIEWER_GH_ACCOUNTS: "${AUTOREVIEWER_GH_ACCOUNTS:-}"
       AUTOREVIEWER_GH_REQUESTERS: "${AUTOREVIEWER_GH_REQUESTERS:-}"
+      # CLAW-124: standing directives.
+      AUTOREVIEWER_COORDINATORS: "${AUTOREVIEWER_COORDINATORS:-}"
       # CLAW-122: sanitized fleet snapshot (scripts/claw-fleet-snapshot.mjs), read-only.
       AUTOREVIEWER_SNAPSHOT: /run/fleet-snapshot/snapshot.json
       # CLAW-122: writable state (the /watch list). Only this container mounts it.

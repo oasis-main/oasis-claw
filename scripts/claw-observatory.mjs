@@ -2457,8 +2457,18 @@ function readJsonQuiet(file, fallback) {
 export function readApprovals(support = OASIS_SUPPORT, now = Date.now()) {
   const DAY = 86_400_000;
   const recent = (iso) => iso && now - Date.parse(iso) <= DAY;
-  const grants = (readJsonQuiet(path.join(support, "approvals", "peer-grants", "peer-grants.json"), {}).grants ?? [])
-    .filter((g) => g.status === "proposed" || g.status === "active" || recent(g.approved_at) || recent(g.proposed_at))
+  const ledger = readJsonQuiet(path.join(support, "approvals", "peer-grants", "peer-grants.json"), {}).grants ?? [];
+  const live = (g) => g.status === "proposed" || g.status === "active" || recent(g.approved_at) || recent(g.proposed_at);
+  // CLAW-124: directives share the ledger (kind "directive", one bot, up to 7 days).
+  const directives = ledger
+    .filter((g) => g.kind === "directive" && (live(g) || recent(g.expires)))
+    .map((g) => ({
+      id: g.id, status: g.status, bot: g.grantees?.[0] ?? null, proposer: g.requester, lane: g.lane ?? null,
+      goal: g.topic, may: g.intent, must_not: g.must_not ?? null, path_prefixes: g.path_prefixes,
+      proposed_at: g.proposed_at, proposal_expires: g.proposal_expires, approved_at: g.approved_at, expires: g.expires,
+    }));
+  const grants = ledger
+    .filter((g) => g.kind !== "directive" && live(g))
     .map((g) => ({
       id: g.id, status: g.status, requester: g.requester, grantees: g.grantees ?? [], thread: g.thread_id,
       topic: g.topic, intent: g.intent, families: g.families, path_prefixes: g.path_prefixes, max_actions: g.max_actions,
@@ -2482,13 +2492,31 @@ export function readApprovals(support = OASIS_SUPPORT, now = Date.now()) {
         escalations: (b.reviewer?.recent ?? []).filter((x) => x.verdict === "escalate").slice(0, 5),
       }))
     : [];
+  // CLAW-124: open work from each STATUS.md and the morning-job state, parsed
+  // and redacted by the fleet snapshot exporter; the coordinator's brief.
+  const work = snap
+    ? Object.entries(snap.bots ?? {})
+        .filter(([, b]) => !b.health_only)
+        .map(([bot, b]) => ({
+          bot,
+          updated_at: b.status_file?.updated_at ?? null,
+          updated_today: !!b.status_file?.updated_today,
+          status: b.status_file?.parsed?.status ?? null,
+          next: b.status_file?.parsed?.next ?? null,
+          blockers: b.status_file?.parsed?.blockers ?? null,
+          needs: b.status_file?.parsed?.needs ?? [],
+          open: b.status_file?.parsed?.open ?? [],
+          morning: Array.isArray(b.morning) ? b.morning : [],
+        }))
+    : [];
+  const brief = snap?.brief ?? null;
   let telegram = null;
   try {
     telegram = fs.readFileSync(path.join(support, "autoreviewer", "telegram-username"), "utf8").trim().replace(/^@/, "") || null;
   } catch {
     telegram = null;
   }
-  return { generated_at: new Date(now).toISOString(), snapshot_at: snap?.generated_at ?? null, telegram, grants, github, infra, cards };
+  return { generated_at: new Date(now).toISOString(), snapshot_at: snap?.generated_at ?? null, today: snap?.today ?? null, telegram, brief, directives, work, grants, github, infra, cards };
 }
 
 async function routeApi(url, ctx) {

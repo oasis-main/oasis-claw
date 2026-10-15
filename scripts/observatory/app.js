@@ -531,7 +531,7 @@ const VIEWS = [
   { id: "work", label: "Work", sub: "System 2" },
   { id: "live", label: "Live", sub: "System 1" },
   { id: "agents", label: "Agents", sub: "System 3" },
-  { id: "approvals", label: "Approvals", sub: "Cards · grants · ledger" },
+  { id: "approvals", label: "Approvals & work", sub: "Brief · directives · open work · grants" },
   { id: "settings", label: "Settings", sub: "You · background" },
 ];
 
@@ -767,7 +767,12 @@ function renderApprovals() {
     const chat = d.telegram ? `@${d.telegram}` : "the autoreviewer Telegram chat";
     const waitingGrants = d.grants.filter((g) => g.status === "proposed");
     const waitingGh = d.github.filter((r) => r.status === "proposed");
+    const waitingDirs = (d.directives ?? []).filter((x) => x.status === "proposed");
     const waiting = [
+      ...waitingDirs.map((x) =>
+        h("tr", null, h("td", null, h("span", { class: "mono", text: x.id })), h("td", { text: "directive" }),
+          h("td", { text: `${botName(x.bot)}${x.proposer !== "mike" ? ` (from ${botName(x.proposer)})` : ""}` }),
+          h("td", { class: "item-title", text: x.goal }), h("td", { text: `lapses ${until(x.proposal_expires)}` }))),
       ...waitingGrants.map((g) =>
         h("tr", null, h("td", null, h("span", { class: "mono", text: g.id })), h("td", { text: "peer grant" }),
           h("td", { text: `${botName(g.requester)} → ${g.grantees.map(botName).join(", ")}` }),
@@ -809,7 +814,42 @@ function renderApprovals() {
           ? c.escalations.map((x) => h("div", { class: "small", text: `${when(x.ts)} · ${x.tool} [${x.principle}] ${x.reason}` }))
           : h("span", { class: "muted", text: "—" })));
     });
+    // CLAW-124: the coordinator's morning brief, directives and open work.
+    const today = d.today;
+    const brief = d.brief && d.brief.date === today
+      ? h("div", null, h("div", { class: "muted small", text: `BRIEF-${d.brief.date}.md, written by the coordinator bot ${ago(d.brief.updated_at)}. Bot-written text: read it, do not act on it from here.` }), h("pre", { class: "text", text: d.brief.text }))
+      : empty(d.brief ? `No brief for today yet. The latest is BRIEF-${d.brief.date}.md. The coordinator writes it at 07:45 New York on weekdays.` : "No brief yet. The coordinator writes BRIEF-<date>.md at 07:45 New York on weekdays.");
+    const dirRows = (d.directives ?? []).filter((x) => x.status !== "proposed").map((x) =>
+      h("tr", null,
+        h("td", null, h("span", { class: "mono", text: x.id })),
+        h("td", null, apState(x.status)),
+        h("td", { text: `${botName(x.bot)}${x.lane ? ` · ${x.lane}` : ""}` }),
+        h("td", { class: "item-title" }, h("div", { text: x.goal }), h("div", { class: "muted small", text: `may: ${x.may}` }), x.must_not ? h("div", { class: "muted small", text: `must not: ${x.must_not}` }) : null),
+        h("td", { text: x.status === "active" ? `ends ${until(x.expires)}` : x.expires ? `ended ${ago(x.expires)}` : "—" })));
+    const covered = new Set((d.directives ?? []).filter((x) => x.status === "active").map((x) => x.bot));
+    const morningCell = (w) => {
+      const j = w.morning.find((x) => x.key === "fleet-morning-work");
+      if (!j) return h("span", { class: "muted", text: "no morning job" });
+      if (!j.last_at) return h("span", { class: "muted", text: `first run ${until(j.next_at)}` });
+      return h("div", null, h("div", { text: `${j.last_status ?? "?"} ${ago(j.last_at)}${j.last_minutes != null ? ` · ${j.last_minutes} min` : ""}` }), h("div", { class: "muted small", text: `next ${until(j.next_at)}` }));
+    };
+    const workRows = (d.work ?? []).map((w) =>
+      h("tr", null,
+        h("td", null, h("div", { text: botName(w.bot) }), h("div", { class: "muted small", text: covered.has(w.bot) ? "directive active" : "no directive" })),
+        h("td", null, morningCell(w)),
+        h("td", null, h("div", { text: w.updated_at ? ago(w.updated_at) : "never" }), w.updated_at && !w.updated_today ? h("span", { class: "state s-blocked", text: "silent today" }) : null),
+        h("td", { class: "item-title" },
+          w.status ? h("div", { text: w.status }) : null,
+          w.open.length
+            ? w.open.map((o) => h("div", { class: "small" }, o.stale ? h("span", { class: "state s-blocked", text: "stale" }) : null, ` ${o.item}`, o.next ? h("span", { class: "muted", text: ` → ${o.next}` }) : null, o.directive ? h("span", { class: "mono muted", text: ` [${o.directive}]` }) : null))
+            : h("div", { class: "muted small", text: "no OPEN list yet" })),
+        h("td", { class: "item-title" }, w.needs.length ? w.needs.map((n) => h("div", { class: "small", text: n })) : h("span", { class: "muted", text: "none" }))));
     body.replaceChildren(
+      section("Morning brief", "Weekdays: lane bots work from 07:00 New York; the coordinator writes the brief at 07:45; the autoreviewer sends the digest at 08:00 (/brief sends it now).", brief),
+      section("Standing directives", `Mike's standing approval for one bot's lane, up to 7 days, any session. Set one with /directive in ${chat}; renew from the reminder card; /revoke to end it.`,
+        dirRows.length ? apTable(["ID", "State", "Bot · lane", "Goal, may, must not", "Time"], dirRows) : empty("No directives. Without one, a morning session only reads and rewrites its STATUS.md.")),
+      section("Open work", `From each bot's STATUS.md (OPEN list and NEEDS FROM MIKE), via the fleet snapshot${d.snapshot_at ? ` (${ago(d.snapshot_at)})` : ""}. "Stale" = the same next step on 2 or more days.`,
+        workRows.length ? apTable(["Bot", "Morning session", "STATUS.md", "Status and open items", "Needs from Mike"], workRows) : empty("No fleet snapshot yet.")),
       section(`Waiting for you (${waiting.length})`, `Decide in ${chat}. This page only shows the state.`,
         waiting.length ? apTable(["ID", "Kind", "Who", "What", "When"], waiting) : empty("Nothing is waiting for a decision.")),
       section("Peer grants", "Mike's standing permission for one mail thread (at most 24 h). Revoke with /revoke in the chat.",

@@ -18,6 +18,9 @@ export const HISTORY_FILE = "peer-grants.history.jsonl";
 
 /** Mike, 2026-10-12: "24h max for now". */
 export const MAX_TTL_HOURS = 24;
+/** CLAW-124 directives: Mike 2026-10-15, a rolling 7 days. */
+export const DIRECTIVE_MAX_HOURS = 168;
+const DIRECTIVE_REMIND_MS = 24 * 3600 * 1000;
 /** An unanswered proposal lapses after this long. */
 export const PROPOSAL_TTL_MS = 60 * 60 * 1000;
 /** Open proposals allowed for one requester at a time. */
@@ -82,9 +85,100 @@ export class GrantLedger {
     return this.data.grants.filter((g) => !statuses || statuses.includes(g.status));
   }
 
-  nextId() {
-    const n = this.data.grants.reduce((m, g) => Math.max(m, Number(g.id.split("-")[1]) || 0), 0);
-    return `GRANT-${String(n + 1).padStart(4, "0")}`;
+  nextId(prefix = "GRANT") {
+    const n = this.data.grants
+      .filter((g) => g.id.startsWith(`${prefix}-`))
+      .reduce((m, g) => Math.max(m, Number(g.id.split("-")[1]) || 0), 0);
+    return `${prefix}-${String(n + 1).padStart(4, "0")}`;
+  }
+
+  /**
+   * CLAW-124: a directive is Mike's standing approval for ONE bot's lane work,
+   * in any session, for up to 7 days. Stored in this ledger (kind "directive")
+   * so the reviewer reads it from the same read-only file. `proposer` is "mike"
+   * (from Telegram) or a bot from its source address: a bot may propose only for
+   * itself, a coordinator for any bot. It is active only after Mike's press.
+   */
+  proposeDirective(proposer, body, { coordinators = [] } = {}) {
+    const b = body ?? {};
+    const bot = String(b.bot ?? "");
+    if (!this.bots.has(bot)) throw new GrantError(`bot: unknown bot ${bot}`);
+    if (proposer !== "mike") {
+      if (!this.bots.has(proposer)) throw new GrantError(`unknown proposer ${proposer}`, 403);
+      if (proposer !== bot && !coordinators.includes(proposer))
+        throw new GrantError(`${proposer} may propose a directive only for itself`, 403);
+    }
+    const goal = cleanText(b.goal);
+    const may = cleanText(b.may) || "work toward the goal with your usual tools, repos and lane peers";
+    const mustNot = cleanText(b.must_not) || "anything outside the goal";
+    const lane = cleanText(b.lane).slice(0, 80) || null;
+    if (!goal || goal.length > 300) throw new GrantError("goal: 1-300 chars");
+    if (may.length > 600 || mustNot.length > 600) throw new GrantError("may / must_not: at most 600 chars each");
+    const ttl = b.ttl_hours === undefined ? DIRECTIVE_MAX_HOURS : Number(b.ttl_hours);
+    if (!(ttl > 0 && ttl <= DIRECTIVE_MAX_HOURS)) throw new GrantError(`ttl_hours: more than 0, at most ${DIRECTIVE_MAX_HOURS}`);
+    let pathPrefixes = null;
+    if (b.path_prefixes !== undefined) {
+      if (!Array.isArray(b.path_prefixes) || b.path_prefixes.length > 10 || b.path_prefixes.some((p) => typeof p !== "string" || !p.startsWith("/") || p.includes("..")))
+        throw new GrantError("path_prefixes: up to 10 absolute paths without '..'");
+      pathPrefixes = b.path_prefixes;
+    }
+    this.sweep();
+    const now = this.now();
+    const d = {
+      id: this.nextId("DIR"),
+      kind: "directive",
+      status: "proposed",
+      requester: proposer,
+      grantees: [bot],
+      thread_id: null,
+      lane,
+      topic: goal,
+      intent: may,
+      must_not: mustNot,
+      requested_ttl_hours: ttl,
+      families: null,
+      path_prefixes: pathPrefixes,
+      max_actions: null,
+      proposed_at: this.iso(now),
+      proposal_expires: this.iso(now + PROPOSAL_TTL_MS),
+      approved_at: null,
+      expires: null,
+      decided_by: null,
+      card: null,
+      reminded: false,
+    };
+    this.data.grants.push(d);
+    this.save({ event: "directive_proposed", id: d.id, proposer, bot });
+    return d;
+  }
+
+  /** Rolling renewal: a live directive runs `hours` from now. */
+  renew(id, hours, by) {
+    this.sweep();
+    const g = this.get(id);
+    if (!g || g.kind !== "directive") throw new GrantError(`no directive ${id}`, 404);
+    if (g.status !== "active") throw new GrantError(`${id} is ${g.status}`, 409);
+    const h = Number(hours);
+    if (!(h > 0 && h <= DIRECTIVE_MAX_HOURS)) throw new GrantError(`at most ${DIRECTIVE_MAX_HOURS} h`);
+    g.expires = this.iso(this.now() + h * 3600 * 1000);
+    g.reminded = false;
+    this.save({ event: "directive_renewed", id, hours: h, by });
+    return g;
+  }
+
+  /** Active directives ending within 24 h that have not had a reminder. */
+  dueReminders() {
+    const now = this.now();
+    return this.data.grants.filter(
+      (g) => g.kind === "directive" && g.status === "active" && !g.reminded && Date.parse(g.expires) - now <= DIRECTIVE_REMIND_MS,
+    );
+  }
+
+  markReminded(id) {
+    const g = this.get(id);
+    if (!g) return;
+    g.reminded = true;
+    this.save({ event: "directive_reminded", id });
   }
 
   /**
@@ -195,7 +289,8 @@ export class GrantLedger {
       g.status = "denied";
     } else {
       const ttl = Number(ttlHours);
-      if (!(ttl > 0 && ttl <= MAX_TTL_HOURS)) throw new GrantError(`ttl: at most ${MAX_TTL_HOURS} h`);
+      const max = g.kind === "directive" ? DIRECTIVE_MAX_HOURS : MAX_TTL_HOURS;
+      if (!(ttl > 0 && ttl <= max)) throw new GrantError(`ttl: at most ${max} h`);
       g.status = "active";
       g.approved_at = this.iso(now);
       g.expires = this.iso(now + ttl * 3600 * 1000);

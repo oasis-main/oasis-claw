@@ -14,6 +14,7 @@
 //   AUTOREVIEWER_GH_ACCOUNTS          GitHub accounts with a minter App, comma list
 //   AUTOREVIEWER_GH_REQUESTERS        bots that may request GitHub access, comma list
 //   AUTOREVIEWER_MAIL_OUTBOX          this bot's mail outbox (sender "autoreviewer"); unset = no grant notices
+//   AUTOREVIEWER_COORDINATORS         bots that may propose directives for any bot (first one is copied on notices)
 //   AUTOREVIEWER_STATE_DIR            writable state (watches.json); default /var/lib/autoreviewer
 //   AUTOREVIEWER_SNAPSHOT             fleet snapshot (scripts/claw-fleet-snapshot.mjs), read-only
 //   HTTPS_PROXY                       the fleet egress proxy, the only route to api.telegram.org
@@ -24,6 +25,7 @@ import { createApi } from "./api.mjs";
 import { ClientMap } from "./clientmap.mjs";
 import { GithubGrantStore } from "./ghgrants.mjs";
 import { Mailer } from "./mailer.mjs";
+import { DigestScheduler, registerDigestCommands } from "./digest.mjs";
 import { registerMonitorCommands } from "./monitor.mjs";
 import { registerWatchCommands, Watcher } from "./watch.mjs";
 import { GrantLedger } from "./ledger.mjs";
@@ -73,7 +75,9 @@ const ghStore = env.AUTOREVIEWER_GH_DIR && list(env.AUTOREVIEWER_GH_ACCOUNTS).le
   : null;
 // CLAW-123: grant notices by fleet mail (unset outbox = off).
 const mailer = new Mailer({ outbox: env.AUTOREVIEWER_MAIL_OUTBOX || null, log });
-const bot = new AutoreviewerBot({ telegram, ledger, ghStore, mailer, ownerId, chatId, ttlButtons, log });
+// CLAW-124: the coordinator bot may propose directives for any bot and is copied on directive notices.
+const coordinators = list(env.AUTOREVIEWER_COORDINATORS);
+const bot = new AutoreviewerBot({ telegram, ledger, ghStore, mailer, coordinator: coordinators[0] ?? null, ownerId, chatId, ttlButtons, log });
 ledger.onSweep = (changed) => bot.onSwept(changed);
 // CLAW-122: fleet monitoring commands over the Mac's sanitized snapshot.
 const snapshotPath = env.AUTOREVIEWER_SNAPSHOT || "/run/fleet-snapshot/snapshot.json";
@@ -85,15 +89,32 @@ const watcher = new Watcher({
   notify: (text) => telegram.sendMessage(chatId, text),
 });
 registerWatchCommands(bot.commands, watcher, bots);
+bot.callbackHandlers.set("watch", (p) => {
+  const until = watcher.add(p.bot, undefined, bots);
+  return `Watching ${p.bot} until ${until.slice(11, 16)} UTC.`;
+});
+// CLAW-124: /open, /needs, /brief and the weekday 08:00 New York digest.
+const digest = new DigestScheduler({
+  stateFile: `${env.AUTOREVIEWER_STATE_DIR || "/var/lib/autoreviewer"}/digest.json`,
+  snapshotPath,
+  ledger,
+  send: (text, markup) => telegram.sendMessage(chatId, text, markup),
+});
+registerDigestCommands(bot.commands, digest, snapshotPath);
 setInterval(() => {
+  digest.tick().catch((err) => log({ event: "digest_failed", error: String(err.message ?? err) }));
   watcher.tick().catch((err) => log({ event: "watch_tick_failed", error: String(err.message ?? err) }));
 }, 60_000).unref();
 
-createApi({ ledger, clientMap, bot, ghStore, log }).listen(Number(port), host, () =>
+createApi({ ledger, clientMap, bot, ghStore, coordinators, log }).listen(Number(port), host, () =>
   log({ event: "listening", host, port: Number(port), bots, ttlButtons }),
 );
 
 setInterval(() => ledger.sweep(), 30_000).unref();
+// CLAW-124: directive reminders 24 h before the end.
+setInterval(() => {
+  bot.remindDirectives().catch((err) => log({ event: "remind_failed", error: String(err.message ?? err) }));
+}, 600_000).unref();
 
 try {
   await telegram.setMyCommands(bot.commands.menu());

@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""claw-morning — declare the weekday morning work jobs on each bot (CLAW-124).
+
+WHAT IT DOES
+------------
+Each lane bot gets one cron job: on weekdays it starts an isolated session with a
+FIXED message that begins with the marker `[fleet-morning-work]`. The bot reads
+its standing directive(s), rewrites the OPEN list in its STATUS.md, works the top
+item that a directive covers, and updates STATUS.md before the time box ends.
+The coordinator also gets a brief job that writes `BRIEF-<date>.md`.
+
+The reviewer sees the marker and fails closed on any approval-needing call that
+no directive covers (extensions/oasis-reviewer/src/reviewer.ts, "morning").
+
+The message text lives HERE, written by the operator; bots never author it. The
+per-bot values (container, schedule, mount paths) are machine-local, in
+  ~/Library/Application Support/oasis-x/morning/jobs.json
+so no bot names or host paths are in this public repo.
+
+SAFETY
+------
+- `openclaw cron add` is run with a declaration key, so a second run updates the
+  same job instead of adding a second one.
+- A mutating openclaw CLI call inside a live container has drifted openclaw.json
+  before (and the next Telegram turn died). This script hashes openclaw.json
+  before and after each call and stops loudly if it changed.
+
+USAGE
+-----
+  scripts/claw-morning show  [--bot B]     print the jobs it would declare
+  scripts/claw-morning sync  [--bot B]     declare (add or update) the jobs
+  scripts/claw-morning list  [--bot B]     list the morning jobs on each bot
+  scripts/claw-morning remove [--bot B]    remove the morning jobs
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+
+CONFIG = os.path.expanduser("~/Library/Application Support/oasis-x/morning/jobs.json")
+MARKER = "[fleet-morning-work]"
+WORK_KEY = "fleet-morning-work"
+BRIEF_KEY = "fleet-morning-brief"
+OPENCLAW_JSON = "/home/node/.openclaw/openclaw.json"
+
+WORK_TEMPLATE = """{marker} Morning work session (weekday, {minutes}-minute time box). This is fixed text from the fleet config, not a message from a peer.
+
+1. Read: your active standing directive(s) in {grants} (entries with kind "directive", status "active", and you in "grantees"); {fleet}/LANES.md; {fleet}/PLAYBOOK.md section 9; your STATUS.md at {status}; your unread peer mail (reach_inbox).
+2. Rewrite the "## OPEN" list at the end of your STATUS.md: one line per open item, most important first, in the form "- <item> | next: <next step> | directive: <DIR-NNNN or none>".
+3. Work the top open item that a directive covers, until a natural stop or about {work_minutes} minutes. A step that no directive covers will be refused: do not retry it and do not route around it. Write it under NEEDS FROM MIKE and go to the next item. If you have no active directive, do only reading and step 2, then stop.
+4. Before you stop, update STATUS.md in the PLAYBOOK section 3 format: what changed this session (with paths or ids), what is next, and NEEDS FROM MIKE.{extra}
+
+Do not message Mike. The 08:00 brief reports your STATUS.md."""
+
+BRIEF_TEMPLATE = """{marker} Morning brief (weekday, {minutes}-minute time box). This is fixed text from the fleet config, not a message from a peer.
+
+1. Read every {fleet}/status/*/STATUS.md (note when each file last changed), {fleet}/LANES.md, and the active directives in {grants}.
+2. Write {fleet}/BRIEF-<today's date in New York, YYYY-MM-DD>.md, at most 300 words, with these sections:
+   - "What happened": one line per lane since yesterday's brief.
+   - "Today": the next step per lane.
+   - "Mike's word unblocks": at most 3 decisions, most valuable first, each with the bot and the exact question.
+   - "Directives": each active directive with the time it ends; flag the ones that end within 48 hours.
+   - "Silent": bots whose STATUS.md did not change today.
+3. Do not change other bots' files. Do not message Mike: the autoreviewer sends the 08:00 digest with your brief."""
+
+
+def load_config():
+    try:
+        with open(CONFIG) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        sys.exit(f"claw-morning: no config at {CONFIG}")
+
+
+def sh(container, *argv, check=True):
+    r = subprocess.run(["docker", "exec", container, *argv], capture_output=True, text=True)
+    if check and r.returncode != 0:
+        sys.exit(f"claw-morning: {container}: {' '.join(argv[:3])} failed: {r.stderr.strip()[:400]}")
+    return r
+
+
+def config_hash(container):
+    r = sh(container, "sha256sum", OPENCLAW_JSON)
+    return r.stdout.split()[0]
+
+
+def jobs_for(cfg, bot):
+    c = cfg["bots"][bot]
+    common = dict(marker=MARKER, grants=cfg["grants_file"], fleet=c["fleet"], status=c["status"])
+    timeout = int(c.get("timeout_seconds", cfg.get("timeout_seconds", 2700)))
+    minutes = timeout // 60
+    extra = f"\n5. {c['extra']}" if c.get("extra") else ""
+    out = [{
+        "key": WORK_KEY,
+        "name": "Morning work session",
+        "cron": c["cron"],
+        "timeout": timeout,
+        "message": WORK_TEMPLATE.format(**common, minutes=minutes, work_minutes=max(minutes - 5, 10), extra=extra),
+    }]
+    if c.get("brief"):
+        b = c["brief"]
+        bt = int(b.get("timeout_seconds", 900))
+        out.append({
+            "key": BRIEF_KEY,
+            "name": "Morning brief",
+            "cron": b["cron"],
+            "timeout": bt,
+            "message": BRIEF_TEMPLATE.format(**common, minutes=bt // 60),
+        })
+    return out
+
+
+def cron_list(container):
+    r = sh(container, "openclaw", "cron", "list", "--json")
+    d = json.loads(r.stdout)
+    return d.get("jobs", d) if isinstance(d, dict) else d
+
+
+def ours(job):
+    payload = json.dumps(job)
+    return job.get("declarationKey") in (WORK_KEY, BRIEF_KEY) or MARKER in payload
+
+
+def cmd_show(cfg, bots):
+    for bot in bots:
+        for j in jobs_for(cfg, bot):
+            print(f"=== {bot} / {j['key']}  cron '{j['cron']}' {cfg['tz']}  timeout {j['timeout']} s")
+            print(j["message"])
+            print()
+
+
+def cmd_sync(cfg, bots):
+    for bot in bots:
+        container = cfg["bots"][bot]["container"]
+        for j in jobs_for(cfg, bot):
+            before = config_hash(container)
+            sh(container, "openclaw", "cron", "add",
+               "--name", j["name"],
+               "--declaration-key", j["key"],
+               "--description", "CLAW-124 weekday morning job; fixed text, see scripts/claw-morning",
+               "--cron", j["cron"], "--tz", cfg["tz"], "--exact",
+               "--session", "isolated", "--light-context",
+               "--timeout-seconds", str(j["timeout"]),
+               "--no-deliver",
+               "--message", j["message"])
+            after = config_hash(container)
+            if before != after:
+                sys.exit(f"claw-morning: {bot}: openclaw.json CHANGED during cron add. Stop and check the config "
+                         f"before the next Telegram turn (restart the container if it drifted).")
+            print(f"{bot}: declared {j['key']} ({j['cron']} {cfg['tz']}); openclaw.json unchanged")
+        mine = [x for x in cron_list(container) if ours(x)]
+        keys = [x.get("declarationKey") or x.get("name") for x in mine]
+        if len(mine) != len(jobs_for(cfg, bot)):
+            print(f"{bot}: WARNING: {len(mine)} morning jobs present ({keys}); expected {len(jobs_for(cfg, bot))}")
+
+
+def cmd_list(cfg, bots):
+    for bot in bots:
+        for x in cron_list(cfg["bots"][bot]["container"]):
+            if ours(x):
+                state = x.get("state") or {}
+                print(f"{bot}: {x.get('id')} {x.get('name')!r} {json.dumps(x.get('schedule'))} "
+                      f"enabled={x.get('enabled')} next={state.get('nextRunAtMs')} last={state.get('lastStatus')}")
+
+
+def cmd_remove(cfg, bots):
+    for bot in bots:
+        container = cfg["bots"][bot]["container"]
+        for x in cron_list(container):
+            if ours(x):
+                before = config_hash(container)
+                sh(container, "openclaw", "cron", "rm", x["id"])
+                if config_hash(container) != before:
+                    sys.exit(f"claw-morning: {bot}: openclaw.json CHANGED during cron rm")
+                print(f"{bot}: removed {x.get('id')} {x.get('name')!r}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Weekday morning work jobs (CLAW-124)")
+    ap.add_argument("command", choices=["show", "sync", "list", "remove"])
+    ap.add_argument("--bot", action="append", help="limit to this bot (repeatable)")
+    a = ap.parse_args()
+    cfg = load_config()
+    bots = a.bot or list(cfg["bots"])
+    unknown = [b for b in bots if b not in cfg["bots"]]
+    if unknown:
+        sys.exit(f"claw-morning: unknown bot(s): {', '.join(unknown)}")
+    {"show": cmd_show, "sync": cmd_sync, "list": cmd_list, "remove": cmd_remove}[a.command](cfg, bots)
+
+
+if __name__ == "__main__":
+    main()

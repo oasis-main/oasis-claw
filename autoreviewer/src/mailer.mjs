@@ -119,3 +119,28 @@ export function githubNotices(r) {
       return [];
   }
 }
+
+/** CLAW-124: who hears about a directive. */
+export function directiveNotices(d, coordinator) {
+  const bot = d.grantees[0];
+  const to = [bot, ...(coordinator && coordinator !== bot ? [coordinator] : [])];
+  const head = `${d.id} for ${bot}${d.lane ? ` (${d.lane})` : ""}`;
+  switch (d.status) {
+    case "active":
+      return [{
+        to,
+        subject: `Standing directive ${d.status}: ${head} until ${utc(d.expires)}`,
+        body:
+          `Mike approved a standing directive ${head} until ${utc(d.expires)}.\n` +
+          `Goal: ${d.topic}\nMay: ${d.intent}\nMust not: ${d.must_not}\n\n` +
+          `It covers ${bot}'s own work in any session (attended, morning cron, heartbeat, mail-woken) inside "may", ` +
+          `and the reviewer checks every call against it. It never covers deletes, data out, infra, money or trades. ` +
+          `Put anything outside it under NEEDS FROM MIKE in your STATUS.md.`,
+      }];
+    case "revoked":
+    case "expired":
+      return [{ to, subject: `Standing directive ${d.status}: ${head}`, body: `${head} is ${d.status}. Work it covered now needs Mike again (or a new directive).` }];
+    default:
+      return [];
+  }
+}

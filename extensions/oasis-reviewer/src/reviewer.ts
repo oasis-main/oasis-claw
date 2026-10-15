@@ -36,6 +36,7 @@ import {
   grantCoversCall,
   inboxGrantRef,
   isLive,
+  liveDirectives,
   loadPeerGrants,
   verifyGrant,
   type PeerGrant,
@@ -535,6 +536,11 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
   // allow only when a grant covers it (reverses CLAW-090 §1-§2 for mail-woken
   // runs; cron runs keep CLAW-078's downgrade). Off until grants are in use.
   const mailWakeRequiresGrant = process.env.OASIS_REVIEWER_MAIL_WAKE_REQUIRES_GRANT === "1";
+  // CLAW-124: the fleet morning-work cron job carries this marker in its fixed
+  // message. In such a run an escalation becomes an allow only when a directive
+  // covers it (same rule as mail-woken runs); other cron jobs keep CLAW-078.
+  // A copied marker can only TIGHTEN a run, never loosen it.
+  const morningMarker = process.env.OASIS_REVIEWER_MORNING_MARKER || "[fleet-morning-work]";
   const runtime = (
     api as unknown as {
       runtime?: {
@@ -653,9 +659,13 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
           }
         }
       }
-      const liveGrants: PeerGrant[] = [...(grantsBySession.get(sid) ?? [])]
-        .map((id) => ledgerGrants.find((g) => g.id === id))
-        .filter((g): g is PeerGrant => !!g && isLive(g) && g.grantees.includes(botKey));
+      const liveGrants: PeerGrant[] = [
+        ...[...(grantsBySession.get(sid) ?? [])]
+          .map((id) => ledgerGrants.find((g) => g.id === id))
+          .filter((g): g is PeerGrant => !!g && isLive(g) && g.grantees.includes(botKey)),
+        // CLAW-124: standing directives cover this bot's own work in any session.
+        ...liveDirectives(ledgerGrants, botKey),
+      ];
       // A grant can turn a Layer 1 ESCALATE into an allow, never a deny, never a
       // NEVER_DOWNGRADE or infra principle, and only if Layer 2 then agrees the
       // call fits the grant's topic and intent (see grantDowngrade below).
@@ -988,6 +998,14 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
             verdict: "deny",
             principle: decision.principle,
             reason: `${decision.reason} — no approver in an unattended run (${sessionKey}); failing closed`,
+          };
+        } else if (morningMarker && (operatorRequest.includes(morningMarker) || effectiveStandingRequest.includes(morningMarker))) {
+          decision = {
+            verdict: "deny",
+            principle: `${decision.principle}+morning-no-directive`,
+            reason: `${decision.reason} — morning work session and no standing directive from Mike covers this call; failing closed`,
+            retryHint:
+              "list this step under NEEDS FROM MIKE in your STATUS.md (or ask the coordinator to propose a directive) and continue with other open items",
           };
         } else if (mailWakeRequiresGrant && isMailWoken(sessionKey)) {
           // CLAW-119: peer mail woke this run and no grant covered the call

@@ -20,6 +20,7 @@ import vm from "node:vm";
 import { execFileSync } from "node:child_process";
 import { test } from "node:test";
 import {
+  readApprovals,
   BOT_HOME,
   boardSummary,
   cached,
@@ -886,4 +887,37 @@ test("collectPendingPairing keeps live requests and only the safe fields", () =>
   assert.deepEqual(out[0], { requestId: "a", clientId: CONTROL_UI_CLIENT, platform: "MacIntel", remoteIp: "172.30.0.3", scopes: ["operator.admin"], ts: now - 1000 });
   assert.ok(!JSON.stringify(out).includes("PUBLIC-KEY"));
   assert.deepEqual(collectPendingPairing(fs, path, tmp("obs-pair-none-")), []);
+});
+
+test("readApprovals (CLAW-124): directives apart from grants; open work and the brief from the snapshot; health-only bots left out", () => {
+  const support = fs.mkdtempSync(path.join(os.tmpdir(), "obs-approvals-"));
+  const now = Date.parse("2026-10-15T12:00:00Z");
+  fs.mkdirSync(path.join(support, "approvals", "peer-grants"), { recursive: true });
+  fs.mkdirSync(path.join(support, "fleet-snapshot"), { recursive: true });
+  fs.writeFileSync(path.join(support, "approvals", "peer-grants", "peer-grants.json"), JSON.stringify({ grants: [
+    { id: "GRANT-0001", status: "active", requester: "alpha", grantees: ["beta"], thread_id: "t1", topic: "map", intent: "read" },
+    { id: "DIR-0001", kind: "directive", status: "active", requester: "mike", grantees: ["alpha"], lane: "racing", topic: "Ship it", intent: "push dev", must_not: "merge prod", expires: "2026-10-20T12:00:00Z" },
+    { id: "DIR-0002", kind: "directive", status: "expired", requester: "mike", grantees: ["beta"], topic: "old", intent: "x", expires: "2026-10-01T00:00:00Z" },
+  ] }));
+  fs.writeFileSync(path.join(support, "fleet-snapshot", "snapshot.json"), JSON.stringify({
+    generated_at: "2026-10-15T11:59:00Z", today: "2026-10-15",
+    brief: { date: "2026-10-15", updated_at: "2026-10-15T11:50:00Z", text: "What happened" },
+    bots: {
+      alpha: { status_file: { updated_at: "2026-10-15T11:20:00Z", updated_today: true, parsed: { status: "ok", needs: ["a decision"], open: [{ item: "KIN-218", next: "parse", directive: "DIR-0001", stale: false }] } },
+        morning: [{ key: "fleet-morning-work", last_status: "ok" }] },
+      gamma: { health_only: true },
+    },
+  }));
+  try {
+    const d = readApprovals(support, now);
+    assert.deepEqual(d.grants.map((g) => g.id), ["GRANT-0001"]);
+    assert.deepEqual(d.directives.map((x) => [x.id, x.bot, x.must_not]), [["DIR-0001", "alpha", "merge prod"]]);
+    assert.deepEqual(d.work.map((w) => w.bot), ["alpha"]);
+    assert.equal(d.work[0].open[0].directive, "DIR-0001");
+    assert.deepEqual(d.work[0].needs, ["a decision"]);
+    assert.equal(d.brief.date, "2026-10-15");
+    assert.equal(d.today, "2026-10-15");
+  } finally {
+    fs.rmSync(support, { recursive: true, force: true });
+  }
 });

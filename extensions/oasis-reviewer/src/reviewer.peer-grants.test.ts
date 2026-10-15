@@ -71,9 +71,13 @@ function register(judge: string, bot = "beta") {
   registerReviewer(api, { auditDir, mode: "enforce", policyFile: policyPath });
   const call = (event: Record<string, unknown>, ctx: Record<string, unknown>) =>
     handlers.get("before_tool_call")!(event, ctx) as Promise<Record<string, any> | undefined>;
+  const callWithPrompt = (prompt: string, event: Record<string, unknown>, ctx: Record<string, any>) => {
+    handlers.get("llm_input")!({ prompt }, { runId: ctx.runId, sessionId: ctx.sessionId });
+    return call(event, ctx);
+  };
   const rows = () =>
     fs.readFileSync(path.join(auditDir, "reviewer-audit.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
-  return { call, rows, prompts };
+  return { call, callWithPrompt, rows, prompts };
 }
 
 const read = (id: string) => ({ toolName: "reach_read", toolCallId: `r_${id}`, params: { id } });
@@ -280,6 +284,93 @@ describe("runs that peer mail wakes up (OASIS_REVIEWER_MAIL_WAKE_REQUIRES_GRANT)
     const r = register(ALLOW);
     const out = await r.call(write(), { sessionId: "s-cron", sessionKey: "agent:main:cron:job-1", runId: "run-cron" });
     expect(out).toBeUndefined();
+    expect(r.rows().at(-1).principle).toBe("hard:escalate-write-root+unattended-downgrade");
+  });
+});
+
+describe("standing directives (CLAW-124)", () => {
+  function directive(over: Record<string, unknown> = {}) {
+    return {
+      id: "DIR-0001", kind: "directive", status: "active", requester: "mike", grantees: ["beta"], thread_id: null,
+      lane: "racing", topic: "ship the notes", intent: "write notes under /reach/shared/notes", must_not: "merge to prod",
+      families: null, path_prefixes: null, max_actions: null, approved_at: "2026-10-15T00:00:00.000Z", expires: FUTURE, ...over,
+    };
+  }
+
+  it("covers the bot's own escalation in an attended session with no mail binding", async () => {
+    writeLedger([directive()]);
+    const r = register(ALLOW);
+    expect(await r.call(write(), ATTENDED())).toBeUndefined();
+    expect(r.rows().at(-1)).toMatchObject({ principle: "hard:escalate-write-root+peer-grant", coveringGrant: "DIR-0001" });
+    expect(r.prompts.at(-1)).toContain("DIR-0001 (STANDING DIRECTIVE)");
+    expect(r.prompts.at(-1)).toContain("MUST NOT (a hard line");
+  });
+
+  it("covers a mail-woken run when the mail-wake switch is on", async () => {
+    process.env.OASIS_REVIEWER_MAIL_WAKE_REQUIRES_GRANT = "1";
+    writeLedger([directive()]);
+    const r = register(ALLOW);
+    expect(await r.call(write(), MAIL_WOKEN())).toBeUndefined();
+  });
+
+  it.each([
+    ["another bot's directive", { grantees: ["gamma"] }],
+    ["an expired directive", { expires: "2020-01-01T00:00:00.000Z" }],
+    ["a revoked directive", { status: "revoked" }],
+  ])("NEGATIVE CONTROL: %s does not cover", async (_l, over) => {
+    writeLedger([directive(over)]);
+    const r = register(ALLOW);
+    const out = await r.call(write(), ATTENDED());
+    expect(out?.requireApproval).toBeDefined();
+  });
+
+  it("NEGATIVE CONTROL: never covers a NEVER_DOWNGRADE principle, and the judge's escalate stands", async () => {
+    writeLedger([directive()]);
+    const r = register(ALLOW);
+    const out = await r.call({ toolName: "exec", toolCallId: "e9", params: { command: "git push origin dev" } }, ATTENDED());
+    expect(out?.requireApproval).toBeDefined();
+    const r2 = register(ESCALATE);
+    expect((await r2.call(write(), ATTENDED()))?.requireApproval).toBeDefined();
+  });
+
+  it("NEGATIVE CONTROL: a mail citing a directive id binds nothing", async () => {
+    writeLedger([directive({ grantees: ["beta"] }), grant()]);
+    deliver("alpha", "m_20", { thread_id: "t_map", grant_id: "DIR-0001" });
+    const r = register(ALLOW);
+    await r.call(read("m_20"), ATTENDED());
+    expect(r.rows().at(-1).grantBound).toBeUndefined();
+  });
+});
+
+describe("morning work sessions (CLAW-124)", () => {
+  const CRON = (s = "s-cron") => ({ sessionId: `${testNo}-${s}`, sessionKey: "agent:main:cron:job-m1", runId: `run-${testNo}-${s}` });
+  function morning(judge: string) {
+    const r = register(judge);
+    return r;
+  }
+
+  it("without a directive an escalation fails closed with a NEEDS FROM MIKE hint", async () => {
+    writeLedger([]);
+    const r = morning(ALLOW);
+    // The cron message is the run's operator request.
+    (r as any).prime?.();
+    const out = await r.callWithPrompt("[fleet-morning-work] Morning work session. Work your top open item.", write(), CRON());
+    expect(out?.block).toBe(true);
+    expect(String(out?.blockReason)).toContain("no standing directive from Mike covers this call");
+    expect(String(out?.blockReason)).toContain("NEEDS FROM MIKE");
+  });
+
+  it("with a covering directive it is allowed", async () => {
+    writeLedger([{ id: "DIR-0001", kind: "directive", status: "active", requester: "mike", grantees: ["beta"], thread_id: null, lane: "x",
+      topic: "notes", intent: "write notes", must_not: "prod", families: null, path_prefixes: null, max_actions: null, approved_at: "2026-10-15T00:00:00.000Z", expires: FUTURE }]);
+    const r = morning(ALLOW);
+    expect(await r.callWithPrompt("[fleet-morning-work] Morning work session.", write(), CRON("s2"))).toBeUndefined();
+  });
+
+  it("NEGATIVE CONTROL: an ordinary cron job keeps the CLAW-078 downgrade", async () => {
+    writeLedger([]);
+    const r = morning(ALLOW);
+    expect(await r.callWithPrompt("Daily weather reminder for Mike.", write(), CRON("s3"))).toBeUndefined();
     expect(r.rows().at(-1).principle).toBe("hard:escalate-write-root+unattended-downgrade");
   });
 });
