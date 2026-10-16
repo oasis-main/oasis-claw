@@ -78,9 +78,11 @@ MODAL_PLATFORM="aarch64-unknown-linux-gnu"
 #   oasis-cloud-admin dev          aws 5.68.0, archive 2.7.1, random 3.8.1
 #   oasis-cloud-admin prod         aws 5.68.0, archive 2.8.0, random 3.9.0
 #   exp (all six stacks)           aws 5.100.0, archive 2.8.0, random 3.9.0
+#   oasis-generation hetzner-gateway  hcloud 1.70.0 (GEN-008, added 2026-10-16)
 # When a stack's lock file changes, add the new version here and re-stage.
 PROVIDERS=(
   "scaleway/scaleway=2.83.1"
+  "hetznercloud/hcloud=1.70.0"
   "hashicorp/aws=5.68.0"
   "hashicorp/aws=5.100.0"
   "hashicorp/archive=2.7.1"
