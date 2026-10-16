@@ -76,7 +76,9 @@ REPO_RE = __import__("re").compile(r"^[A-Za-z0-9._-]{1,100}$")
 
 # The App asks for the most any bot may get. Each bot's token is cut down to
 # its own grant (grants.json) when it is minted. No administration, no
-# secrets, no workflows unless Mike adds them here and to that bot's grant.
+# secrets. Workflows only for Yes Man (Mike, 2026-10-16): a workflow file can
+# assume a cloud role through OIDC, so pushing one is an infrastructure change,
+# and only the infra broker may make it. No other bot gets "workflows".
 APP_PERMISSIONS = {
     "contents": "write",
     "pull_requests": "write",
@@ -85,16 +87,18 @@ APP_PERMISSIONS = {
     "actions": "read",
     "checks": "read",
     "statuses": "read",
+    "workflows": "write",
 }
 READ_ONLY = {"contents": "read", "pull_requests": "read", "issues": "read", "metadata": "read", "actions": "read", "checks": "read", "statuses": "read"}
 WRITE = {"contents": "write", "pull_requests": "write", "issues": "write", "metadata": "read", "actions": "read", "checks": "read", "statuses": "read"}
+INFRA_BROKER_WRITE = {**WRITE, "workflows": "write"}
 
 # Starting grants (Mike, 2026-10-08: every bot except Van Helsing). Repos an
 # App installation does not cover are dropped at mint time with a warning.
 DEFAULT_GRANTS = {
     "yesman": {
-        "oasis-main": {"repos": "*", "permissions": WRITE},
-        "MikeHLee": {"repos": "*", "permissions": WRITE},
+        "oasis-main": {"repos": "*", "permissions": INFRA_BROKER_WRITE},
+        "MikeHLee": {"repos": "*", "permissions": INFRA_BROKER_WRITE},
     },
     "kolmogorov": {
         "oasis-main": {"repos": ["oasis-claw", "oasis-generation", "oasis-voice", "oasis-cloud"], "permissions": WRITE},
@@ -274,6 +278,15 @@ def mint_one(bot, account, grant, app, log):
         log(f"{bot}/{account}: {err}")
         return False
     perms = {k: v for k, v in (grant.get("permissions") or READ_ONLY).items() if k in APP_PERMISSIONS}
+    # GitHub refuses the whole token if one permission is above what the
+    # installation accepted (e.g. "workflows" before the account owner accepts
+    # the App's new permission). Drop that one permission and mint the rest.
+    granted = inst.get("permissions") or {}
+    rank = {"read": 1, "write": 2, "admin": 3}
+    over = sorted(k for k, v in perms.items() if rank.get(granted.get(k), 0) < rank.get(v, 0))
+    if over:
+        log(f"{bot}/{account}: the installation has not accepted {', '.join(over)}; minted without it")
+        perms = {k: v for k, v in perms.items() if k not in over}
     body = {"permissions": perms}
     repos = grant.get("repos", [])
     if repos != "*":
