@@ -21,6 +21,7 @@ import {
 } from "./policy.js";
 import {
   judgeConstitution,
+  judgeFailureCause,
   judgeInjectionReport,
   type InjectionReviewDecision,
   type InjectionReviewInput,
@@ -926,9 +927,12 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
           // different sentences. Order matters: an aborted call may ALSO carry an
           // error (the abort itself), and the timeout is the more useful of the
           // two facts. See JudgeResult.timedOut.
-          const cause = r.timedOut
-            ? `judge timed out after ${r.timeoutMs} ms`
-            : (r.error ?? "unparseable verdict");
+          //
+          // 2026-10-18: a fourth cause, the EMPTY reply, was still reported as
+          // "unparseable verdict" (4 Nimbus reach_send denies on 2026-10-17;
+          // Bedrock had stopped with content_filtered). judgeFailureCause now
+          // names it with its finish reason. See layer2.ts.
+          const cause = judgeFailureCause(r);
           decision = {
             verdict: "deny",
             principle: "l2:unavailable-fail-closed",
@@ -969,6 +973,11 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
           // the empty one, so the cause can be read off the audit.
           l2EmptyReplies: r.emptyReplies,
           l2EmptyUsage: r.emptyUsage,
+          // 2026-10-18: why the empty reply ended (e.g. "error" with
+          // "Provider finish_reason: content_filter"). Absent when the runtime
+          // does not report it.
+          l2FinishReason: r.emptyFinishReason,
+          l2FinishError: r.emptyErrorMessage,
           l2Tightened: !!combined && !inertReadKept && combined.verdict !== l1.verdict,
           // Records every escalate-on-an-inert-read the backstop absorbed, so
           // the constitution's own drift stays measurable after the prose fix.
@@ -1235,6 +1244,9 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
               // not "the judge writes garbage".
               l2TimedOut: r.timedOut || undefined,
               l2TimeoutMs: r.timeoutMs,
+              l2EmptyReplies: r.emptyReplies,
+              l2FinishReason: r.emptyFinishReason,
+              l2FinishError: r.emptyErrorMessage,
               l2RetryHint: r.decision?.retryHint ?? null,
               contextDepth,
               hadSessionTranscript: !!sessionTranscript,

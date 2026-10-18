@@ -152,6 +152,14 @@ RUN node /tmp/patch-openclaw-network-resilience.mjs && rm /tmp/patch-openclaw-ne
 COPY scripts/patch-openclaw-theme.mjs /tmp/patch-openclaw-theme.mjs
 RUN node /tmp/patch-openclaw-theme.mjs && rm /tmp/patch-openclaw-theme.mjs
 
+# runtime.llm.complete() drops the reply's stopReason/errorMessage, so a
+# provider-side stop (e.g. Bedrock content_filtered -> finish_reason
+# content_filter) reaches oasis-reviewer's judge as a bare empty string
+# (2026-10-17: 4 Nimbus reach_send denies, cause invisible in the audit).
+# Additive patch; fails the build on a shape mismatch. See the script.
+COPY scripts/patch-openclaw-llm-stop-reason.mjs /tmp/patch-openclaw-llm-stop-reason.mjs
+RUN node /tmp/patch-openclaw-llm-stop-reason.mjs && rm /tmp/patch-openclaw-llm-stop-reason.mjs
+
 # Playwright + Chromium for the vendored `browser` plugin (extensions/browser/).
 # Three layered pins; bump independently per AUDIT_LOG.md and extensions/browser/UPSTREAM:
 #   PLAYWRIGHT_VERSION  — JS library

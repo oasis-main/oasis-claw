@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { judgeConstitution, judgeInjectionReport, type Layer2Input, type InjectionReviewInput } from "./layer2.js";
+import { judgeConstitution, judgeFailureCause, judgeInjectionReport, type Layer2Input, type InjectionReviewInput } from "./layer2.js";
 
 // ── A timeout is not a parse failure (2026-08-26) ───────────────────────────
 // Nimbus lost 4 tool calls on 2026-08-25 to this message:
@@ -135,13 +135,11 @@ describe("judgeInjectionReport — mirrors judgeConstitution exactly", () => {
 });
 
 // ── The caller's wording (reviewer.ts fail-closed branch) ───────────────────
-// reviewer.ts builds the agent-visible denial from these two fields. The logic
-// is reproduced here rather than imported because the branch sits deep inside
-// the before_tool_call handler; keeping a test on the SHAPE guards the
-// contract that layer2.ts promises and reviewer.ts consumes.
+// reviewer.ts builds the agent-visible denial with judgeFailureCause (moved
+// into layer2.ts on 2026-10-18 so this test exercises the real code, not a
+// copy of it).
 
-const causeOf = (r: { timedOut?: boolean; error?: string; timeoutMs: number }) =>
-  r.timedOut ? `judge timed out after ${r.timeoutMs} ms` : (r.error ?? "unparseable verdict");
+const causeOf = judgeFailureCause;
 
 describe("fail-closed wording follows timedOut, not the absence of an error", () => {
   it("names the timeout and its limit when the deadline fired", async () => {

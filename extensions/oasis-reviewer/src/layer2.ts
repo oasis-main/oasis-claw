@@ -103,7 +103,18 @@ export type LlmComplete = (params: {
   agentId?: string;
   thinkingLevel?: string;
   signal?: AbortSignal;
-}) => Promise<{ text: string; usage?: unknown }>;
+}) => Promise<{
+  text: string;
+  usage?: unknown;
+  /**
+   * Why the reply ended ("stop", "length", "error", "aborted", ...). openclaw
+   * 2026.7.1-2 returns this only with scripts/patch-openclaw-llm-stop-reason.mjs
+   * applied; without it the field is absent. A provider-side stop such as
+   * finish_reason "content_filter" arrives as "error" plus errorMessage.
+   */
+  stopReason?: string;
+  errorMessage?: string;
+}>;
 
 const NONCE_BYTES = 12;
 
@@ -264,6 +275,44 @@ export interface JudgeResult {
   emptyReplies?: number;
   /** Provider usage of the last reply that came back empty, for diagnosis. */
   emptyUsage?: unknown;
+  /**
+   * stopReason / errorMessage of the last reply that came back empty
+   * (2026-10-18). On 2026-10-17 two judges got two empty replies each and the
+   * deny said "unparseable verdict"; a replay showed Bedrock had stopped with
+   * content_filtered and 0 output tokens. These fields carry that cause into
+   * the audit and the deny reason. Undefined when the runtime does not report
+   * it (see LlmComplete.stopReason).
+   */
+  emptyFinishReason?: string;
+  emptyErrorMessage?: string;
+}
+
+const MAX_ERROR_MESSAGE = 300;
+
+/**
+ * The cause of a judgment that produced no verdict, as one phrase for the
+ * fail-closed deny reason. Four causes, four remedies, so four wordings:
+ *   - timeout: raise OASIS_REVIEWER_L2_TIMEOUT_MS or retry;
+ *   - transport error: fix the path to the model;
+ *   - EMPTY reply: the model said nothing (content filter, budget, ...);
+ *     read the finish reason, the prompt did not fail to parse;
+ *   - text that does not parse: fix the prompt or the model.
+ * Order matters: an aborted call may ALSO carry an error (the abort itself),
+ * and the timeout is the more useful fact.
+ */
+export function judgeFailureCause(r: JudgeResult): string {
+  if (r.timedOut) return `judge timed out after ${r.timeoutMs} ms`;
+  if (r.error) return r.error;
+  if (r.emptyReplies && !r.raw) {
+    const finish = r.emptyFinishReason
+      ? r.emptyErrorMessage
+        ? `${r.emptyFinishReason}: ${r.emptyErrorMessage}`
+        : r.emptyFinishReason
+      : "not reported by the runtime";
+    const times = r.emptyReplies === 1 ? "an empty reply" : `an empty reply ${r.emptyReplies} times`;
+    return `judge returned ${times}, finish reason ${finish}`;
+  }
+  return "unparseable verdict";
 }
 
 /** Call the model to judge the call. Bounded by timeoutMs; never throws. */
@@ -286,6 +335,17 @@ export async function judgeConstitution(
   // same deadline. A reply WITH text (verdict or garbage) is never retried.
   let emptyReplies = 0;
   let emptyUsage: unknown;
+  let emptyFinishReason: string | undefined;
+  let emptyErrorMessage: string | undefined;
+  const emptyFields = () =>
+    emptyReplies
+      ? {
+          emptyReplies,
+          emptyUsage,
+          ...(emptyFinishReason ? { emptyFinishReason } : {}),
+          ...(emptyErrorMessage ? { emptyErrorMessage } : {}),
+        }
+      : {};
   try {
     for (;;) {
       const res = await complete({
@@ -327,6 +387,9 @@ export async function judgeConstitution(
       if (empty && !ac.signal.aborted) {
         emptyReplies++;
         emptyUsage = res.usage;
+        emptyFinishReason = typeof res.stopReason === "string" ? res.stopReason : undefined;
+        emptyErrorMessage =
+          typeof res.errorMessage === "string" ? res.errorMessage.slice(0, MAX_ERROR_MESSAGE) : undefined;
         if (emptyReplies < 2) continue;
       }
       return {
@@ -337,7 +400,7 @@ export async function judgeConstitution(
         // reject. See JudgeResult.timedOut.
         timedOut: ac.signal.aborted,
         timeoutMs,
-        ...(emptyReplies ? { emptyReplies, emptyUsage } : {}),
+        ...emptyFields(),
       };
     }
   } catch (err) {
@@ -348,7 +411,7 @@ export async function judgeConstitution(
       ms: Date.now() - started,
       timedOut: ac.signal.aborted,
       timeoutMs,
-      ...(emptyReplies ? { emptyReplies, emptyUsage } : {}),
+      ...emptyFields(),
     };
   } finally {
     clearTimeout(timer);
