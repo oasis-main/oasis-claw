@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""
+claw-gen-vm-bootstrap — put the cloud oasis-generation gateway's secrets on its
+Hetzner VM, from the Mac, over SSH (GEN-008, Mike 2026-10-19: option A).
+
+No secret goes into Terraform state, into the server's startup data, or into a
+mail. The three values live only on this Mac:
+
+  fleet token     ~/Library/Application Support/oasis-x/generation/remote-token
+                  (the Mac gateway sends it; the VM accepts it as client "fleet")
+  Bedrock key     GEN_VM_AWS_ACCESS_KEY_ID / GEN_VM_AWS_SECRET_ACCESS_KEY in
+                  ~/Library/Application Support/oasis-x/yesman-secrets/providers.env
+                  (IAM user dev-bedrock-invoker-gen-vm, invoke-only)
+
+The script writes /opt/gateway/secrets.env (mode 600) on the VM, starts the
+stack, and tests the gateway through its public name.
+
+  scripts/claw-gen-vm-bootstrap plan  <ipv4> <hostname>   # names and sizes only, no SSH
+  scripts/claw-gen-vm-bootstrap push  <ipv4> <hostname>   # write, start, test
+  scripts/claw-gen-vm-bootstrap check <hostname>          # test only (https)
+
+SSH: the dedicated key ~/.ssh/oasis-gen-vm_ed25519 (Mac only), IPv4 only (the
+VM's firewall allows port 22 from the Mac's IPv4 address only), its own
+known_hosts file. The first connection records the VM's host key; a later
+change of that key stops the script (no silent trust).
+
+Never prints a secret. Runs from the Mac host, never from a bot: Yes Man has no
+SSH path (its egress is an HTTP proxy).
+"""
+
+import argparse
+import ipaddress
+import json
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+SUPPORT = HOME / "Library" / "Application Support" / "oasis-x"
+FLEET_TOKEN_FILE = SUPPORT / "generation" / "remote-token"
+PROVIDERS_ENV = SUPPORT / "yesman-secrets" / "providers.env"
+SSH_KEY = HOME / ".ssh" / "oasis-gen-vm_ed25519"
+KNOWN_HOSTS = HOME / ".ssh" / "known_hosts_oasis_gen_vm"
+REMOTE_DIR = "/opt/gateway"
+REMOTE_FILE = f"{REMOTE_DIR}/secrets.env"
+HOSTNAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$")
+
+
+def die(msg):
+    sys.exit(f"claw-gen-vm-bootstrap: {msg}")
+
+
+def env_value(name):
+    """One key from providers.env, without sourcing the file."""
+    if not PROVIDERS_ENV.exists():
+        die(f"{PROVIDERS_ENV} is missing")
+    for line in PROVIDERS_ENV.read_text().splitlines():
+        m = re.match(r"^([A-Z][A-Z0-9_]*)=(.*)$", line)
+        if m and m.group(1) == name:
+            return m.group(2).strip()
+    return ""
+
+
+def collect():
+    token = FLEET_TOKEN_FILE.read_text().strip() if FLEET_TOKEN_FILE.exists() else ""
+    values = {
+        "OASIS_GENERATION_SERVICE_TOKENS": f"fleet:{token}" if token else "",
+        "AWS_ACCESS_KEY_ID": env_value("GEN_VM_AWS_ACCESS_KEY_ID"),
+        "AWS_SECRET_ACCESS_KEY": env_value("GEN_VM_AWS_SECRET_ACCESS_KEY"),
+    }
+    missing = [k for k, v in values.items() if not v or v == "fleet:"]
+    if missing:
+        die("missing on this Mac: " + ", ".join(missing))
+    for k, v in values.items():
+        if any(c in v for c in "\n\r\"'$`\\ "):
+            die(f"{k} holds a character that an env file cannot carry safely")
+    return values
+
+
+def check_args(ipv4, hostname):
+    try:
+        ip = ipaddress.IPv4Address(ipv4)
+    except ValueError:
+        die(f"not an IPv4 address: {ipv4!r}")
+    if not ip.is_global:
+        die(f"not a public IPv4 address: {ipv4}")
+    if not HOSTNAME_RE.match(hostname):
+        die(f"not a hostname: {hostname!r}")
+
+
+def ssh(ipv4, remote_cmd, stdin_bytes=None):
+    if not SSH_KEY.exists():
+        die(f"{SSH_KEY} is missing")
+    cmd = [
+        "ssh", "-4", "-i", str(SSH_KEY),
+        "-o", "IdentitiesOnly=yes",
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
+        "-o", "ConnectTimeout=15",
+        f"root@{ipv4}", remote_cmd,
+    ]
+    return subprocess.run(cmd, input=stdin_bytes, capture_output=True, timeout=300)
+
+
+def http_status(url, token=None):
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"} if token else {})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+    except (urllib.error.URLError, TimeoutError) as exc:
+        return f"unreachable ({type(exc).__name__})"
+
+
+def run_checks(hostname):
+    token = FLEET_TOKEN_FILE.read_text().strip()
+    base = f"https://{hostname}"
+    results = [
+        ("GET /health (no token)", http_status(f"{base}/health"), 200),
+        ("GET /v1/models (no token)", http_status(f"{base}/v1/models"), 401),
+        ("GET /v1/models (wrong token)", http_status(f"{base}/v1/models", "wrong-token-for-test"), 401),
+        ("GET /v1/models (fleet token)", http_status(f"{base}/v1/models", token), 200),
+    ]
+    ok = True
+    for label, got, want in results:
+        good = got == want
+        ok &= good
+        print(f"  {'ok ' if good else 'BAD'} {label}: {got} (want {want})")
+    return ok
+
+
+def cmd_plan(a):
+    check_args(a.ipv4, a.hostname)
+    values = collect()
+    print(f"target: root@{a.ipv4} (IPv4), file {REMOTE_FILE} (mode 600), then docker compose up -d in {REMOTE_DIR}")
+    print(f"checks through https://{a.hostname}")
+    for k, v in values.items():
+        print(f"  {k}: set, {len(v)} chars")
+    print(f"ssh key: {SSH_KEY} ({'present' if SSH_KEY.exists() else 'MISSING'})")
+
+
+def cmd_push(a):
+    check_args(a.ipv4, a.hostname)
+    values = collect()
+    body = "".join(f"{k}={v}\n" for k, v in values.items()).encode()
+    remote = (
+        f"set -e; umask 077; install -d -m 755 {REMOTE_DIR}; "
+        f"cat > {REMOTE_FILE}.new; chmod 600 {REMOTE_FILE}.new; mv {REMOTE_FILE}.new {REMOTE_FILE}; "
+        # Compose hashes env_file contents into the service config, so a changed
+        # secrets.env recreates the gateway; a first push starts the whole stack.
+        f"cd {REMOTE_DIR} && docker compose up -d >/dev/null 2>&1; "
+        f"docker compose ps --format json"
+    )
+    r = ssh(a.ipv4, remote, body)
+    if r.returncode != 0:
+        # stderr can carry the remote shell's messages; it never carries the values.
+        die(f"ssh step failed (rc={r.returncode}): {r.stderr.decode(errors='replace').strip()[-300:]}")
+    print(f"wrote {REMOTE_FILE} on {a.ipv4} ({len(values)} keys, mode 600); stack started")
+    for line in r.stdout.decode(errors="replace").splitlines():
+        try:
+            svc = json.loads(line)
+            print(f"  {svc.get('Service')}: {svc.get('State')} {svc.get('Status', '')}")
+        except ValueError:
+            pass
+    print("checks:")
+    if not run_checks(a.hostname):
+        die("a check failed; the stack is up but not as expected")
+
+
+def cmd_check(a):
+    if not HOSTNAME_RE.match(a.hostname):
+        die(f"not a hostname: {a.hostname!r}")
+    if not run_checks(a.hostname):
+        sys.exit(1)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name, fn in (("plan", cmd_plan), ("push", cmd_push)):
+        s = sub.add_parser(name)
+        s.add_argument("ipv4")
+        s.add_argument("hostname")
+        s.set_defaults(fn=fn)
+    s = sub.add_parser("check")
+    s.add_argument("hostname")
+    s.set_defaults(fn=cmd_check)
+    a = p.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
