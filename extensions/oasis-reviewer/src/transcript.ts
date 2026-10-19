@@ -39,19 +39,62 @@ export interface TranscriptSummary {
 
 const PER_MESSAGE_CHAR_CAP = 600;
 
+// ── Base64 elision (2026-10-19) ──────────────────────────────────────────────
+// On 2026-10-17 Nimbus's judge got empty replies on 2 reach_send calls (4
+// denies with retries). A replay showed Bedrock stopReason content_filtered
+// with 0 output tokens. A bisect found the trigger: ONE tool result in the
+// transcript tail, a raw email body in base64 from `gog gmail get`. With only
+// that line removed, both prompts got a normal verdict.
+//
+// Base64 carries no signal the judge can read, so each long run becomes a
+// marker that keeps the fact and the size: "[base64, 1234 chars elided]". It
+// runs BEFORE the per-message cap, so the cap (and the maxChars budget) holds
+// real text, and the marker counts the full run.
+//
+// A run is a sequence of base64/base64url pieces of MIN_PIECE+ characters,
+// optionally split by whitespace (MIME bodies wrap at 76 columns), with
+// MIN_RUN+ base64 characters in total. The run needs a digit, an upper- and
+// a lower-case letter, so a long "=====" rule or a lower-case hex digest is
+// kept. URLs, paths with dots, and JSON values break on ":", ".", quotes and
+// spaces, and English words are far shorter than MIN_PIECE.
+//
+// Only the TRANSCRIPT is elided. The params of the call under judgment go to
+// the judge as they are.
+const BASE64_MIN_PIECE = 60;
+const BASE64_MIN_RUN = 200;
+const BASE64_RUN = new RegExp(
+  `[A-Za-z0-9+/_-]{${BASE64_MIN_PIECE},}={0,2}(?:\\s+[A-Za-z0-9+/_-]{${BASE64_MIN_PIECE},}={0,2})*`,
+  "g",
+);
+
+// Only the head of each part is scanned: the per-message cap keeps 600
+// characters, and an unbounded scan of a multi-megabyte tool result would
+// cost about 1 s per 12 MB on every judged call. A run that crosses this
+// limit is counted up to the limit.
+const ELIDE_SCAN_CAP = 65_536;
+
+export function elideBase64(text: string): string {
+  return text.slice(0, ELIDE_SCAN_CAP).replace(BASE64_RUN, (run) => {
+    const chars = run.replace(/\s+/g, "");
+    if (chars.length < BASE64_MIN_RUN) return run;
+    if (!/[0-9]/.test(chars) || !/[A-Z]/.test(chars) || !/[a-z]/.test(chars)) return run;
+    return `[base64, ${chars.length} chars elided]`;
+  });
+}
+
 function summarizeContent(content: unknown): string {
-  if (typeof content === "string") return content.slice(0, PER_MESSAGE_CHAR_CAP);
+  if (typeof content === "string") return elideBase64(content).slice(0, PER_MESSAGE_CHAR_CAP);
   if (!Array.isArray(content)) return "";
   const parts: string[] = [];
   for (const block of content) {
     if (!block || typeof block !== "object") continue;
     const b = block as Record<string, unknown>;
     if (b.type === "text" && typeof b.text === "string") {
-      parts.push(b.text);
+      parts.push(elideBase64(b.text));
     } else if (b.type === "toolCall" && typeof b.name === "string") {
       let args = "";
       try {
-        args = JSON.stringify(b.arguments ?? {}).slice(0, 200);
+        args = elideBase64(JSON.stringify(b.arguments ?? {})).slice(0, 200);
       } catch {
         /* best-effort argument preview only */
       }
