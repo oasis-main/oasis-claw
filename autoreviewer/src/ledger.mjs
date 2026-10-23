@@ -103,7 +103,8 @@ export class GrantLedger {
     const b = body ?? {};
     const bot = String(b.bot ?? "");
     if (!this.bots.has(bot)) throw new GrantError(`bot: unknown bot ${bot}`);
-    if (proposer !== "mike") {
+    // "console" (CLAW-127) reaches here only from the host-only folder, never from the API.
+    if (proposer !== "mike" && proposer !== "console") {
       if (!this.bots.has(proposer)) throw new GrantError(`unknown proposer ${proposer}`, 403);
       if (proposer !== bot && !coordinators.includes(proposer))
         throw new GrantError(`${proposer} may propose a directive only for itself`, 403);

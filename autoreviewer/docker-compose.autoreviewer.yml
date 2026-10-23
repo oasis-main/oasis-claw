@@ -56,6 +56,9 @@ services:
       AUTOREVIEWER_GH_REQUESTERS: "${AUTOREVIEWER_GH_REQUESTERS:-}"
       # CLAW-124: standing directives.
       AUTOREVIEWER_COORDINATORS: "${AUTOREVIEWER_COORDINATORS:-}"
+      # CLAW-127: Claude Code's directive proposals (scripts/claw-directive). Host-only
+      # folder: no bot mounts it, so no bot can propose as "console".
+      AUTOREVIEWER_CONSOLE_DIR: /run/console-proposals
       # CLAW-122: sanitized fleet snapshot (scripts/claw-fleet-snapshot.mjs), read-only.
       AUTOREVIEWER_SNAPSHOT: /run/fleet-snapshot/snapshot.json
       # CLAW-122: writable state (the /watch list). Only this container mounts it.
@@ -87,6 +90,10 @@ services:
       - type: bind
         source: ${HOME}/Library/Application Support/oasis-x/autoreviewer-state
         target: /var/lib/autoreviewer
+      # CLAW-127: read-write HERE ONLY; scripts/claw-directive writes it on the Mac.
+      - type: bind
+        source: ${HOME}/Library/Application Support/oasis-x/autoreviewer-console
+        target: /run/console-proposals
       - type: bind
         source: ${HOME}/Library/Application Support/oasis-x/fleet-snapshot
         target: /run/fleet-snapshot

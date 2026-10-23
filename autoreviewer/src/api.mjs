@@ -70,7 +70,8 @@ export function createApi({ ledger, clientMap, bot, ghStore = null, coordinators
       if (req.method === "GET" && url.pathname === "/healthz") return send(200, { ok: true });
 
       const caller = clientMap.botFor(req.socket.remoteAddress);
-      if (!caller) {
+      // "mike" and "console" (CLAW-127) are never network callers, whatever the map says.
+      if (!caller || caller === "mike" || caller === "console") {
         log({ event: "refused_unmapped", address: req.socket.remoteAddress, path: url.pathname });
         return send(403, { error: "caller address is not a mapped fleet bot" });
       }

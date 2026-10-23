@@ -63,6 +63,18 @@ describe("HTTP interface", () => {
     assert.equal((await call(base, "GET", "/healthz")).status, 200);
   });
 
+  it("NEGATIVE CONTROL: a map line that names console or mike is refused (CLAW-127)", async () => {
+    for (const name of ["console", "mike"]) {
+      const base = await start(`127.0.0.1=${name}\n`);
+      const r = await call(base, "POST", "/v1/directives", { bot: "beta", goal: "x" });
+      assert.equal(r.status, 403);
+      assert.equal(s.ledger.list().length, 0);
+      await new Promise((res) => server.close(() => res()));
+      server = undefined;
+      s.cleanup();
+    }
+  });
+
   it("NEGATIVE CONTROL: no route can decide or revoke a grant", async () => {
     const base = await start("127.0.0.1=alpha\n");
     const { body } = await call(base, "POST", "/v1/grants", PROPOSAL);

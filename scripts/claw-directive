@@ -1,0 +1,79 @@
+#!/usr/bin/env node
+// ── claw-directive (CLAW-127) ────────────────────────────────────────────────
+// Claude Code (the host operator, "console") proposes a standing directive for
+// one bot. The autoreviewer opens Mike's normal directive card; the directive is
+// active only after Mike presses Approve. Design: autoreviewer/src/console.mjs.
+//
+//   scripts/claw-directive propose --bot <bot> --goal G [--may M] [--must-not N]
+//                                  [--lane L] [--days D] [--path-prefix /abs ...]
+//   scripts/claw-directive list    proposed and active directives
+//
+// The folder is host-only: the autoreviewer container is the one other mount.
+// This writes <name>.tmp and renames it, then waits up to 30 s for done/<name>.
+
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+const SUPPORT = join(homedir(), "Library", "Application Support", "oasis-x");
+const DIR = process.env.CLAW_DIRECTIVE_DIR || join(SUPPORT, "autoreviewer-console");
+const LEDGER = join(SUPPORT, "approvals", "peer-grants", "peer-grants.json");
+
+function die(msg, code = 2) {
+  console.error(msg);
+  process.exit(code);
+}
+
+function parseArgs(argv) {
+  const out = { path_prefixes: [] };
+  const keys = { "--bot": "bot", "--goal": "goal", "--may": "may", "--must-not": "must_not", "--lane": "lane", "--days": "days", "--path-prefix": "path_prefix" };
+  for (let i = 0; i < argv.length; i += 2) {
+    const k = keys[argv[i]];
+    if (!k || argv[i + 1] === undefined) die(`unknown or empty option: ${argv[i]}`);
+    if (k === "path_prefix") out.path_prefixes.push(argv[i + 1]);
+    else out[k] = argv[i + 1];
+  }
+  return out;
+}
+
+async function propose(argv) {
+  const a = parseArgs(argv);
+  if (!a.bot || !a.goal) die("--bot and --goal are required");
+  const body = { bot: a.bot, goal: a.goal };
+  for (const k of ["may", "must_not", "lane"]) if (a[k]) body[k] = a[k];
+  if (a.days) body.ttl_hours = Math.round(Number(a.days) * 24);
+  if (a.path_prefixes.length) body.path_prefixes = a.path_prefixes;
+
+  mkdirSync(join(DIR, "inbox"), { recursive: true });
+  mkdirSync(join(DIR, "done"), { recursive: true });
+  const name = `${new Date().toISOString().replace(/[:.]/g, "-")}-${randomBytes(4).toString("hex")}.json`;
+  const tmp = join(DIR, "inbox", `${name}.tmp`);
+  writeFileSync(tmp, JSON.stringify(body));
+  renameSync(tmp, join(DIR, "inbox", name));
+
+  const done = join(DIR, "done", name);
+  for (let waited = 0; waited < 30_000; waited += 500) {
+    if (existsSync(done)) {
+      const r = JSON.parse(readFileSync(done, "utf8"));
+      rmSync(done, { force: true });
+      if (!r.ok) die(`refused: ${r.error}${r.id ? ` (${r.id})` : ""}`, 1);
+      console.log(`${r.id} proposed for ${r.bot}: Mike's card is in the autoreviewer chat. Active only after Approve.`);
+      return;
+    }
+    await new Promise((res) => setTimeout(res, 500));
+  }
+  die(`no answer in 30 s; ${name} waits in the inbox. Is the autoreviewer running with AUTOREVIEWER_CONSOLE_DIR?`, 1);
+}
+
+function list() {
+  const data = JSON.parse(readFileSync(LEDGER, "utf8"));
+  const rows = (data.grants ?? []).filter((g) => g.kind === "directive" && ["proposed", "active"].includes(g.status));
+  if (!rows.length) return console.log("no proposed or active directives");
+  for (const d of rows) console.log(`${d.id}  ${d.status.padEnd(8)}  ${d.grantees[0].padEnd(11)}  ${d.expires ?? "-"}  ${d.lane ?? ""}  by ${d.requester}`);
+}
+
+const [cmd, ...rest] = process.argv.slice(2);
+if (cmd === "propose") await propose(rest);
+else if (cmd === "list") list();
+else die("usage: claw-directive propose --bot <bot> --goal G [--may M] [--must-not N] [--lane L] [--days D] [--path-prefix P]... | list");

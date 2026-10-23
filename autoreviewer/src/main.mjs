@@ -15,6 +15,7 @@
 //   AUTOREVIEWER_GH_REQUESTERS        bots that may request GitHub access, comma list
 //   AUTOREVIEWER_MAIL_OUTBOX          this bot's mail outbox (sender "autoreviewer"); unset = no grant notices
 //   AUTOREVIEWER_COORDINATORS         bots that may propose directives for any bot (first one is copied on notices)
+//   AUTOREVIEWER_CONSOLE_DIR          host-only folder for Claude Code's directive proposals (CLAW-127; unset = off)
 //   AUTOREVIEWER_STATE_DIR            writable state (watches.json); default /var/lib/autoreviewer
 //   AUTOREVIEWER_SNAPSHOT             fleet snapshot (scripts/claw-fleet-snapshot.mjs), read-only
 //   HTTPS_PROXY                       the fleet egress proxy, the only route to api.telegram.org
@@ -22,6 +23,7 @@
 import { readFileSync } from "node:fs";
 import { AutoreviewerBot } from "./bot.mjs";
 import { createApi } from "./api.mjs";
+import { ConsoleProposals } from "./console.mjs";
 import { ClientMap } from "./clientmap.mjs";
 import { GithubGrantStore } from "./ghgrants.mjs";
 import { Mailer } from "./mailer.mjs";
@@ -105,6 +107,14 @@ setInterval(() => {
   digest.tick().catch((err) => log({ event: "digest_failed", error: String(err.message ?? err) }));
   watcher.tick().catch((err) => log({ event: "watch_tick_failed", error: String(err.message ?? err) }));
 }, 60_000).unref();
+
+// CLAW-127: Claude Code proposes directives through a host-only folder (unset = off).
+if (env.AUTOREVIEWER_CONSOLE_DIR) {
+  const consoleProposals = new ConsoleProposals(env.AUTOREVIEWER_CONSOLE_DIR, { ledger, bot, log });
+  setInterval(() => {
+    consoleProposals.tick().catch((err) => log({ event: "console_tick_failed", error: String(err.message ?? err) }));
+  }, 5_000).unref();
+}
 
 createApi({ ledger, clientMap, bot, ghStore, coordinators, log }).listen(Number(port), host, () =>
   log({ event: "listening", host, port: Number(port), bots, ttlButtons }),
