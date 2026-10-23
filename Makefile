@@ -286,8 +286,12 @@ semantic-reindex: ## run the semantic-index builder by hand right now (works tod
 SWARM_BIN  ?= $(HOME)/Documents/Runes/dot_swarm/.venv/bin/swarm
 SWARM_ROOT ?= $(abspath ..)
 OBSERVATORY_SNAPSHOT_PLIST := $(HOME)/Library/LaunchAgents/com.oasis-x.observatory-snapshot.plist
+# `serve` flags for `make observe`. The desktop app (CLAW-126) runs
+# `make observatory OBSERVE_FLAGS=`, because its own window shows the page.
+OBSERVE_FLAGS ?= --open
+OBSERVATORY_APP_DEST ?= $(HOME)/Applications
 
-.PHONY: observatory observe observe-open observe-key observatory-rotate-key swarm-open swarm-dashboard control-ui fleet pair observatory-snapshot \
+.PHONY: observatory observatory-app observe observe-open observe-key observatory-rotate-key swarm-open swarm-dashboard control-ui fleet pair observatory-snapshot \
         observatory-snapshot-install observatory-snapshot-status observatory-snapshot-uninstall \
         feedback feedback-show feedback-pull feedback-set
 
@@ -300,7 +304,10 @@ observatory: ## boot the whole observatory: the port proxy (when bots/ has its c
 	@$(MAKE) --no-print-directory observe
 
 observe: ## serve the fleet observatory on 127.0.0.1:18780 (bookmark it) with the swarm dashboard on 18781, and open it (Ctrl-C stops both)
-	OASIS_SWARM_BIN="$(SWARM_BIN)" OASIS_SWARM_ROOT="$(SWARM_ROOT)" node scripts/claw-observatory.mjs serve --open
+	OASIS_SWARM_BIN="$(SWARM_BIN)" OASIS_SWARM_ROOT="$(SWARM_ROOT)" node scripts/claw-observatory.mjs serve $(OBSERVE_FLAGS)
+
+observatory-app: ## build "Fleet Observatory.app" and install it in ~/Applications: one click runs `make observatory` in this checkout (CLAW-126; see scripts/observatory-app/README.md)
+	@scripts/observatory-app/build.sh "$(CURDIR)" "$(OBSERVATORY_APP_DEST)"
 
 observe-open: ## open the running observatory and unlock this browser (after that, the bookmark http://127.0.0.1:18780/ works)
 	@node scripts/claw-observatory.mjs open observatory
