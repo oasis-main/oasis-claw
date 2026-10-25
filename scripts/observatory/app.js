@@ -1340,8 +1340,125 @@ const BOARD_PREVIEW = 12;
 const itemMatches = (i) =>
   (app.work.state === "all" || i.state === app.work.state) && matches(app.work.q, i.id, i.title, i.section);
 
-function itemRow(i) {
-  return h("li", null, h("span", { class: "mono item-id", text: i.id }), h("span", { class: `state s-${cls(i.state)}`, text: i.state }), h("span", { class: "item-title", title: i.title, text: i.title }));
+/** One open item. Hover shows its description (the indented lines under it);
+ *  a click opens it, with its comments, for a comment or an edit. */
+function itemRow(i, botKey) {
+  const tip = i.summary ? `${i.title}\n\n${i.summary}` : i.title;
+  const open = () => botKey && openItemDialog(botKey, i.id);
+  return h(
+    "li",
+    {
+      class: botKey ? "item-link" : null,
+      title: tip,
+      tabindex: botKey ? "0" : null,
+      role: botKey ? "button" : null,
+      onclick: open,
+      onkeydown: (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          open();
+        }
+      },
+    },
+    h("span", { class: "mono item-id", text: i.id }),
+    h("span", { class: `state s-${cls(i.state)}`, text: i.state }),
+    h("span", { class: "item-title", text: i.title }),
+  );
+}
+
+// ── one .swarm item: description, comments, edit (Mike, 2026-10-25) ─────────
+// A comment goes to the item's dot_swarm thread and as a line under the item
+// in queue.md, which the bots read. An edit replaces the title and the body;
+// the server refuses it when a bot changed the item after this panel read it.
+
+async function openItemDialog(botKey, id) {
+  const dialog = h("dialog", { class: "settings-dialog item-dialog", "aria-label": `Item ${id}` });
+  const inner = h("div", { class: "settings-inner" }, placeholder(`Reading ${id}…`));
+  dialog.append(inner);
+  dialog.addEventListener("close", () => dialog.remove());
+  document.body.append(dialog);
+  dialog.showModal();
+  const url = `/api/boards/${encodeURIComponent(botKey)}/items/${encodeURIComponent(id)}`;
+  const post = (body) => api(url, { method: "POST", type: "application/json", body: JSON.stringify(body) });
+  let data;
+  try {
+    data = await api(url);
+  } catch (err) {
+    inner.replaceChildren(errorBox(err));
+    return;
+  }
+  const bot = botByKey(botKey);
+  const draw = (editing = false, note = "") => {
+    const it = data.item;
+    const head = h(
+      "header",
+      { class: "settings-head" },
+      botIcon(bot),
+      h("h2", { class: "grow" }, h("span", { class: "mono", text: `${it.id} ` }), h("span", { text: botLabel(bot) })),
+      h("span", { class: `state s-${cls(it.state)}`, text: it.state }),
+      h("button", { type: "button", class: "button small", text: "Close", onclick: () => dialog.close() }),
+    );
+    const status = h("div", { class: "muted small", role: "status", text: note });
+    if (editing) {
+      const title = h("input", { type: "text", class: "field", value: it.title, maxlength: "4000", "aria-label": "Title" });
+      const body = h("textarea", { class: "field mono", rows: "14", maxlength: "4000", "aria-label": "Description" });
+      body.value = it.body;
+      const save = h("button", {
+        type: "button",
+        class: "button",
+        text: "Save",
+        onclick: async () => {
+          save.disabled = true;
+          try {
+            data = { ...data, ...(await post({ action: "edit", title: title.value, body: body.value, hash: it.hash })) };
+            draw(false, "Saved to queue.md. The bots read it on their next look at the board.");
+          } catch (err) {
+            status.textContent = `Not saved: ${err.message}`;
+            save.disabled = false;
+          }
+        },
+      });
+      inner.replaceChildren(
+        head,
+        h("p", { class: "muted small", text: `${it.section} · queue.md in ${botLabel(bot)}'s board. Blank lines are dropped: the description stays one block.` }),
+        h("div", { class: "profile-form" }, title, body),
+        h("div", { class: "toolbar tight-row" }, save, h("button", { type: "button", class: "button", text: "Cancel", onclick: () => draw(false) }), status),
+      );
+      title.focus();
+      return;
+    }
+    const text = h("textarea", { class: "field", rows: "3", maxlength: "4000", placeholder: "A comment for the bots on this item" });
+    const send = h("button", {
+      type: "button",
+      class: "button",
+      text: "Comment",
+      onclick: async () => {
+        if (!text.value.trim()) return;
+        send.disabled = true;
+        try {
+          data = { ...data, ...(await post({ action: "comment", text: text.value })) };
+          draw(false, "Comment added: in the item's thread and under the item in queue.md.");
+        } catch (err) {
+          status.textContent = `Not sent: ${err.message}`;
+          send.disabled = false;
+        }
+      },
+    });
+    inner.replaceChildren(
+      head,
+      h("p", { class: "item-dialog-title", text: it.title }),
+      h("div", { class: "muted small", text: it.section }),
+      it.body ? h("pre", { class: "text item-body", text: it.body }) : empty("This item has no description lines."),
+      h("div", { class: "toolbar tight-row" }, h("button", { type: "button", class: "button", text: "Edit", onclick: () => draw(true) })),
+      h("h3", { text: `Comments (${data.comments.length})` }),
+      data.comments.length
+        ? h("ol", { class: "comments" }, data.comments.map((c) => h("li", null, h("div", { class: "muted small", text: `${c.agent ?? "?"} · ${when(c.ts)}` }), h("div", { class: "comment-body", text: c.body }))))
+        : empty("No comments yet."),
+      h("div", { class: "profile-form" }, text),
+      h("div", { class: "toolbar tight-row" }, send, status),
+    );
+  };
+  draw();
 }
 
 function boardCard(board, redraw) {
@@ -1373,7 +1490,7 @@ function boardCard(board, redraw) {
     h("div", { class: "path mono small", title: board.hostPath, text: board.hostPath }),
     h("div", { class: "chips" }, Object.entries(s.counts).sort().map(([state, n]) => chip(`${state} ${n}`, tone(state)))),
     s.stateUpdatedMs ? h("div", { class: "muted small", text: `state.md updated ${ago(s.stateUpdatedMs)}` }) : null,
-    shown.length ? h("ul", { class: "items" }, shown.map(itemRow)) : empty(s.open.length ? "No item matches the filter." : "No open items."),
+    shown.length ? h("ul", { class: "items" }, shown.map((i) => itemRow(i, board.key))) : empty(s.open.length ? "No item matches the filter." : "No open items."),
     items.length > BOARD_PREVIEW
       ? h("button", { type: "button", class: "more", text: expanded ? "Show fewer" : `Show all ${items.length}`, onclick: toggle })
       : null,

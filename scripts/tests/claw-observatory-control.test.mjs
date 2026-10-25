@@ -201,3 +201,99 @@ test("the cron and decide routes: token, Origin, argv, and the openclaw.json gua
     server.close();
   }
 });
+
+test("an unfilled IDENTITY.md template field is no name or emoji", async () => {
+  const { collectIdentity } = await import("../claw-observatory.mjs");
+  const home = tmp("obs-ident-tpl-");
+  fs.mkdirSync(path.join(home, "workspace"));
+  fs.writeFileSync(path.join(home, "workspace", "IDENTITY.md"), "- **Name:** _(pick something you like)_\n- **Emoji:** _(your signature — pick one)_\n");
+  const id = collectIdentity(fs, path, home, "/nonexistent");
+  assert.equal(id.name, null);
+  assert.equal(id.emoji, null);
+  fs.writeFileSync(path.join(home, "workspace", "IDENTITY.md"), "- **Name:** Mr. House\n- **Emoji:** 🎰\n");
+  assert.deepEqual([collectIdentity(fs, path, home, "/nonexistent").name, collectIdentity(fs, path, home, "/nonexistent").emoji], ["Mr. House", "🎰"]);
+});
+
+const QUEUE = [
+  "# Queue",
+  "## Active",
+  "- [ ] [ORG-1] [OPEN] First item",
+  "      priority: high | project: x",
+  "      notes: line one",
+  "             line two",
+  "- [>] [ORG-2] Second item",
+  "",
+  "## Done",
+  "- [x] [ORG-3] Done item",
+  "      notes: kept",
+].join("\n");
+
+test(".swarm items: body, summary, edit with a hash check, comment line", async () => {
+  const { parseQueueItems, itemSummary, replaceItem, appendItemComment, swarmCommentRecord } = await import("../claw-observatory.mjs");
+  const { items } = parseQueueItems(QUEUE);
+  assert.deepEqual(items.map((i) => [i.id, i.end - i.start]), [["ORG-1", 4], ["ORG-2", 1], ["ORG-3", 2]]);
+  assert.equal(items[0].body, "priority: high | project: x\nnotes: line one\n       line two");
+  assert.equal(itemSummary(items[0].body), "priority: high | project: x notes: line one line two");
+  const edited = replaceItem(QUEUE, "ORG-1", { title: "[OPEN] Renamed", body: "priority: low\n\nnotes: new", hash: items[0].hash });
+  assert.match(edited.text, /- \[ \] \[ORG-1\] \[OPEN\] Renamed\n      priority: low\n      notes: new\n- \[>\] \[ORG-2\]/);
+  assert.equal(replaceItem(QUEUE, "ORG-1", { title: "x", body: "", hash: "stale" }).status, 409);
+  assert.equal(replaceItem(QUEUE, "ORG-9", { title: "x", body: "", hash: "h" }).status, 404);
+  const commented = appendItemComment(QUEUE, "ORG-2", "► Mike: look");
+  assert.match(commented.text, /- \[>\] \[ORG-2\] Second item\n      ► Mike: look\n\n## Done/);
+  const rec = swarmCommentRecord("ORG-1", "mike", "hi", new Date("2026-10-25T12:00:00.123Z"));
+  assert.equal(rec.timestamp, "2026-10-25T12:00:00Z");
+  assert.equal(rec.signature, "unsigned");
+  assert.equal(rec.comment_id.length, 12);
+});
+
+test("the board item route reads, comments and edits only a discovered board", async () => {
+  const board = tmp("obs-board-");
+  fs.writeFileSync(path.join(board, "queue.md"), QUEUE);
+  const ctx = {
+    token: "t".repeat(32),
+    discover: async () => ({ bots: [{ key: "house", container: "oasis-claw-house", running: true, state: "running", board: { hostPath: board } }], proxy: null }),
+    swarm: { port: 1, url: "http://127.0.0.1:1/" },
+    snapshotDir: tmp("obs-empty-"),
+    mailRoot: tmp("obs-mail-empty-"),
+    identities: identityStore(tmp("obs-ident-")),
+    readIdentity: async () => ({ name: null, role: null, avatar: null }),
+    settings: settingsStore(path.join(tmp("obs-set-"), "settings.json")),
+  };
+  const server = createObservatoryServer(ctx);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  ctx.port = server.address().port;
+  const own = `http://127.0.0.1:${ctx.port}`;
+  const call = (pathname, { method = "GET", body, origin = own } = {}) =>
+    new Promise((resolve, reject) => {
+      const headers = { host: `127.0.0.1:${ctx.port}`, "x-observatory-token": ctx.token };
+      if (method !== "GET" && origin) headers.origin = origin;
+      const r = http.request({ host: "127.0.0.1", port: ctx.port, path: pathname, method, headers, agent: false }, (res) => {
+        let text = "";
+        res.on("data", (c) => (text += c));
+        res.on("end", () => resolve({ status: res.statusCode, json: JSON.parse(text || "null") }));
+      });
+      r.on("error", reject);
+      r.end(body);
+    });
+  try {
+    const got = await call("/api/boards/house/items/ORG-1");
+    assert.equal(got.status, 200);
+    assert.equal(got.json.item.title, "[OPEN] First item");
+    assert.equal((await call("/api/boards/nimbus/items/ORG-1")).status, 404);
+    assert.equal((await call("/api/boards/house/items/ORG-1", { method: "POST", origin: null, body: "{}" })).status, 403);
+
+    const c = await call("/api/boards/house/items/ORG-1", { method: "POST", body: JSON.stringify({ action: "comment", text: "Please split this\ninto two" }) });
+    assert.equal(c.status, 200);
+    assert.equal(c.json.comments.at(-1).body, "Please split this\ninto two");
+    assert.match(fs.readFileSync(path.join(board, "queue.md"), "utf8"), /line two\n      ► Mike \(\d{4}-\d{2}-\d{2}, observatory\): Please split this \/ into two\n- \[>\]/);
+
+    const stale = await call("/api/boards/house/items/ORG-1", { method: "POST", body: JSON.stringify({ action: "edit", title: "x", body: "", hash: got.json.item.hash }) });
+    assert.equal(stale.status, 409, "the comment changed the block, so the old hash is stale");
+    const fresh = await call("/api/boards/house/items/ORG-1", { method: "POST", body: JSON.stringify({ action: "edit", title: "[OPEN] Split", body: "notes: two parts", hash: c.json.item.hash }) });
+    assert.equal(fresh.status, 200);
+    assert.equal(fresh.json.item.body, "notes: two parts");
+    assert.equal((await call("/api/boards/house/items/ORG-1", { method: "POST", body: JSON.stringify({ action: "edit", title: "a\nb", body: "", hash: fresh.json.item.hash }) })).status, 400);
+  } finally {
+    server.close();
+  }
+});

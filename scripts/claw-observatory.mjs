@@ -41,7 +41,8 @@
 //      key), openclaw.json, tokens, or transcripts.
 //   5. The only writes the API takes are change requests (/api/feedback),
 //      the Control UI open and approve (item 7), the settings (item 8), and
-//      the decisions and cron changes (item 9).
+//      the decisions and cron changes (item 9), and .swarm item comments
+//      and edits (item 10).
 //      A write needs the token AND this page's Origin. The requests and their screenshots stay in the
 //      state folder, which no bot mounts: a screenshot can show any agent's
 //      memory.
@@ -70,6 +71,11 @@
 //      before and after. Both need the token AND this page's Origin (item 5).
 //      Bots still cannot reach either: they have no token, and no bot mounts
 //      the decision folder.
+//  10. .swarm items (Mike, 2026-10-25). POST /api/boards/<bot>/items/<ID>
+//      adds a comment (to the dot_swarm thread file and as a line in the
+//      item's queue.md block, which the bots read) or replaces one item's
+//      title and body when its block hash still matches. Only a bot board
+//      that fleet discovery found is writable; token + Origin as item 5.
 //   6. `serve` also starts the dot_swarm dashboard (`swarm gui`, 18781), where
 //      the human claims, finishes, blocks and comments on items. A bot can
 //      reach that port too, so the observatory starts it only after it proves
@@ -749,7 +755,7 @@ export function collectProfile(fs, path, home) {
   const createdAtMs = typeof device?.createdAtMs === "number" ? device.createdAtMs : null;
 
   const identity = doc("IDENTITY.md", 8000);
-  const nameMatch = identity ? identity.text.match(/\*\*Name:?\*\*:?\s*(.+)/i) : null;
+  const nameMatch = identity ? identity.text.match(/\*\*Name:?\*\*:?\s*(?!_?\()(.+)/i) : null;
 
   const phases = {};
   for (const phase of ["light", "rem", "deep"]) {
@@ -1021,9 +1027,12 @@ export function collectIdentity(fs, path, home, rolePath = "/app/role.yaml") {
     }
   };
   const text = (readFile(path.join(W, "IDENTITY.md"), 256 * 1024) || Buffer.alloc(0)).toString("utf8");
+  // An unfilled openclaw template field, such as "_(pick something you like)_",
+  // is no value: the page then falls back to the agent name and its initial.
   const field = (re) => {
     const m = text.match(re);
-    return m ? m[1].trim() : null;
+    const v = m ? m[1].trim() : "";
+    return v && !/^_?\(.*\)_?$/.test(v) ? v : null;
   };
   const clip = (s, n) => (s == null ? null : Array.from(s).slice(0, n).join(""));
   const avatarRel = field(/^\s*[-*]\s*\*\*Avatar:\*\*\s*(.+)$/im);
@@ -1107,7 +1116,7 @@ export function collectSnapshot(fs, path, home) {
   } catch {
     createdAtMs = null;
   }
-  const nameMatch = String(files["IDENTITY.md"] ?? "").match(/\*\*Name:?\*\*:?\s*(.+)/i);
+  const nameMatch = String(files["IDENTITY.md"] ?? "").match(/\*\*Name:?\*\*:?\s*(?!_?\()(.+)/i);
   return {
     files,
     skipped,
@@ -1148,6 +1157,7 @@ export function boardSummary(swarmDir) {
   const open = [];
   let openTotal = 0;
   let section = "";
+  const bodies = new Map(parseQueueItems(queue).items.map((it) => [it.id, it.body]));
   for (const line of queue.split("\n")) {
     const heading = line.match(/^##\s+(.+?)\s*$/);
     if (heading) {
@@ -1163,7 +1173,7 @@ export function boardSummary(swarmDir) {
     if (state !== "done" && state !== "cancelled" && !/^done/i.test(section)) {
       openTotal += 1;
       if (open.length < 500) {
-        open.push({ id: m[2], state, section, title: m[3].replace(/\*\*/g, "").slice(0, 240) });
+        open.push({ id: m[2], state, section, title: m[3].replace(/\*\*/g, "").slice(0, 240), summary: itemSummary(bodies.get(m[2])) });
       }
     }
   }
@@ -1174,6 +1184,207 @@ export function boardSummary(swarmDir) {
     stateUpdatedMs = null;
   }
   return { counts, open, openTotal, stateUpdatedMs };
+}
+
+// ── .swarm item details, comments and edits (Mike, 2026-10-25) ───────────────
+// "Hover tooltips for the human-level description of each .swarm item and the
+// ability to send comments on them and edits for the bots." An item is its
+// `- [x] [ID] title` line plus the more-indented lines under it (priority,
+// notes, refs, ...). A comment goes two places: the item's dot_swarm thread
+// (.swarm/comments/<ID>.jsonl, the format of `swarm comment`, unsigned), and an
+// indented line in the item's queue.md block, because the bots' swarm tools
+// read only state.md and queue.md. An edit replaces the title and the body of
+// one item, only when the block still has the hash the page read (a bot may
+// have changed it since). Writes are temp file + rename inside the .swarm
+// directory, one at a time per file. Only bot boards from fleet discovery are
+// writable (TRUST MODEL item 10).
+const ITEM_LINE_RE = /^(\s*)- \[(.)\] \[([A-Za-z][A-Za-z0-9]*-[A-Za-z0-9]+)\]\s*(.*)$/;
+const ITEM_ID_RE = /^[A-Za-z][A-Za-z0-9]*-[A-Za-z0-9]{1,20}$/;
+const BOARD_ITEM_PATH_RE = /^\/api\/boards\/([a-z0-9-]{1,40})\/items\/([A-Za-z][A-Za-z0-9]*-[A-Za-z0-9]{1,20})$/;
+const isBoardWrite = (method, pathname) => method === "POST" && BOARD_ITEM_PATH_RE.test(pathname);
+const ITEM_TEXT_MAX = 4000;
+const blockHash = (lines) => crypto.createHash("sha256").update(lines.join("\n")).digest("hex").slice(0, 16);
+
+/** Every item in queue.md with its line range and body. */
+export function parseQueueItems(text) {
+  const lines = text.split("\n");
+  const items = [];
+  let section = "";
+  for (let i = 0; i < lines.length; i++) {
+    const heading = lines[i].match(/^##\s+(.+?)\s*$/);
+    if (heading) {
+      section = heading[1];
+      continue;
+    }
+    const m = lines[i].match(ITEM_LINE_RE);
+    if (!m) continue;
+    const indent = m[1].length;
+    let end = i + 1;
+    while (end < lines.length) {
+      const l = lines[end];
+      if (!l.trim() || ITEM_LINE_RE.test(l) || /^##\s/.test(l)) break;
+      if (l.length - l.trimStart().length <= indent) break;
+      end++;
+    }
+    const bodyLines = lines.slice(i + 1, end);
+    const bodyIndent = bodyLines.length ? Math.min(...bodyLines.map((l) => l.length - l.trimStart().length)) : indent + 6;
+    items.push({
+      id: m[3],
+      mark: m[2],
+      state: ITEM_STATES[m[2]] ?? `[${m[2]}]`,
+      section,
+      title: m[4],
+      body: bodyLines.map((l) => l.slice(bodyIndent)).join("\n"),
+      start: i,
+      end,
+      indent,
+      bodyIndent,
+      hash: blockHash(lines.slice(i, end)),
+    });
+  }
+  return { lines, items };
+}
+
+/** A one-paragraph description for a tooltip: the body, whitespace folded. */
+export function itemSummary(body, max = 400) {
+  const s = String(body ?? "").replace(/\s+/g, " ").trim();
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+function cleanItemText(v, { multiline }) {
+  if (typeof v !== "string") return null;
+  const s = v.replace(/\r\n?/g, "\n").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "");
+  if (!multiline && s.includes("\n")) return null;
+  return s.length <= ITEM_TEXT_MAX ? s : null;
+}
+
+/** queue.md text with one item's title and body replaced. */
+export function replaceItem(text, id, { title, body, hash }) {
+  const { lines, items } = parseQueueItems(text);
+  const it = items.find((x) => x.id === id);
+  if (!it) return { error: `no item ${id} in queue.md`, status: 404 };
+  if (it.hash !== hash) return { error: `${id} changed after this page read it. Reload it, then edit again.`, status: 409, current: it };
+  const pad = " ".repeat(it.bodyIndent);
+  const head = lines[it.start].replace(ITEM_LINE_RE, (_all, ind, mark, itemId) => `${ind}- [${mark}] [${itemId}] ${title.trim()}`);
+  const bodyLines = body.trim() ? body.replace(/\s+$/, "").split("\n").map((l) => (l.trim() ? pad + l : "")) : [];
+  // A blank line would end the block early: keep the body one block.
+  const kept = bodyLines.filter((l) => l !== "");
+  lines.splice(it.start, it.end - it.start, head, ...kept);
+  return { text: lines.join("\n") };
+}
+
+/** queue.md text with a comment line added at the end of one item's block. */
+export function appendItemComment(text, id, line) {
+  const { lines, items } = parseQueueItems(text);
+  const it = items.find((x) => x.id === id);
+  if (!it) return { error: `no item ${id} in queue.md`, status: 404 };
+  lines.splice(it.end, 0, " ".repeat(it.bodyIndent) + line);
+  return { text: lines.join("\n") };
+}
+
+/** One record in the dot_swarm comment format (comments.py, unsigned). */
+export function swarmCommentRecord(itemId, agentId, body, now = new Date()) {
+  const timestamp = now.toISOString().replace(/\.\d{3}Z$/, "Z");
+  const commentId = crypto.createHash("sha256").update(`${itemId}|${agentId}|${timestamp}|${body}`).digest("hex").slice(0, 12);
+  return { comment_id: commentId, item_id: itemId, agent_id: agentId, body, timestamp, in_reply_to: "", signature: "unsigned" };
+}
+
+export function readItemComments(swarmDir, id) {
+  try {
+    return fs
+      .readFileSync(path.join(swarmDir, "comments", `${id}.jsonl`), "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => {
+        try {
+          const c = JSON.parse(l);
+          return { id: c.comment_id ?? null, agent: c.agent_id ?? null, body: String(c.body ?? "").slice(0, ITEM_TEXT_MAX), ts: c.timestamp ?? null };
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean)
+      .slice(-200);
+  } catch {
+    return [];
+  }
+}
+
+function writeAtomic(file, text) {
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.observatory-${process.pid}-${crypto.randomBytes(3).toString("hex")}`);
+  const mode = fs.statSync(file).mode & 0o777;
+  fs.writeFileSync(tmp, text, { mode });
+  fs.renameSync(tmp, file);
+}
+
+const boardLocks = new Map();
+/** Run fn after any earlier write to the same file has finished. */
+function withBoardLock(file, fn) {
+  const prev = boardLocks.get(file) ?? Promise.resolve();
+  const next = prev.then(fn, fn);
+  boardLocks.set(file, next.catch(() => {}));
+  return next;
+}
+
+/** /api/boards/<bot>/items/<ID>  GET   the item (title, body, hash) and its comments
+ *                                 POST  { action: "comment", text } | { action: "edit", title, body, hash } */
+async function routeBoardItem(req, url, ctx) {
+  const [, key, id] = BOARD_ITEM_PATH_RE.exec(url.pathname) ?? [];
+  if (!key || !ITEM_ID_RE.test(id)) return [404, { error: "not found" }];
+  const fleet = await cached(ctx, "fleet", 4000, ctx.discover);
+  const bot = fleet.bots.find((b) => b.key === key);
+  const dir = bot?.board?.hostPath;
+  if (!dir) return [404, { error: `${key} has no .swarm board` }];
+  const queueFile = path.join(dir, "queue.md");
+  const readItem = () => {
+    const st = fs.lstatSync(queueFile);
+    if (!st.isFile() || st.size > 16 * 1024 * 1024) throw Object.assign(new Error("queue.md is not a regular file under 16 MB"), { status: 409 });
+    const text = fs.readFileSync(queueFile, "utf8");
+    return { text, item: parseQueueItems(text).items.find((x) => x.id === id) ?? null };
+  };
+  const view = (it) => ({ id: it.id, state: it.state, section: it.section, title: it.title, body: it.body, hash: it.hash });
+  if (req.method === "GET") {
+    const { item } = readItem();
+    if (!item) return [404, { error: `no item ${id} in ${key}'s queue.md` }];
+    return [200, { bot: key, item: view(item), comments: readItemComments(dir, id) }];
+  }
+  if (req.method !== "POST") return [405, { error: "method not allowed here" }];
+  let body;
+  try {
+    body = JSON.parse((await readBody(req, 32 * 1024)).toString("utf8"));
+  } catch (err) {
+    if (err.status) throw err;
+    return [400, { error: "the body is not valid JSON" }];
+  }
+  return withBoardLock(queueFile, async () => {
+    const { text, item } = readItem();
+    if (!item) return [404, { error: `no item ${id} in ${key}'s queue.md` }];
+    const day = new Date().toISOString().slice(0, 10);
+    if (body?.action === "comment") {
+      const note = cleanItemText(body.text, { multiline: true });
+      if (!note || !note.trim()) return [400, { error: `text: 1-${ITEM_TEXT_MAX} characters` }];
+      const r = appendItemComment(text, id, `► Mike (${day}, observatory): ${note.trim().replace(/\s*\n\s*/g, " / ")}`);
+      if (r.error) return [r.status, { error: r.error }];
+      writeAtomic(queueFile, r.text);
+      const rec = swarmCommentRecord(id, "mike", note.trim());
+      fs.mkdirSync(path.join(dir, "comments"), { recursive: true });
+      fs.appendFileSync(path.join(dir, "comments", `${id}.jsonl`), `${JSON.stringify(rec)}\n`);
+      ctx.cache.delete("boards");
+    } else if (body?.action === "edit") {
+      const title = cleanItemText(body.title, { multiline: false });
+      const itemBody = cleanItemText(body.body, { multiline: true });
+      if (!title || !title.trim()) return [400, { error: "title: one line, 1-4000 characters" }];
+      if (itemBody === null) return [400, { error: `body: at most ${ITEM_TEXT_MAX} characters` }];
+      if (typeof body.hash !== "string") return [400, { error: "hash: the hash the page read" }];
+      const r = replaceItem(text, id, { title, body: itemBody, hash: body.hash });
+      if (r.error) return [r.status, { error: r.error, ...(r.current ? { current: view(r.current) } : {}) }];
+      writeAtomic(queueFile, r.text);
+    } else {
+      return [400, { error: "action: comment or edit" }];
+    }
+    const after = readItem().item;
+    return [200, { ok: true, item: after ? view(after) : null, comments: readItemComments(dir, id) }];
+  });
 }
 
 function readEnvelopes(dir, max = 5000) {
@@ -2010,6 +2221,7 @@ export function checkRequest(req, port) {
     isSettingsWrite(req.method, pathname) ||
     isGenrouteWrite(req.method, pathname) ||
     isCronWrite(req.method, pathname) ||
+    isBoardWrite(req.method, pathname) ||
     (req.method === "POST" && pathname === DECIDE_PATH);
   if (!WRITE_METHODS.has(req.method) || !writable) {
     return { status: 405, error: "read-only" };
@@ -3244,6 +3456,16 @@ export function createObservatoryServer(ctx) {
       routeGenroute(req, url, ctx).then(
         ([status, body]) => sendJson(res, status, body),
         (err) => sendJson(res, err.status ?? 502, { error: err.message }),
+      );
+      return;
+    }
+    if (BOARD_ITEM_PATH_RE.test(url.pathname)) {
+      routeBoardItem(req, url, ctx).then(
+        ([status, body]) => sendJson(res, status, body),
+        (err) => {
+          if (err.status === 413) res.once("finish", () => req.destroy());
+          sendJson(res, err.status ?? 502, { error: err.message });
+        },
       );
       return;
     }
