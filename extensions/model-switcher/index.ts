@@ -1,4 +1,10 @@
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { runCron } from "./cron.js";
 import { label, parseRouteArg, renderRouteStatus, resolveApiKey, routeRequest, type RouteTarget, type SelfRoute } from "./genroute.js";
 import { z } from "zod";
 
@@ -452,9 +458,42 @@ const plugin = {
       },
     });
 
+    // ── /cron: this bot's cron jobs and a model per job (see cron.ts) ──
+    const configFile = join(process.env.OPENCLAW_STATE_DIR || join(homedir(), ".openclaw"), "openclaw.json");
+    apiAny.registerCommand({
+      name: "cron",
+      description:
+        "This bot's cron jobs: list, show, on/off, run now, and a model per job. Usage: /cron | /cron model <n> <model|chat> | /cron help",
+      acceptsArgs: true,
+      requireAuth: true,
+      handler: async (ctx) => {
+        const text = await runCron(ctx.args ?? "", {
+          cli: (args) =>
+            new Promise((resolve, reject) =>
+              execFile("openclaw", ["cron", ...args], { timeout: 90_000, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) =>
+                err ? reject(new Error(String(stderr || err.message).trim().split("\n").slice(-2).join(" "))) : resolve(stdout),
+              ),
+            ),
+          models: () => {
+            const cfg = runtime.config.current() as AnyConfig & { agents?: { defaults?: { models?: Record<string, unknown> } } };
+            return { chat: readPrimary(cfg) ?? null, allowed: Object.keys(cfg.agents?.defaults?.models ?? {}).sort() };
+          },
+          configFingerprint: () => {
+            try {
+              return createHash("sha256").update(readFileSync(configFile)).digest("hex");
+            } catch {
+              return "missing";
+            }
+          },
+        }).catch((err: Error) => `⚠️ /cron failed: ${err.message}`);
+        api.logger.info("model-switcher: /cron", { args: (ctx.args ?? "").trim().split(/\s+/).slice(0, 2).join(" ") });
+        return { text };
+      },
+    });
+
     api.logger.info("model-switcher plugin loaded", {
       tools: ["switch_model", "current_model", "list_model_tiers"],
-      commands: ["/setmodel", "/genroute"],
+      commands: ["/setmodel", "/genroute", "/cron"],
       allowedProviders: allowedProviders ?? "(unrestricted)",
       tierProviders: Object.keys(TIER_CATALOG),
     });
