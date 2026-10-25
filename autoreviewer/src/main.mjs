@@ -16,6 +16,7 @@
 //   AUTOREVIEWER_MAIL_OUTBOX          this bot's mail outbox (sender "autoreviewer"); unset = no grant notices
 //   AUTOREVIEWER_COORDINATORS         bots that may propose directives for any bot (first one is copied on notices)
 //   AUTOREVIEWER_CONSOLE_DIR          host-only folder for Claude Code's directive proposals (CLAW-127; unset = off)
+//   AUTOREVIEWER_DECISION_DIR         host-only folder for Mike's decisions from the fleet observatory (unset = off)
 //   AUTOREVIEWER_STATE_DIR            writable state (watches.json); default /var/lib/autoreviewer
 //   AUTOREVIEWER_SNAPSHOT             fleet snapshot (scripts/claw-fleet-snapshot.mjs), read-only
 //   HTTPS_PROXY                       the fleet egress proxy, the only route to api.telegram.org
@@ -24,6 +25,7 @@ import { readFileSync } from "node:fs";
 import { AutoreviewerBot } from "./bot.mjs";
 import { createApi } from "./api.mjs";
 import { ConsoleProposals } from "./console.mjs";
+import { ObservatoryDecisions } from "./decisions.mjs";
 import { ClientMap } from "./clientmap.mjs";
 import { GithubGrantStore } from "./ghgrants.mjs";
 import { Mailer } from "./mailer.mjs";
@@ -114,6 +116,14 @@ if (env.AUTOREVIEWER_CONSOLE_DIR) {
   setInterval(() => {
     consoleProposals.tick().catch((err) => log({ event: "console_tick_failed", error: String(err.message ?? err) }));
   }, 5_000).unref();
+}
+
+// Mike decides from the fleet observatory too, through a host-only folder (unset = off).
+if (env.AUTOREVIEWER_DECISION_DIR) {
+  const decisions = new ObservatoryDecisions(env.AUTOREVIEWER_DECISION_DIR, { ledger, ghStore, bot, log });
+  setInterval(() => {
+    decisions.tick().catch((err) => log({ event: "decision_tick_failed", error: String(err.message ?? err) }));
+  }, 2_000).unref();
 }
 
 createApi({ ledger, clientMap, bot, ghStore, coordinators, log }).listen(Number(port), host, () =>

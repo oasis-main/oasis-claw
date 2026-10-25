@@ -40,7 +40,8 @@
 //   4. The snapshot never copies identity/device.json (the device private
 //      key), openclaw.json, tokens, or transcripts.
 //   5. The only writes the API takes are change requests (/api/feedback),
-//      the Control UI open and approve (item 7), and the settings (item 8).
+//      the Control UI open and approve (item 7), the settings (item 8), and
+//      the decisions and cron changes (item 9).
 //      A write needs the token AND this page's Origin. The requests and their screenshots stay in the
 //      state folder, which no bot mounts: a screenshot can show any agent's
 //      memory.
@@ -58,6 +59,17 @@
 //      in the state folder. PUT /api/settings keeps the user profile and the
 //      swarm parameters there too. Nothing here reads or writes any other
 //      bot file.
+//   9. Decisions and cron (Mike, 2026-10-25: "browse and modify cron jobs,
+//      standing directives, and open permissions asks"). POST
+//      /api/approvals/decide writes one decision file into a folder that only
+//      the Mac and the autoreviewer container mount; the autoreviewer stays the
+//      only ledger writer and edits the Telegram card, so the Telegram card and
+//      this page are two doors to one decision. POST /api/cron/<bot>/<id> runs
+//      the bot's own `openclaw cron edit|run|rm` over `docker exec`, with argv
+//      only (no shell), checked values, and an openclaw.json fingerprint
+//      before and after. Both need the token AND this page's Origin (item 5).
+//      Bots still cannot reach either: they have no token, and no bot mounts
+//      the decision folder.
 //   6. `serve` also starts the dot_swarm dashboard (`swarm gui`, 18781), where
 //      the human claims, finishes, blocks and comments on items. A bot can
 //      reach that port too, so the observatory starts it only after it proves
@@ -1992,7 +2004,14 @@ export function checkRequest(req, port) {
     return null;
   }
   const pathname = String(req.url ?? "").split("?")[0];
-  if (!WRITE_METHODS.has(req.method) || !(isFeedbackPath(pathname) || isControlUiWrite(pathname) || isSettingsWrite(req.method, pathname) || isGenrouteWrite(req.method, pathname))) {
+  const writable =
+    isFeedbackPath(pathname) ||
+    isControlUiWrite(pathname) ||
+    isSettingsWrite(req.method, pathname) ||
+    isGenrouteWrite(req.method, pathname) ||
+    isCronWrite(req.method, pathname) ||
+    (req.method === "POST" && pathname === DECIDE_PATH);
+  if (!WRITE_METHODS.has(req.method) || !writable) {
     return { status: 405, error: "read-only" };
   }
   // A browser always sends Origin with a POST, PUT or DELETE fetch. A write
@@ -2440,10 +2459,11 @@ async function routeControlUi(req, url, ctx) {
 }
 
 // ── approvals panel (CLAW-122 slice 2) ────────────────────────────────────────
-// Read-only view of everything Mike approves: peer grants (autoreviewer bot),
-// GitHub access requests and the minter's result, the infra ledger, and the
-// approval-card outcomes in the fleet snapshot. Decisions stay in Telegram:
-// this page has no approve route, so there is one authenticated decision path.
+// Everything Mike approves: peer grants (autoreviewer bot), GitHub access
+// requests and the minter's result, the infra ledger, and the approval-card
+// outcomes in the fleet snapshot. Since 2026-10-25 Mike also decides here: see
+// "decisions from this page" below (TRUST MODEL item 9). The infra ledger stays
+// read-only here (scripts/claw-approvals on the Mac).
 const OASIS_SUPPORT = path.join(HOME, "Library", "Application Support", "oasis-x");
 
 function readJsonQuiet(file, fallback) {
@@ -2516,7 +2536,476 @@ export function readApprovals(support = OASIS_SUPPORT, now = Date.now()) {
   } catch {
     telegram = null;
   }
-  return { generated_at: new Date(now).toISOString(), snapshot_at: snap?.generated_at ?? null, today: snap?.today ?? null, telegram, brief, directives, work, grants, github, infra, cards };
+  return { generated_at: new Date(now).toISOString(), snapshot_at: snap?.generated_at ?? null, today: snap?.today ?? null, telegram, brief, directives, directiveBots: directiveBots(), work, grants, github, infra, cards };
+}
+
+// ── decisions from this page (Mike, 2026-10-25) ──────────────────────────────
+// Mike: "browse and modify ... standing directives, and open permissions asks"
+// from the observatory. This page writes one decision file into a folder that
+// only the Mac and the autoreviewer container mount (TRUST MODEL item 9). The
+// autoreviewer stays the only ledger writer: it runs the same ledger call as
+// the Telegram button, edits the card and mails the bots
+// (autoreviewer/src/decisions.mjs). This server checks the shape only; the
+// ledger keeps every limit (24 h grants, 7 d directives, proposed-only decide).
+export const DECISION_DIR = process.env.OASIS_AUTOREVIEWER_DECISION_DIR || path.join(OASIS_SUPPORT, "autoreviewer-decisions");
+const DECIDE_PATH = "/api/approvals/decide";
+const DECIDE_WAIT_MS = 20_000;
+const GRANT_ID_RE = /^(?:GRANT|DIR)-\d{4,}$/;
+const GH_ID_RE = /^GH-\d{4,}$/;
+
+/** Check one decision and return the body for the autoreviewer, or { error }. */
+export function validateDecision(b) {
+  if (!b || typeof b !== "object" || Array.isArray(b)) return { error: "the body must be a JSON object" };
+  const str = (v, max) => typeof v === "string" && v.length <= max;
+  const hours = (v, max) => Number.isFinite(v) && v > 0 && v <= max;
+  switch (b.op) {
+    case "decide":
+      if (!GRANT_ID_RE.test(String(b.id ?? ""))) return { error: "id: GRANT-NNNN or DIR-NNNN" };
+      if (b.hours !== null && !hours(b.hours, 168)) return { error: "hours: null (deny) or 1-168" };
+      return { op: "decide", id: b.id, hours: b.hours };
+    case "revoke":
+      if (!GRANT_ID_RE.test(String(b.id ?? ""))) return { error: "id: GRANT-NNNN or DIR-NNNN" };
+      if (b.reason !== undefined && !str(b.reason, 200)) return { error: "reason: at most 200 characters" };
+      return { op: "revoke", id: b.id, reason: b.reason ?? "revoked from the observatory" };
+    case "renew":
+      if (!/^DIR-\d{4,}$/.test(String(b.id ?? ""))) return { error: "id: DIR-NNNN" };
+      if (!hours(b.hours, 168)) return { error: "hours: 1-168" };
+      return { op: "renew", id: b.id, hours: b.hours };
+    case "gh-decide":
+      if (!GH_ID_RE.test(String(b.id ?? ""))) return { error: "id: GH-NNNN" };
+      if (typeof b.approve !== "boolean") return { error: "approve: true or false" };
+      return { op: "gh-decide", id: b.id, approve: b.approve };
+    case "gh-revoke":
+      if (!GH_ID_RE.test(String(b.id ?? ""))) return { error: "id: GH-NNNN" };
+      return { op: "gh-revoke", id: b.id };
+    case "directive": {
+      if (!/^[a-z0-9-]{1,40}$/.test(String(b.bot ?? ""))) return { error: "bot: a bot key" };
+      if (!str(b.goal, 300) || !b.goal.trim()) return { error: "goal: 1-300 characters" };
+      const out = { op: "directive", bot: b.bot, goal: b.goal };
+      for (const [k, max] of [["may", 600], ["must_not", 600], ["lane", 80]]) {
+        if (b[k] === undefined || b[k] === "") continue;
+        if (!str(b[k], max)) return { error: `${k}: at most ${max} characters` };
+        out[k] = b[k];
+      }
+      if (b.ttl_hours !== undefined) {
+        if (!hours(b.ttl_hours, 168)) return { error: "ttl_hours: 1-168" };
+        out.ttl_hours = b.ttl_hours;
+      }
+      return out;
+    }
+    default:
+      return { error: "op: decide, revoke, renew, gh-decide, gh-revoke or directive" };
+  }
+}
+
+/** Write one decision for the autoreviewer and wait for its result. A decision
+ *  the autoreviewer has not picked up when the wait ends is taken back, so a
+ *  stopped autoreviewer cannot apply it hours later. */
+export async function submitDecision(body, { dir = DECISION_DIR, waitMs = DECIDE_WAIT_MS } = {}) {
+  const inbox = path.join(dir, "inbox");
+  const done = path.join(dir, "done");
+  fs.mkdirSync(inbox, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(done, { recursive: true, mode: 0o700 });
+  const name = `${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomBytes(4).toString("hex")}.json`;
+  const tmp = path.join(inbox, `${name}.tmp`);
+  fs.writeFileSync(tmp, JSON.stringify(body), { mode: 0o600 });
+  fs.renameSync(tmp, path.join(inbox, name));
+  const result = path.join(done, name);
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    if (fs.existsSync(result)) {
+      const r = readJsonQuiet(result, { ok: false, error: "the autoreviewer wrote an unreadable result" });
+      fs.rmSync(result, { force: true });
+      return r;
+    }
+    if (Date.now() > deadline) {
+      try {
+        fs.rmSync(path.join(inbox, name));
+        return { ok: false, error: `the autoreviewer did not answer in ${Math.round(waitMs / 1000)} s; nothing was decided. Is oasis-autoreviewer running?` };
+      } catch {
+        // It took the file in the last moment: wait a little for the result.
+        if (Date.now() > deadline + 5000) return { ok: false, error: "the autoreviewer took the decision but wrote no result yet; check the Telegram card" };
+      }
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
+
+async function routeDecide(req, ctx) {
+  if (req.method !== "POST") return [405, { error: "method not allowed here" }];
+  let raw;
+  try {
+    raw = JSON.parse((await readBody(req, 8 * 1024)).toString("utf8"));
+  } catch (err) {
+    if (err.status) throw err;
+    return [400, { error: "the body is not valid JSON" }];
+  }
+  const body = validateDecision(raw);
+  if (body.error) return [400, body];
+  const result = await ctx.submitDecision(body);
+  ctx.cache.delete("approvals");
+  return [result.ok ? 200 : 409, result];
+}
+
+/** The bot names a directive may name: AUTOREVIEWER_BOTS in autoreviewer/.env. */
+function directiveBots() {
+  try {
+    const m = fs.readFileSync(path.join(SCRIPT_DIR, "..", "autoreviewer", ".env"), "utf8").match(/^AUTOREVIEWER_BOTS=(.*)$/m);
+    return m ? m[1].split(",").map((s) => s.trim()).filter((s) => /^[a-z0-9-]{1,40}$/.test(s)) : [];
+  } catch {
+    return [];
+  }
+}
+
+// ── cron jobs (Mike, 2026-10-25) ─────────────────────────────────────────────
+// Browse and change each bot's openclaw cron jobs, and give a job its own model
+// apart from the bot's chat model (payload.model; openclaw applies it to
+// isolated agentTurn jobs only). Reads and writes go through the bot's own
+// `openclaw cron` CLI over `docker exec`, so openclaw keeps its validation and
+// its store. Arguments go as argv (no shell) in --flag=value form, so a value
+// that starts with "-" is never read as a flag. A mutating openclaw CLI call has
+// drifted openclaw.json before (scripts/claw-morning SAFETY): every write
+// fingerprints openclaw.json before and after and reports a change loudly.
+const CRON_PATH_RE = /^\/api\/cron(?:\/([a-z0-9-]{1,40})\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}))?$/;
+const isCronWrite = (method, pathname) => method === "POST" && CRON_PATH_RE.exec(pathname)?.[2] !== undefined;
+const THINKING = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "adaptive", "max"]);
+const CRON_EXPR_RE = /^[0-9A-Za-z*?/,#L-]+(?: [0-9A-Za-z*?/,#L-]+){4,5}$/;
+const TZ_RE = /^[A-Za-z_]+(?:\/[A-Za-z0-9_+-]+){0,2}$/;
+const EVERY_RE = /^\d{1,5}(?:s|m|h|d)$/;
+const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/;
+
+/** The model settings and tool policy in openclaw.json, and a fingerprint of
+ *  the whole file (FNV-1a; collectors have no crypto module). */
+export function collectAgentConfig(fs, path, home) {
+  const p = path.join(home, "openclaw.json");
+  let text = "";
+  try {
+    const st = fs.lstatSync(p);
+    if (st.isFile() && st.size <= 4 * 1024 * 1024) text = fs.readFileSync(p, "utf8");
+  } catch {
+    return { error: "openclaw.json is missing" };
+  }
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  let c = {};
+  try {
+    c = JSON.parse(text);
+  } catch {
+    return { fingerprint: `${text.length}:${h}`, error: "openclaw.json is not valid JSON" };
+  }
+  const d = c?.agents?.defaults ?? {};
+  const list = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === "string") : []);
+  const plugins = c?.plugins?.entries ?? {};
+  return {
+    fingerprint: `${text.length}:${h}`,
+    model: {
+      primary: typeof d.model === "string" ? d.model : (d.model?.primary ?? null),
+      fallbacks: list(d.model?.fallbacks),
+      subagents: typeof d.subagents?.model === "string" ? d.subagents.model : (d.subagents?.model?.primary ?? null),
+      allowed: Object.keys(d.models ?? {}).sort(),
+    },
+    tools: {
+      profile: c?.tools?.profile ?? null,
+      allow: list(c?.tools?.allow),
+      alsoAllow: list(c?.tools?.alsoAllow),
+      deny: list(c?.tools?.deny),
+      plugins: Object.entries(plugins)
+        .map(([id, e]) => ({ id, enabled: e?.enabled !== false }))
+        .sort((a, b) => a.id.localeCompare(b.id)),
+    },
+  };
+}
+
+/** The JSON object an openclaw CLI printed, after any warning lines. */
+export function parseCliJson(out) {
+  const text = String(out);
+  const at = text.search(/^[{[]/m);
+  if (at < 0) throw new Error("the openclaw CLI printed no JSON");
+  return JSON.parse(text.slice(at));
+}
+
+const capText = (v, n) => (typeof v === "string" ? (v.length > n ? `${v.slice(0, n)}…` : v) : null);
+
+/** The fields of a cron job this page shows. */
+export function pickCronJob(j) {
+  const s = j?.state ?? {};
+  const p = j?.payload ?? {};
+  return {
+    id: j.id,
+    name: capText(j.name, 200),
+    description: capText(j.description, 500),
+    declarationKey: j.declarationKey ?? null,
+    enabled: j.enabled !== false,
+    agentId: j.agentId ?? null,
+    schedule: j.schedule ?? null,
+    sessionTarget: j.sessionTarget ?? null,
+    payload: {
+      kind: p.kind ?? null,
+      text: capText(p.kind === "systemEvent" ? p.text : p.message, 8000),
+      model: p.model ?? null,
+      thinking: p.thinking ?? null,
+      timeoutSeconds: p.timeoutSeconds ?? null,
+    },
+    delivery: j.delivery ? { mode: j.delivery.mode ?? null, channel: j.delivery.channel ?? null } : null,
+    state: {
+      nextRunAtMs: s.nextRunAtMs ?? null,
+      lastRunAtMs: s.lastRunAtMs ?? null,
+      lastRunStatus: s.lastRunStatus ?? s.lastStatus ?? null,
+      lastDurationMs: s.lastDurationMs ?? null,
+      consecutiveErrors: s.consecutiveErrors ?? 0,
+      lastError: capText(s.lastError, 500),
+    },
+  };
+}
+
+/** Turn a checked patch into `openclaw cron edit` flags. Returns { args } or { error }. */
+export function cronEditArgs(job, patch, allowedModels) {
+  if (!patch || typeof patch !== "object" || Array.isArray(patch)) return { error: "patch must be an object" };
+  const args = [];
+  const agentTurn = job.payload?.kind === "agentTurn";
+  for (const key of Object.keys(patch)) {
+    const v = patch[key];
+    switch (key) {
+      case "enabled":
+        if (typeof v !== "boolean") return { error: "enabled: true or false" };
+        args.push(v ? "--enable" : "--disable");
+        break;
+      case "model":
+        if (!agentTurn) return { error: "this job runs in the main session, which uses the bot's chat model: it takes no model of its own" };
+        if (v === null || v === "") args.push("--clear-model");
+        else if (typeof v === "string" && allowedModels.includes(v)) args.push(`--model=${v}`);
+        else return { error: `model: not in this bot's allowed models (agents.defaults.models)` };
+        break;
+      case "thinking":
+        if (!agentTurn) return { error: "thinking applies to isolated agent jobs only" };
+        if (v === null || v === "") args.push("--clear-thinking");
+        else if (THINKING.has(v)) args.push(`--thinking=${v}`);
+        else return { error: `thinking: one of ${[...THINKING].join(", ")}` };
+        break;
+      case "name":
+        if (typeof v !== "string" || !v.trim() || v.length > 120 || CONTROL_CHARS_RE.test(v)) return { error: "name: 1-120 characters, one line" };
+        args.push(`--name=${v.trim()}`);
+        break;
+      case "text":
+        if (typeof v !== "string" || !v.trim() || v.length > 8000) return { error: "text: 1-8000 characters" };
+        if (job.payload?.kind === "agentTurn") args.push(`--message=${v}`);
+        else if (job.payload?.kind === "systemEvent") args.push(`--system-event=${v}`);
+        else return { error: `a ${job.payload?.kind ?? "unknown"} payload cannot be edited here` };
+        break;
+      case "schedule": {
+        if (!v || typeof v !== "object") return { error: "schedule must be an object" };
+        if (v.kind === "cron") {
+          if (!CRON_EXPR_RE.test(String(v.expr ?? ""))) return { error: "schedule.expr: a 5- or 6-field cron expression" };
+          args.push(`--cron=${v.expr}`);
+          if (v.tz !== undefined && v.tz !== "") {
+            if (!TZ_RE.test(String(v.tz))) return { error: "schedule.tz: an IANA time zone such as America/New_York" };
+            args.push(`--tz=${v.tz}`);
+          }
+        } else if (v.kind === "every") {
+          if (!EVERY_RE.test(String(v.every ?? ""))) return { error: "schedule.every: a duration such as 30m, 6h or 2d" };
+          args.push(`--every=${v.every}`);
+        } else if (v.kind === "at") {
+          if (!Number.isFinite(Date.parse(v.at)) || !/^\d{4}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:\d{2})$/.test(String(v.at))) return { error: "schedule.at: an ISO time with a zone" };
+          args.push(`--at=${v.at}`);
+        } else {
+          return { error: "schedule.kind: cron, every or at" };
+        }
+        break;
+      }
+      default:
+        return { error: `unknown field ${key}` };
+    }
+  }
+  if (!args.length) return { error: "nothing to change" };
+  return { args };
+}
+
+async function readCronBot(ctx, bot) {
+  const [config, list] = await Promise.all([
+    cached(ctx, `agentcfg:${bot.key}`, 15_000, () => ctx.readAgentConfig(bot)),
+    cached(ctx, `cron:${bot.key}`, 15_000, () => ctx.cronCli(bot, ["list", "--all", "--json"]).then(parseCliJson)),
+  ]);
+  return {
+    key: bot.key,
+    model: config.model ?? null,
+    jobs: (list.jobs ?? []).map(pickCronJob),
+  };
+}
+
+/** /api/cron              GET   every running bot's jobs, chat model and allowed models
+ *  /api/cron/<bot>/<id>   POST  { action: "edit", patch } | { action: "run" } | { action: "remove" } */
+async function routeCron(req, url, ctx) {
+  const [, key, id] = CRON_PATH_RE.exec(url.pathname) ?? [];
+  const fleet = await cached(ctx, "fleet", 4000, ctx.discover);
+  if (!key) {
+    if (req.method !== "GET") return [405, { error: "method not allowed here" }];
+    const bots = await Promise.all(
+      fleet.bots.map(async (bot) => {
+        if (!bot.running) return { key: bot.key, error: `${bot.container} is ${bot.state}` };
+        try {
+          return await readCronBot(ctx, bot);
+        } catch (err) {
+          return { key: bot.key, error: err.message };
+        }
+      }),
+    );
+    return [200, { bots }];
+  }
+  if (req.method !== "POST") return [405, { error: "method not allowed here" }];
+  const bot = fleet.bots.find((b) => b.key === key);
+  if (!bot) return [404, { error: `unknown bot "${key}"` }];
+  if (!bot.running) return [409, { error: `${bot.container} is ${bot.state}` }];
+  let body;
+  try {
+    body = JSON.parse((await readBody(req, 32 * 1024)).toString("utf8"));
+  } catch (err) {
+    if (err.status) throw err;
+    return [400, { error: "the body is not valid JSON" }];
+  }
+  ctx.cache.delete(`cron:${bot.key}`);
+  ctx.cache.delete(`agentcfg:${bot.key}`);
+  const current = await readCronBot(ctx, bot);
+  const job = current.jobs.find((j) => j.id === id);
+  if (!job) return [404, { error: `no cron job ${id} on ${bot.key}` }];
+  let args;
+  if (body?.action === "edit") {
+    const r = cronEditArgs(job, body.patch, current.model?.allowed ?? []);
+    if (r.error) return [400, { error: r.error }];
+    args = ["edit", id, ...r.args];
+  } else if (body?.action === "run") {
+    args = ["run", id];
+  } else if (body?.action === "remove") {
+    args = ["rm", id];
+  } else {
+    return [400, { error: "action: edit, run or remove" }];
+  }
+  const before = (await ctx.readAgentConfig(bot)).fingerprint;
+  let out;
+  try {
+    out = await ctx.cronCli(bot, args);
+  } finally {
+    ctx.cache.delete(`cron:${bot.key}`);
+    ctx.cache.delete(`agentcfg:${bot.key}`);
+  }
+  const after = (await ctx.readAgentConfig(bot)).fingerprint;
+  if (before !== after) {
+    return [500, { error: `${bot.key}: openclaw.json CHANGED during \`openclaw cron ${args[0]}\`. The change was applied; check the bot's config and its next Telegram turn.` }];
+  }
+  const fresh = await readCronBot(ctx, bot);
+  return [200, { ok: true, output: capText(String(out).trim(), 2000), job: fresh.jobs.find((j) => j.id === id) ?? null }];
+}
+
+// ── egress list and tools (Mike, 2026-10-25) ─────────────────────────────────
+// Read only. The egress proxy's lists are host files (sandbox/egress-proxy);
+// what a bot really reached is in the proxy's audit file, a volume that only
+// the vetting container mounts, so the observatory reads its tail there.
+// Changes to egress still go through scripts/claw-vet.
+const EGRESS_DIR = process.env.OASIS_EGRESS_DIR || path.join(SCRIPT_DIR, "..", "sandbox", "egress-proxy");
+const EGRESS_BOTS_FILE = process.env.OASIS_EGRESS_BOTS_FILE || path.join(OASIS_SUPPORT, "egress", "bots.json");
+const EGRESS_AUDIT_CONTAINER = "oasis-claw-vet";
+const EGRESS_AUDIT_FILE = "/var/lib/egress/audit/audit.jsonl";
+
+function readListFile(file) {
+  try {
+    return fs
+      .readFileSync(file, "utf8")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith("#"));
+  } catch {
+    return [];
+  }
+}
+
+function readJsonlTail(file, max) {
+  try {
+    return fs
+      .readFileSync(file, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .slice(-max * 4)
+      .map((l) => {
+        try {
+          return JSON.parse(l);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/** Per-host counts for one bot from the proxy's audit rows. */
+export function egressActivity(rows, bot, now = Date.now()) {
+  const byHost = new Map();
+  for (const r of rows) {
+    if (r?.event !== "decision" || r.bot !== bot || typeof r.host !== "string") continue;
+    const ts = Number(r.ts_unix) * 1000;
+    const e = byHost.get(r.host) ?? { host: r.host, allow: 0, deny: 0, last: 0 };
+    if (r.action === "allow") e.allow++;
+    else e.deny++;
+    e.last = Math.max(e.last, Number.isFinite(ts) ? ts : 0);
+    byHost.set(r.host, e);
+  }
+  return [...byHost.values()].filter((e) => now - e.last <= 7 * 86_400_000).sort((a, b) => b.last - a.last).slice(0, 100);
+}
+
+export function readEgress(bot, auditRows, { dir = EGRESS_DIR, botsFile = EGRESS_BOTS_FILE, baseEnv = [] } = {}) {
+  const partitioned = readJsonQuiet(botsFile, []);
+  const decision = (r) => ({ ts: r.ts ?? null, host: r.host ?? null, decision: r.decision ?? null, reason: capText(r.reason, 200), source: r.source ?? null });
+  const learnedRows = [
+    ...readJsonlTail(path.join(dir, "learned", bot, "learned.jsonl"), 40),
+    ...readJsonlTail(path.join(dir, "learned", "learned.jsonl"), 200).filter((r) => r.bot === bot),
+  ]
+    .sort((a, b) => String(b.ts).localeCompare(String(a.ts)))
+    .slice(0, 40)
+    .map(decision);
+  return {
+    behindProxy: Array.isArray(partitioned) && partitioned.includes(bot),
+    base: [...new Set([...readListFile(path.join(dir, "allowlist.txt")), ...baseEnv])],
+    learnedShared: readListFile(path.join(dir, "learned", "allowlist.txt")),
+    learnedBot: readListFile(path.join(dir, "learned", bot, "allowlist.txt")),
+    decisions: learnedRows,
+    activity: auditRows ? egressActivity(auditRows, bot) : null,
+  };
+}
+
+async function readEgressAudit() {
+  const out = await docker(["exec", EGRESS_AUDIT_CONTAINER, "tail", "-c", "4000000", EGRESS_AUDIT_FILE], { timeoutMs: 20_000 });
+  return out
+    .split("\n")
+    .map((l) => {
+      try {
+        return JSON.parse(l);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+async function readProxyAllowlistEnv() {
+  const out = await docker(["inspect", "oasis-egress-proxy", "--format", "{{json .Config.Env}}"], { timeoutMs: 10_000 });
+  const line = JSON.parse(out).find((e) => e.startsWith("ALLOWLIST=")) ?? "";
+  return line.slice("ALLOWLIST=".length).split(/[\s,]+/).filter(Boolean);
+}
+
+/** The tools the bot's main agent can call now, from its gateway (tools.effective). */
+export function pickEffectiveTools(r) {
+  return {
+    profile: r?.profile ?? null,
+    groups: (r?.groups ?? []).map((g) => ({
+      id: g.id,
+      label: g.label ?? g.id,
+      source: g.source ?? null,
+      tools: (g.tools ?? []).map((t) => ({ id: t.id, label: t.label ?? t.id, description: capText(t.description, 300), source: t.source ?? null })),
+    })),
+  };
 }
 
 async function routeApi(url, ctx) {
@@ -2581,7 +3070,7 @@ async function routeApi(url, ctx) {
     const f = await fleet();
     const bot = f.bots.find((b) => b.key === parts[2]);
     if (!bot) return [404, { error: "unknown bot" }];
-    const needsContainer = ["profile", "sessions", "transcript"].includes(parts[3]);
+    const needsContainer = ["profile", "sessions", "transcript", "tools"].includes(parts[3]);
     if (needsContainer && !bot.running) return [409, { error: `${bot.container} is ${bot.state}` }];
 
     switch (parts[3]) {
@@ -2610,6 +3099,23 @@ async function routeApi(url, ctx) {
           collect(bot.container, collectTranscript, [agent, session, limit]),
         );
         return [result.error ? 404 : 200, result];
+      }
+      case "tools": {
+        const [config, effective] = await Promise.all([
+          cached(ctx, `agentcfg:${bot.key}`, 15_000, () => ctx.readAgentConfig(bot)),
+          cached(ctx, `tools:${bot.key}`, 300_000, () => ctx.readEffectiveTools(bot)).then(
+            (r) => ({ ...pickEffectiveTools(r), error: null }),
+            (err) => ({ profile: null, groups: [], error: err.message }),
+          ),
+        ]);
+        return [200, { config: config.tools ?? null, model: config.model ?? null, effective }];
+      }
+      case "egress": {
+        const [audit, baseEnv] = await Promise.all([
+          cached(ctx, "egress-audit", 30_000, () => ctx.readEgressAudit()).catch(() => null),
+          cached(ctx, "egress-env", 300_000, () => ctx.readProxyAllowlistEnv()).catch(() => []),
+        ]);
+        return [200, { ...ctx.readEgress(bot.key, audit, { baseEnv }), auditRead: audit !== null }];
       }
       case "history":
         return [200, await botHistory(ctx.snapshotDir, bot.key)];
@@ -2650,6 +3156,17 @@ export function createObservatoryServer(ctx) {
     collect(bot.container, collectUserMd, ["write", baseHash, Buffer.from(text, "utf8").toString("base64")]);
   ctx.keepUserMdHistory ??= (key, text) => keepUserMdHistory(USER_MD_HISTORY_DIR, key, text);
   ctx.genAdmin ??= (method, apiPath, body) => genAdmin(method, apiPath, body);
+  ctx.submitDecision ??= (body) => submitDecision(body);
+  ctx.readAgentConfig ??= (bot) => collect(bot.container, collectAgentConfig);
+  ctx.cronCli ??= (bot, args) => docker(["exec", bot.container, "openclaw", "cron", ...args], { timeoutMs: 90_000 });
+  ctx.readEffectiveTools ??= (bot) =>
+    docker(
+      ["exec", bot.container, "openclaw", "gateway", "call", "tools.effective", "--params", JSON.stringify({ agentId: "main", sessionKey: "agent:main:main" }), "--json"],
+      { timeoutMs: 60_000 },
+    ).then(parseCliJson);
+  ctx.readEgress ??= readEgress;
+  ctx.readEgressAudit ??= readEgressAudit;
+  ctx.readProxyAllowlistEnv ??= readProxyAllowlistEnv;
   return http.createServer((req, res) => {
     const refused = checkRequest(req, ctx.port);
     if (refused) {
@@ -2727,6 +3244,16 @@ export function createObservatoryServer(ctx) {
       routeGenroute(req, url, ctx).then(
         ([status, body]) => sendJson(res, status, body),
         (err) => sendJson(res, err.status ?? 502, { error: err.message }),
+      );
+      return;
+    }
+    if (CRON_PATH_RE.test(url.pathname) || url.pathname === DECIDE_PATH) {
+      (url.pathname === DECIDE_PATH ? routeDecide(req, ctx) : routeCron(req, url, ctx)).then(
+        ([status, body]) => sendJson(res, status, body),
+        (err) => {
+          if (err.status === 413) res.once("finish", () => req.destroy());
+          sendJson(res, err.status ?? 502, { error: err.message });
+        },
       );
       return;
     }

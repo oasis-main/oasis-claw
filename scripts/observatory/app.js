@@ -532,6 +532,7 @@ const VIEWS = [
   { id: "live", label: "Live", sub: "System 1" },
   { id: "agents", label: "Agents", sub: "System 3" },
   { id: "approvals", label: "Approvals & work", sub: "Brief · directives · open work · grants" },
+  { id: "cron", label: "Cron", sub: "Schedules · per-job models" },
   { id: "settings", label: "Settings", sub: "You · background" },
 ];
 
@@ -720,14 +721,15 @@ function renderView() {
   else if (app.view === "live") renderLive();
   else if (app.view === "settings") renderSettings();
   else if (app.view === "approvals") renderApprovals();
+  else if (app.view === "cron") renderCron();
   else renderAgents();
 }
 
 // ── Approvals (CLAW-122 slice 2) ──────────────────────────────────────────────
-// Read-only. Everything Mike approves, in one place: requests waiting for him,
-// live peer grants with the time left, GitHub access requests and what the
-// minter did with them, the infra ledger, and approval-card outcomes. Every
-// decision is made in the autoreviewer Telegram chat (one authenticated path).
+// Everything Mike approves, in one place: requests waiting for him, live peer
+// grants with the time left, GitHub access requests and what the minter did
+// with them, the infra ledger, and approval-card outcomes. Since 2026-10-25
+// Mike decides here or on the Telegram card (see "decisions from this page").
 
 function until(v) {
   const ms = toMs(v);
@@ -756,6 +758,8 @@ function grantLimits(g) {
 
 function renderApprovals() {
   const body = h("div", null, placeholder("Reading the approval ledgers…"));
+  const formSlot = h("div");
+  let formBuilt = false;
   const draw = async () => {
     let d;
     try {
@@ -765,6 +769,10 @@ function renderApprovals() {
       return;
     }
     const chat = d.telegram ? `@${d.telegram}` : "the autoreviewer Telegram chat";
+    if (!formBuilt) {
+      formSlot.replaceChildren(directiveForm(d.directiveBots ?? [], draw));
+      formBuilt = true;
+    }
     const waitingGrants = d.grants.filter((g) => g.status === "proposed");
     const waitingGh = d.github.filter((r) => r.status === "proposed");
     const waitingDirs = (d.directives ?? []).filter((x) => x.status === "proposed");
@@ -772,15 +780,18 @@ function renderApprovals() {
       ...waitingDirs.map((x) =>
         h("tr", null, h("td", null, h("span", { class: "mono", text: x.id })), h("td", { text: "directive" }),
           h("td", { text: `${botName(x.bot)}${x.proposer !== "mike" ? ` (from ${botName(x.proposer)})` : ""}` }),
-          h("td", { class: "item-title", text: x.goal }), h("td", { text: `lapses ${until(x.proposal_expires)}` }))),
+          h("td", { class: "item-title" }, h("div", { text: x.goal }), h("div", { class: "muted small", text: `may: ${x.may}` }), x.must_not ? h("div", { class: "muted small", text: `must not: ${x.must_not}` }) : null),
+          h("td", { text: `lapses ${until(x.proposal_expires)}` }), h("td", null, directiveDecide(x, draw)))),
       ...waitingGrants.map((g) =>
         h("tr", null, h("td", null, h("span", { class: "mono", text: g.id })), h("td", { text: "peer grant" }),
           h("td", { text: `${botName(g.requester)} → ${g.grantees.map(botName).join(", ")}` }),
-          h("td", { class: "item-title", text: g.topic }), h("td", { text: `lapses ${until(g.proposal_expires)}` }))),
+          h("td", { class: "item-title" }, h("div", { text: g.topic }), h("div", { class: "muted small", text: g.intent }), h("div", { class: "muted small", text: grantLimits(g) })),
+          h("td", { text: `lapses ${until(g.proposal_expires)}` }), h("td", null, grantDecide(g, draw)))),
       ...waitingGh.map((r) =>
         h("tr", null, h("td", null, h("span", { class: "mono", text: r.id })), h("td", { text: "GitHub access" }),
           h("td", { text: `${botName(r.requester)} for ${botName(r.bot)}` }),
-          h("td", { class: "item-title", text: `${r.access} on ${r.account}: ${r.repos.join(", ")}` }), h("td", { text: `asked ${ago(r.proposed_at)}` }))),
+          h("td", { class: "item-title" }, h("div", { text: `${r.access} on ${r.account}: ${r.repos.join(", ")}` }), h("div", { class: "muted small", text: r.reason })),
+          h("td", { text: `asked ${ago(r.proposed_at)}` }), h("td", null, ghDecide(r, draw)))),
     ];
     const grants = d.grants.filter((g) => g.status !== "proposed").map((g) =>
       h("tr", null,
@@ -789,7 +800,8 @@ function renderApprovals() {
         h("td", { text: `${botName(g.requester)} → ${g.grantees.map(botName).join(", ")}` }),
         h("td", null, h("div", { class: "mono small", text: g.thread })),
         h("td", { class: "item-title" }, h("div", { text: g.topic }), h("div", { class: "muted small", text: g.intent }), h("div", { class: "muted small", text: grantLimits(g) })),
-        h("td", { text: g.status === "active" ? `ends ${until(g.expires)}` : g.expires ? `ended ${ago(g.expires)}` : "—" })));
+        h("td", { text: g.status === "active" ? `ends ${until(g.expires)}` : g.expires ? `ended ${ago(g.expires)}` : "—" }),
+        h("td", null, g.status === "active" ? decideButtons([["Revoke", { op: "revoke", id: g.id }, `Revoke ${g.id} now?`, "danger"]], draw) : null)));
     const github = d.github.map((r) =>
       h("tr", null,
         h("td", null, h("span", { class: "mono", text: r.id })),
@@ -797,7 +809,8 @@ function renderApprovals() {
         h("td", { text: botName(r.bot) }),
         h("td", { text: `${r.access} · ${r.account}: ${r.repos.join(", ")}` }),
         h("td", { class: "item-title" }, h("div", { text: r.minter ?? (r.status === "approved" ? "minter has not run yet" : "—") }), h("div", { class: "muted small", text: r.reason })),
-        h("td", { text: ago(r.decided_at ?? r.proposed_at) })));
+        h("td", { text: ago(r.decided_at ?? r.proposed_at) }),
+        h("td", null, r.status === "approved" ? decideButtons([["Revoke", { op: "gh-revoke", id: r.id }, `Revoke ${r.id}? The minter drops it on its next run.`, "danger"]], draw) : null)));
     const infra = d.infra.map((e) =>
       h("tr", null,
         h("td", null, h("span", { class: "mono", text: e.id })),
@@ -825,7 +838,13 @@ function renderApprovals() {
         h("td", null, apState(x.status)),
         h("td", { text: `${botName(x.bot)}${x.lane ? ` · ${x.lane}` : ""}` }),
         h("td", { class: "item-title" }, h("div", { text: x.goal }), h("div", { class: "muted small", text: `may: ${x.may}` }), x.must_not ? h("div", { class: "muted small", text: `must not: ${x.must_not}` }) : null),
-        h("td", { text: x.status === "active" ? `ends ${until(x.expires)}` : x.expires ? `ended ${ago(x.expires)}` : "—" })));
+        h("td", { text: x.status === "active" ? `ends ${until(x.expires)}` : x.expires ? `ended ${ago(x.expires)}` : "—" }),
+        h("td", null, x.status === "active"
+          ? decideButtons([
+              ["Renew 7 d", { op: "renew", id: x.id, hours: 168 }, `Renew ${x.id} for 7 days from now?`],
+              ["Revoke", { op: "revoke", id: x.id }, `Revoke directive ${x.id} for ${botName(x.bot)} now?`, "danger"],
+            ], draw)
+          : null)));
     const covered = new Set((d.directives ?? []).filter((x) => x.status === "active").map((x) => x.bot));
     const morningCell = (w) => {
       const j = w.morning.find((x) => x.key === "fleet-morning-work");
@@ -846,16 +865,17 @@ function renderApprovals() {
         h("td", { class: "item-title" }, w.needs.length ? w.needs.map((n) => h("div", { class: "small", text: n })) : h("span", { class: "muted", text: "none" }))));
     body.replaceChildren(
       section("Morning brief", "Weekdays: lane bots work from 07:00 New York; the coordinator writes the brief at 07:45; the autoreviewer sends the digest at 08:00 (/brief sends it now).", brief),
-      section("Standing directives", `Mike's standing approval for one bot's lane, up to 7 days, any session. Set one with /directive in ${chat}; renew from the reminder card; /revoke to end it.`,
-        dirRows.length ? apTable(["ID", "State", "Bot · lane", "Goal, may, must not", "Time"], dirRows) : empty("No directives. Without one, a morning session only reads and rewrites its STATUS.md.")),
+      section("Standing directives", `Mike's standing approval for one bot's lane, up to 7 days, any session. Propose, renew and revoke here, or use /directive, the reminder card and /revoke in ${chat}.`,
+        formSlot,
+        dirRows.length ? apTable(["ID", "State", "Bot · lane", "Goal, may, must not", "Time", ""], dirRows) : empty("No directives. Without one, a morning session only reads and rewrites its STATUS.md.")),
       section("Open work", `From each bot's STATUS.md (OPEN list and NEEDS FROM MIKE), via the fleet snapshot${d.snapshot_at ? ` (${ago(d.snapshot_at)})` : ""}. "Stale" = the same next step on 2 or more days.`,
         workRows.length ? apTable(["Bot", "Morning session", "STATUS.md", "Status and open items", "Needs from Mike"], workRows) : empty("No fleet snapshot yet.")),
-      section(`Waiting for you (${waiting.length})`, `Decide in ${chat}. This page only shows the state.`,
-        waiting.length ? apTable(["ID", "Kind", "Who", "What", "When"], waiting) : empty("Nothing is waiting for a decision.")),
-      section("Peer grants", "Mike's standing permission for one mail thread (at most 24 h). Revoke with /revoke in the chat.",
-        grants.length ? apTable(["ID", "State", "Requester → grantees", "Thread", "Topic, intent, limits", "Time"], grants) : empty("No peer grants in the last 24 h.")),
-      section("GitHub access requests", "Approved requests reach the bot within 30 min, when the Mac minter runs. Revoke with /ghrevoke in the chat.",
-        github.length ? apTable(["ID", "State", "Bot", "Access", "Minter result, reason", "When"], github) : empty("No GitHub access requests yet.")),
+      section(`Waiting for you (${waiting.length})`, `Decide here or on the card in ${chat}. Both go to the autoreviewer, which edits the card and tells the bots.`,
+        waiting.length ? apTable(["ID", "Kind", "Who", "What", "When", "Decide"], waiting) : empty("Nothing is waiting for a decision.")),
+      section("Peer grants", "Mike's standing permission for one mail thread (at most 24 h). Revoke here or with /revoke in the chat.",
+        grants.length ? apTable(["ID", "State", "Requester → grantees", "Thread", "Topic, intent, limits", "Time", ""], grants) : empty("No peer grants in the last 24 h.")),
+      section("GitHub access requests", "Approved requests reach the bot within 30 min, when the Mac minter runs. Revoke here or with /ghrevoke in the chat.",
+        github.length ? apTable(["ID", "State", "Bot", "Access", "Minter result, reason", "When", ""], github) : empty("No GitHub access requests yet.")),
       section("Infra ledger", "Entries the reviewer matches before the applier bot may apply an infrastructure change. Change them on the Mac with scripts/claw-approvals.",
         apTable(["ID", "State", "Entry and limits", "For", "Until"], infra)),
       section("Approval cards, last 24 h", `Card outcomes and the latest escalations per bot, from the fleet snapshot${d.snapshot_at ? ` (${ago(d.snapshot_at)})` : " (no snapshot yet)"}.`,
@@ -865,6 +885,451 @@ function renderApprovals() {
   mainEl.append(body);
   draw();
   every(15_000, draw);
+}
+
+// ── decisions from this page (Mike, 2026-10-25) ───────────────────────────────
+// A decision here goes to the autoreviewer through a host-only folder; the
+// autoreviewer applies it with the same ledger call as the Telegram button and
+// edits the card. Each decision asks for a confirm first: one click must not
+// grant a permission by accident.
+
+async function decide(body, question) {
+  if (!window.confirm(question)) return null;
+  try {
+    return await api("/api/approvals/decide", { method: "POST", type: "application/json", body: JSON.stringify(body) });
+  } catch (err) {
+    window.alert(`Not done: ${err.message}`);
+    return null;
+  }
+}
+
+function decideButtons(buttons, redraw) {
+  return h(
+    "div",
+    { class: "pill-bar" },
+    buttons.map(([text, body, question, tone]) =>
+      h("button", {
+        type: "button",
+        class: `button small${tone ? ` ${tone}` : ""}`,
+        text,
+        onclick: async (e) => {
+          e.currentTarget.disabled = true;
+          await decide(body, question);
+          redraw();
+        },
+      }),
+    ),
+  );
+}
+
+const grantDecide = (g, redraw) =>
+  decideButtons(
+    [
+      ...[1, 4, 24].map((n) => [`Approve ${n} h`, { op: "decide", id: g.id, hours: n }, `Approve ${g.id} for ${n} h?\n\n${g.topic}\n${g.intent}`]),
+      ["Deny", { op: "decide", id: g.id, hours: null }, `Deny ${g.id}?`, "danger"],
+    ],
+    redraw,
+  );
+
+const directiveDecide = (x, redraw) =>
+  decideButtons(
+    [
+      ["Approve 7 d", { op: "decide", id: x.id, hours: 168 }, `Approve directive ${x.id} for ${botName(x.bot)} for 7 days?\n\nGoal: ${x.goal}\nMay: ${x.may}\nMust not: ${x.must_not ?? "—"}`],
+      ["Approve 1 d", { op: "decide", id: x.id, hours: 24 }, `Approve directive ${x.id} for ${botName(x.bot)} for 1 day?\n\nGoal: ${x.goal}`],
+      ["Deny", { op: "decide", id: x.id, hours: null }, `Deny directive ${x.id}?`, "danger"],
+    ],
+    redraw,
+  );
+
+const ghDecide = (r, redraw) =>
+  decideButtons(
+    [
+      ["Approve", { op: "gh-decide", id: r.id, approve: true }, `Approve ${r.id}: ${r.access} on ${r.account} (${r.repos.join(", ")}) for ${botName(r.bot)}?`],
+      ["Deny", { op: "gh-decide", id: r.id, approve: false }, `Deny ${r.id}?`, "danger"],
+    ],
+    redraw,
+  );
+
+/** Propose a standing directive as Mike. Built once, so the 15 s redraw of the
+ *  ledgers below never clears what the reader typed. */
+function directiveForm(bots, onDone) {
+  const field = (tag, props, kids) => h(tag, { class: "field", ...props }, kids);
+  const bot = field("select", { "aria-label": "Bot" }, bots.map((k) => h("option", { value: k, text: botName(k) })));
+  const goal = field("input", { type: "text", maxlength: "300", placeholder: "What the bot works toward (required)" });
+  const may = field("textarea", { rows: "2", maxlength: "600", placeholder: "Default: work toward the goal with your usual tools, repos and lane peers" });
+  const mustNot = field("textarea", { rows: "2", maxlength: "600", placeholder: "Default: anything outside the goal" });
+  const lane = field("input", { type: "text", maxlength: "80", placeholder: "Optional lane name" });
+  const days = field("select", { "aria-label": "Days" }, [7, 5, 3, 2, 1].map((d) => h("option", { value: String(d), text: `${d} d` })));
+  const note = h("span", { class: "muted small", role: "status" });
+  const row = (label, input) => h("div", { class: "field-row" }, h("label", { class: "field-label", text: label }), h("div", { class: "field-input" }, input));
+  const submit = h("button", {
+    type: "button",
+    class: "button",
+    text: "Propose",
+    onclick: async () => {
+      if (!goal.value.trim()) {
+        note.textContent = "Write a goal first.";
+        return;
+      }
+      const body = { op: "directive", bot: bot.value, goal: goal.value.trim(), may: may.value.trim(), must_not: mustNot.value.trim(), lane: lane.value.trim(), ttl_hours: Number(days.value) * 24 };
+      submit.disabled = true;
+      note.textContent = "Sending…";
+      try {
+        const r = await api("/api/approvals/decide", { method: "POST", type: "application/json", body: JSON.stringify(body) });
+        note.textContent = `${r.id} proposed for ${botName(r.bot)}. Approve it under "Waiting for you" or on the Telegram card.`;
+        goal.value = may.value = mustNot.value = lane.value = "";
+        onDone();
+      } catch (err) {
+        note.textContent = `Not proposed: ${err.message}`;
+      } finally {
+        submit.disabled = false;
+      }
+    },
+  });
+  if (!bots.length) return empty("No bot list: AUTOREVIEWER_BOTS in autoreviewer/.env is empty or missing.");
+  return h(
+    "details",
+    { class: "card form-card" },
+    h("summary", { text: "Propose a standing directive" }),
+    h(
+      "div",
+      { class: "profile-form" },
+      row("Bot", bot),
+      row("Goal", goal),
+      row("May", may),
+      row("Must not", mustNot),
+      row("Lane", lane),
+      row("Length", days),
+      h("div", { class: "toolbar tight-row" }, submit, note),
+      h("p", { class: "muted small", text: "The autoreviewer opens the normal card. The directive is active only after you approve it here or on the card." }),
+    ),
+  );
+}
+
+// ── Cron (Mike, 2026-10-25) ──────────────────────────────────────────────────
+// Every bot's openclaw cron jobs: turn on or off, run now, change the name,
+// schedule and text, delete, and give an isolated job its own model apart from
+// the bot's chat model. Main-session jobs (systemEvent) always use the chat
+// model, because they run in the bot's main conversation.
+
+function scheduleText(s) {
+  if (!s) return "—";
+  if (s.kind === "cron") return `cron ${s.expr}${s.tz ? ` (${s.tz})` : ""}`;
+  if (s.kind === "every") {
+    const m = Math.round((s.everyMs ?? 0) / 60000);
+    return m < 120 ? `every ${m} min` : m % 1440 === 0 ? `every ${m / 1440} d` : `every ${Math.round(m / 60)} h`;
+  }
+  if (s.kind === "at") return `once at ${when(s.at)}`;
+  return s.kind ?? "—";
+}
+
+function shortModel(ref) {
+  return String(ref ?? "").replace(/^oasis-generation\//, "");
+}
+
+async function cronCall(botKey, id, body) {
+  return api(`/api/cron/${encodeURIComponent(botKey)}/${encodeURIComponent(id)}`, { method: "POST", type: "application/json", body: JSON.stringify(body) });
+}
+
+function cronEditor(bot, job, onDone, onCancel) {
+  const field = (tag, props, kids) => h(tag, { class: "field", ...props }, kids);
+  const s = job.schedule ?? {};
+  const name = field("input", { type: "text", maxlength: "120", value: job.name ?? "" });
+  const kind = field("select", null, ["cron", "every", "at"].map((k) => h("option", { value: k, text: k, selected: s.kind === k })));
+  const expr = field("input", { type: "text", class: "field mono", placeholder: "0 8 * * *", value: s.kind === "cron" ? s.expr : "" });
+  const tz = field("input", { type: "text", placeholder: "America/New_York", value: s.tz ?? "America/New_York" });
+  const every = field("input", { type: "text", placeholder: "30m, 6h, 2d", value: s.kind === "every" ? `${Math.round((s.everyMs ?? 0) / 60000)}m` : "" });
+  const at = field("input", { type: "text", placeholder: "2026-11-01T14:00:00Z", value: s.kind === "at" ? s.at : "" });
+  const text = field("textarea", { rows: "8", maxlength: "8000" });
+  text.value = job.payload.text ?? "";
+  const agentTurn = job.payload.kind === "agentTurn";
+  const thinking = field("select", { disabled: !agentTurn }, ["", "off", "minimal", "low", "medium", "high", "xhigh", "adaptive", "max"].map((t) => h("option", { value: t, text: t || "default", selected: (job.payload.thinking ?? "") === t })));
+  const note = h("span", { class: "muted small", role: "status" });
+  const row = (label, ...input) => h("div", { class: "field-row" }, h("label", { class: "field-label", text: label }), h("div", { class: "field-input" }, input));
+  const schedRow = h("div", { class: "field-input" });
+  const drawSched = () => schedRow.replaceChildren(...(kind.value === "cron" ? [expr, tz] : kind.value === "every" ? [every] : [at]));
+  kind.addEventListener("change", drawSched);
+  drawSched();
+  const save = h("button", {
+    type: "button",
+    class: "button",
+    text: "Save",
+    onclick: async () => {
+      const patch = {};
+      if (name.value.trim() !== (job.name ?? "")) patch.name = name.value.trim();
+      if (text.value !== (job.payload.text ?? "")) patch.text = text.value;
+      if (agentTurn && thinking.value !== (job.payload.thinking ?? "")) patch.thinking = thinking.value;
+      const sched = kind.value === "cron" ? { kind: "cron", expr: expr.value.trim(), tz: tz.value.trim() } : kind.value === "every" ? { kind: "every", every: every.value.trim() } : { kind: "at", at: at.value.trim() };
+      const same = sched.kind === s.kind && (sched.kind === "cron" ? sched.expr === s.expr && sched.tz === (s.tz ?? "") : sched.kind === "at" ? sched.at === s.at : sched.every === `${Math.round((s.everyMs ?? 0) / 60000)}m`);
+      if (!same) patch.schedule = sched;
+      if (!Object.keys(patch).length) {
+        onCancel();
+        return;
+      }
+      save.disabled = true;
+      note.textContent = "Saving…";
+      try {
+        await cronCall(bot.key, job.id, { action: "edit", patch });
+        onDone();
+      } catch (err) {
+        note.textContent = `Not saved: ${err.message}`;
+        save.disabled = false;
+      }
+    },
+  });
+  return h(
+    "div",
+    { class: "cron-editor profile-form" },
+    job.declarationKey ? h("p", { class: "warn-text small", text: `Declared by the fleet config (${job.declarationKey}). The next scripts/claw-morning sync writes its schedule and text again.` }) : null,
+    row("Name", name),
+    h("div", { class: "field-row" }, h("label", { class: "field-label", text: "Schedule" }), h("div", { class: "field-input" }, kind, schedRow)),
+    row(job.payload.kind === "systemEvent" ? "Event text" : "Message", text),
+    row("Thinking", thinking),
+    h("div", { class: "toolbar tight-row" }, save, h("button", { type: "button", class: "button", text: "Cancel", onclick: onCancel }), note),
+  );
+}
+
+function cronModelSelect(bot, data, job, redraw) {
+  const chatModel = data.model?.primary ?? "?";
+  if (job.payload.kind !== "agentTurn") {
+    return h("span", { class: "muted small", title: "A main-session job runs in the bot's main conversation, so it uses the chat model.", text: `chat model (${shortModel(chatModel)})` });
+  }
+  const allowed = data.model?.allowed ?? [];
+  const current = job.payload.model ?? "";
+  const options = [h("option", { value: "", text: `chat model (${shortModel(chatModel)})`, selected: !current })];
+  if (current && !allowed.includes(current)) options.push(h("option", { value: current, text: `${shortModel(current)} (not allowed)`, selected: true }));
+  for (const m of allowed) options.push(h("option", { value: m, text: shortModel(m), selected: m === current }));
+  const sel = h("select", { class: `field small-field${current ? " overridden" : ""}`, "aria-label": `Model for ${job.name}` }, options);
+  sel.addEventListener("change", async () => {
+    sel.disabled = true;
+    try {
+      await cronCall(bot.key, job.id, { action: "edit", patch: { model: sel.value } });
+    } catch (err) {
+      window.alert(`Model not changed: ${err.message}`);
+    }
+    redraw(true);
+  });
+  return sel;
+}
+
+function renderCron() {
+  const state = (app.cron ??= { q: "", disabled: true, editing: null });
+  const list = h("div", { class: "stack" }, placeholder("Reading cron jobs from each bot (a few seconds per bot)…"));
+  let data = null;
+  const toggle = h("button", {
+    type: "button",
+    class: `pill small${state.disabled ? " active" : ""}`,
+    text: "Show disabled",
+    onclick: () => {
+      state.disabled = !state.disabled;
+      toggle.classList.toggle("active", state.disabled);
+      draw();
+    },
+  });
+  mainEl.append(
+    section(
+      "Cron jobs",
+      "Each bot's openclaw cron jobs. An isolated job can run on its own model; \"chat model\" means it follows the bot's default. Changes go through the bot's own openclaw CLI.",
+      h(
+        "div",
+        { class: "toolbar" },
+        filterBox("Filter jobs: name, text, schedule, model", state.q, (v) => {
+          state.q = v;
+          draw();
+        }),
+        toggle,
+      ),
+      list,
+    ),
+  );
+
+  const load = async (force) => {
+    // A redraw replaces every control: never under an open editor or a focused select.
+    if (!force && (state.editing || list.contains(document.activeElement))) return;
+    try {
+      data = await api("/api/cron");
+    } catch (err) {
+      list.replaceChildren(errorBox(err));
+      return;
+    }
+    draw();
+  };
+  const actions = (bot, job) => {
+    const act = async (body, question) => {
+      if (question && !window.confirm(question)) return;
+      try {
+        await cronCall(bot.key, job.id, body);
+      } catch (err) {
+        window.alert(`Not done: ${err.message}`);
+      }
+      load(true);
+    };
+    return h(
+      "div",
+      { class: "pill-bar" },
+      h("button", { type: "button", class: "button small", text: "Edit", onclick: () => ((state.editing = `${bot.key}|${job.id}`), draw()) }),
+      h("button", { type: "button", class: "button small", text: "Run now", onclick: () => act({ action: "run" }, `Run "${job.name}" on ${botLabel(bot)} now?`) }),
+      h("button", { type: "button", class: "button small danger", text: "Delete", onclick: () => act({ action: "remove" }, `Delete "${job.name}" from ${botLabel(bot)}? This cannot be undone.`) }),
+    );
+  };
+  const draw = () => {
+    if (!data) return;
+    const scope = new Set(inScope(app.fleet.bots).map((b) => b.key));
+    const blocks = data.bots
+      .filter((d) => scope.has(d.key))
+      .map((d) => {
+        const bot = botByKey(d.key);
+        const head = h(
+          "header",
+          { class: "card-head" },
+          botIcon(bot, "md"),
+          h(
+            "div",
+            { class: "card-title" },
+            h("h3", { text: botLabel(bot) }),
+            d.model ? h("div", { class: "muted small", text: `chat model ${shortModel(d.model.primary)}${d.model.fallbacks.length ? ` · fallbacks ${d.model.fallbacks.map(shortModel).join(", ")}` : ""}${d.model.subagents ? ` · subagents ${shortModel(d.model.subagents)}` : ""}` }) : null,
+          ),
+        );
+        if (d.error) return h("article", { class: `card fam-${famOf(bot)}` }, head, errorBox(new Error(d.error)));
+        const jobs = d.jobs
+          .filter((j) => state.disabled || j.enabled)
+          .filter((j) => matches(state.q, j.name, j.description, j.payload.text, j.payload.model, scheduleText(j.schedule)));
+        const rows = jobs.flatMap((j) => {
+          const on = h("input", { type: "checkbox", checked: j.enabled, "aria-label": `${j.enabled ? "Disable" : "Enable"} ${j.name}` });
+          on.addEventListener("change", async () => {
+            on.disabled = true;
+            try {
+              await cronCall(d.key, j.id, { action: "edit", patch: { enabled: on.checked } });
+            } catch (err) {
+              window.alert(`Not changed: ${err.message}`);
+            }
+            load(true);
+          });
+          const st = j.state;
+          const row = h(
+            "tr",
+            { class: j.enabled ? "" : "muted-row" },
+            h("td", null, on),
+            h(
+              "td",
+              { class: "item-title" },
+              h("div", { text: j.name ?? j.id }),
+              h("div", { class: "muted small", text: `${scheduleText(j.schedule)} · ${j.sessionTarget === "main" ? "main session" : "isolated"}${j.declarationKey ? ` · fleet config (${j.declarationKey})` : ""}` }),
+              j.payload.text ? h("div", { class: "muted small clamp", title: j.payload.text, text: j.payload.text }) : null,
+            ),
+            h("td", null, cronModelSelect(bot, d, j, () => load(true))),
+            h(
+              "td",
+              null,
+              h("div", { text: st.lastRunAtMs ? `${st.lastRunStatus ?? "?"} ${ago(st.lastRunAtMs)}` : "never" }),
+              st.consecutiveErrors ? h("div", { class: "bad-text small", text: `${st.consecutiveErrors} errors in a row` }) : null,
+              st.lastError ? h("div", { class: "bad-text small clamp", title: st.lastError, text: st.lastError }) : null,
+            ),
+            h("td", { text: j.enabled && st.nextRunAtMs ? until(st.nextRunAtMs) : "—" }),
+            h("td", null, actions(bot, j)),
+          );
+          if (state.editing !== `${d.key}|${j.id}`) return [row];
+          const done = () => {
+            state.editing = null;
+            load(true);
+          };
+          const cancel = () => {
+            state.editing = null;
+            draw();
+          };
+          return [row, h("tr", { class: "editor-row" }, h("td", { colspan: "6" }, cronEditor(bot, j, done, cancel)))];
+        });
+        return h(
+          "article",
+          { class: `card fam-${famOf(bot)}` },
+          head,
+          rows.length ? apTable(["On", "Job", "Model", "Last run", "Next", ""], rows) : empty(d.jobs.length ? "No job matches the filter." : "No cron jobs."),
+        );
+      });
+    list.replaceChildren(...(blocks.length ? blocks : [empty("No chosen bot is running.")]));
+  };
+  load(true);
+  every(30_000, () => load(false));
+}
+
+// ── agent tabs: tools and egress (Mike, 2026-10-25) ──────────────────────────
+
+function toolsView(key, p) {
+  const wrap = h("div", { class: "stack" }, placeholder("Asking the bot's gateway for its tools…"));
+  api(`/api/bots/${encodeURIComponent(key)}/tools`)
+    .then((d) => {
+      const q = app.agents.q;
+      const groups = d.effective.groups
+        .map((g) => ({ ...g, tools: g.tools.filter((t) => matches(q, t.id, t.label, t.description, g.label)) }))
+        .filter((g) => g.tools.length);
+      const total = d.effective.groups.reduce((n, g) => n + g.tools.length, 0);
+      const c = d.config;
+      wrap.replaceChildren(
+        h(
+          "dl",
+          { class: "facts" },
+          fact("Tool profile", c?.profile ?? "default"),
+          fact("Also allowed", c?.alsoAllow?.length ? c.alsoAllow.join(", ") : "—"),
+          fact("Allow list", c?.allow?.length ? c.allow.join(", ") : "— (the profile decides)"),
+          fact("Denied", c?.deny?.length ? c.deny.join(", ") : "—"),
+          fact("Plugins", c?.plugins?.length ? c.plugins.map((x) => (x.enabled ? x.id : `${x.id} (off)`)).join(", ") : "—"),
+        ),
+        d.effective.error
+          ? errorBox(new Error(`The gateway did not list the tools: ${d.effective.error}`))
+          : h("p", { class: "muted", text: `${total} tools the main agent can call now (gateway tools.effective, read every 5 min). The reviewer still judges each call.` }),
+        ...groups.map((g) =>
+          h(
+            "details",
+            { class: "card tool-group", open: true },
+            h("summary", { text: `${g.label} (${g.tools.length})` }),
+            apTable(["Tool", "What it does"], g.tools.map((t) => h("tr", null, h("td", { class: "mono small", text: t.id }), h("td", { class: "item-title small", text: t.description ?? "" })))),
+          ),
+        ),
+        docView(p.docs.tools, "TOOLS.md"),
+      );
+    })
+    .catch((err) => wrap.replaceChildren(errorBox(err)));
+  return wrap;
+}
+
+function egressView(key) {
+  const wrap = h("div", { class: "stack" }, placeholder("Reading the egress lists…"));
+  api(`/api/bots/${encodeURIComponent(key)}/egress`)
+    .then((d) => {
+      const q = app.agents.q;
+      const listBlock = (title, hosts, note) =>
+        h(
+          "details",
+          { class: "card tool-group", open: hosts.length <= 40 },
+          h("summary", { text: `${title} (${hosts.length})` }),
+          note ? h("p", { class: "muted small", text: note }) : null,
+          hosts.filter((x) => matches(q, x)).length ? h("ul", { class: "host-list mono small" }, hosts.filter((x) => matches(q, x)).map((x) => h("li", { text: x }))) : empty("None."),
+        );
+      wrap.replaceChildren(
+        d.behindProxy
+          ? h("p", { class: "muted", text: "This bot reaches the internet only through the egress proxy. A host is allowed when it is on the base list, the shared learned list or this bot's learned list. scripts/claw-vet adds hosts after a first-visit check." })
+          : h("p", { class: "warn-text", text: "This bot is not behind the egress proxy (it is not in egress/bots.json). The lists below do not limit it." }),
+        listBlock("This bot's learned hosts", d.learnedBot, "Written only by claw-vet for this bot."),
+        listBlock("Shared learned hosts", d.learnedShared, null),
+        listBlock("Base allowlist", d.base, "sandbox/egress-proxy/allowlist.txt and the proxy's ALLOWLIST setting."),
+        section(
+          "Recent traffic",
+          d.auditRead ? "From the tail of the proxy's current audit file (the proxy starts a new file at 32 MB): hosts this bot asked for, newest first." : "The proxy audit file could not be read (is oasis-claw-vet running?).",
+          d.activity?.length
+            ? apTable(["Host", "Allowed", "Refused", "Last"], d.activity.filter((a) => matches(q, a.host)).map((a) => h("tr", { class: a.deny ? "warn-row" : "" }, h("td", { class: "mono small", text: a.host }), h("td", { class: "num", text: a.allow }), h("td", { class: "num", text: a.deny }), h("td", { text: ago(a.last) }))))
+            : empty("No traffic in the audit tail."),
+        ),
+        section(
+          "Vetting decisions",
+          "The latest first-visit decisions by claw-vet for this bot.",
+          d.decisions.length
+            ? apTable(["When", "Host", "Decision", "Reason"], d.decisions.filter((x) => matches(q, x.host, x.reason)).map((x) => h("tr", null, h("td", { text: ago(x.ts) }), h("td", { class: "mono small", text: x.host }), h("td", null, apState(x.decision ?? "?")), h("td", { class: "item-title small", text: x.reason ?? "" }))))
+            : empty("No vetting decisions for this bot."),
+        ),
+      );
+    })
+    .catch((err) => wrap.replaceChildren(errorBox(err)));
+  return wrap;
 }
 
 // ── System 2: work ────────────────────────────────────────────────────────────
@@ -1644,6 +2109,9 @@ const AGENT_TABS = [
   ["soul", "Soul"],
   ["user", "User"],
   ["memory", "Memory"],
+  ["agents", "Agents"],
+  ["tools", "Tools"],
+  ["egress", "Egress"],
   ["dreams", "Dreams"],
   ["notes", "Notes"],
   ["reviewer", "Reviewer"],
@@ -1941,6 +2409,9 @@ function renderAgents() {
       soul: () => docView(p.docs.soul, "SOUL.md"),
       user: () => docView(p.docs.user, "USER.md"),
       memory: () => docView(p.docs.memory, "MEMORY.md"),
+      agents: () => docView(p.docs.agents, "AGENTS.md"),
+      tools: () => toolsView(key, p),
+      egress: () => egressView(key),
       dreams: () => dreamsView(p),
       notes: () => notesView(p),
       reviewer: () => reviewerView(p.reviewer),

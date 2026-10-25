@@ -23,7 +23,8 @@
 ##   - Internal networks only. The one route out is the egress proxy, whose
 ##     base allowlist holds api.telegram.org.
 ##   - Bots reach this service at http://oasis-autoreviewer:8791. They can
-##     propose and read; no route decides a grant.
+##     propose and read; no route decides a grant. Mike decides on the
+##     Telegram card or on the fleet observatory page (a host-only folder).
 
 name: oasis-autoreviewer
 
@@ -59,6 +60,9 @@ services:
       # CLAW-127: Claude Code's directive proposals (scripts/claw-directive). Host-only
       # folder: no bot mounts it, so no bot can propose as "console".
       AUTOREVIEWER_CONSOLE_DIR: /run/console-proposals
+      # Mike's decisions from the fleet observatory (scripts/claw-observatory.mjs).
+      # Host-only folder: no bot mounts it, so no bot can decide its own request.
+      AUTOREVIEWER_DECISION_DIR: /run/observatory-decisions
       # CLAW-122: sanitized fleet snapshot (scripts/claw-fleet-snapshot.mjs), read-only.
       AUTOREVIEWER_SNAPSHOT: /run/fleet-snapshot/snapshot.json
       # CLAW-122: writable state (the /watch list). Only this container mounts it.
@@ -94,6 +98,10 @@ services:
       - type: bind
         source: ${HOME}/Library/Application Support/oasis-x/autoreviewer-console
         target: /run/console-proposals
+      # Read-write HERE ONLY; the observatory server writes it on the Mac.
+      - type: bind
+        source: ${HOME}/Library/Application Support/oasis-x/autoreviewer-decisions
+        target: /run/observatory-decisions
       - type: bind
         source: ${HOME}/Library/Application Support/oasis-x/fleet-snapshot
         target: /run/fleet-snapshot

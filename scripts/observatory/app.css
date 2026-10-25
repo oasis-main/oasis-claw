@@ -672,3 +672,28 @@ body.swarm-solo .anim-panel > .fb-row { padding: 6px 8px; }
 .state.s-proposed { color: var(--warn); }
 .state.s-revoked, .state.s-denied, .state.s-expired, .state.s-lapsed { color: var(--muted); text-decoration: line-through; }
 .table td .mono { white-space: nowrap; }
+
+/* ── Cron view, decisions, tools and egress tabs (2026-10-25) ── */
+.button.danger { color: var(--bad); }
+.button.danger:hover { background: color-mix(in srgb, var(--bad) 12%, transparent); }
+.button:disabled { opacity: 0.5; cursor: progress; }
+.warn-text { color: var(--warn); }
+.table tr.muted-row td { color: var(--muted); }
+.table tr.warn-row td:first-child { color: var(--warn); }
+.table tr.editor-row td { background: var(--panel-2); }
+.clamp { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; max-width: 60ch; }
+.field.small-field { width: auto; max-width: 220px; padding: 3px 6px; font-size: 12px; }
+.field.small-field.overridden { border-color: var(--accent); color: var(--accent); }
+.cron-editor { padding: 6px 0; }
+.cron-editor textarea.field { font-family: var(--mono); font-size: 12.5px; }
+.toolbar.tight-row { margin: 4px 0 0; }
+.form-card { padding: 10px 14px; margin-bottom: 12px; }
+.form-card summary, .tool-group summary { cursor: pointer; font-weight: 600; padding: 2px 0; }
+.form-card[open] summary { margin-bottom: 10px; }
+.tool-group { padding: 8px 12px; margin-bottom: 10px; }
+.tool-group[open] summary { margin-bottom: 8px; }
+.host-list { columns: 3 220px; margin: 0; padding-left: 18px; }
+@media (max-width: 640px) {
+  .field-row { grid-template-columns: 1fr; gap: 4px; }
+  .clamp { max-width: 40ch; }
+}
