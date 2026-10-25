@@ -67,7 +67,7 @@ Env:
   OASIS_GENERATION_TOKEN   service token (required for live vetting; same token the bots
                            use). Falls back to the repo root .env when unset in the shell
                            (CLAW-115) — export a value yourself to override that default.
-  OASIS_VET_MODEL          default claude-sonnet-5, routed through oasis-generation like
+  OASIS_VET_MODEL          default claude-sonnet-5-5, routed through oasis-generation like
                            everything else (Mike, 2026-09-15: match the fleet's L2
                            reviewer model — see OASIS_REVIEWER_MODEL on each bot)
   OASIS_EGRESS_PROXY       proxy container name (default oasis-egress-proxy)
@@ -135,7 +135,7 @@ def _repo_env_token_fallback():
 
 GEN_URL = os.environ.get("OASIS_GENERATION_URL", "").strip() or "http://localhost:8800/v1"
 GEN_TOKEN = os.environ.get("OASIS_GENERATION_TOKEN", "").strip() or _repo_env_token_fallback()
-VET_MODEL = os.environ.get("OASIS_VET_MODEL", "").strip() or "claude-sonnet-5"
+VET_MODEL = os.environ.get("OASIS_VET_MODEL", "").strip() or "claude-sonnet-5-5"
 PROXY_CONTAINER = os.environ.get("OASIS_EGRESS_PROXY", "").strip() or "oasis-egress-proxy"
 
 # Where to read the proxy's decision stream from. Two sources, same JSONL:
