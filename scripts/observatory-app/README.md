@@ -58,9 +58,9 @@ System Settings > Privacy & Security > Files and Folders.
    container continues to run, as after `make observatory` in a terminal.
    `cd bots && make observatory-proxy-down` stops the port proxy.
 
-A link to a different address opens in the default browser. Examples are a
-bot's Control UI and the swarm dashboard. This is the same as
-`make control-ui` and `make swarm-open`.
+A link to a loopback address opens in a new window of the app. Examples are
+a bot's Control UI and the swarm dashboard. A link to any other address opens
+in the default browser.
 
 The menu item **View > Show Log** opens the log. The menu item
 **View > Start Observatory** starts the observatory again after it stops.

@@ -138,13 +138,14 @@ func httpAnswers(port: Int, _ done: @escaping (Bool) -> Void) {
 
 // ── the app ──────────────────────────────────────────────────────────────────
 
-final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate {
   let config = Config.load()
   var window: NSWindow!
   var statusView: NSTextView!
   var statusScroll: NSScrollView!
   var webView: WKWebView?
-  var popups: [WKWebView] = []
+  // Windows of this app for loopback links: a bot's Control UI, the swarm dashboard.
+  var linkWindows: [NSWindow] = []
 
   // The servers the app started, if any.
   var groupPid: pid_t = 0  // make, and the leader of the process group
@@ -376,10 +377,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     url.scheme == "http" && url.host == "127.0.0.1" && url.port == port
   }
 
-  /// A link to another address opens in the default browser.
+  /// A loopback address: a bot's Control UI (through the port proxy) or the
+  /// swarm dashboard. Mike, 2026-10-25: these open in the app, not the browser.
+  func isLoopback(_ url: URL) -> Bool {
+    url.scheme == "http" && (url.host == "127.0.0.1" || url.host == "localhost")
+  }
+
+  /// Any other web address opens in the default browser.
   func openOutside(_ url: URL) {
     guard url.scheme == "http" || url.scheme == "https" else { return }
     NSWorkspace.shared.open(url)
+  }
+
+  /// Put a web view for a loopback address in a window of this app.
+  func showInWindow(_ wv: WKWebView) {
+    wv.navigationDelegate = self
+    wv.uiDelegate = self
+    let w = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 1280, height: 860),
+      styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+    w.title = "Opening…"
+    w.isReleasedWhenClosed = false
+    w.minSize = NSSize(width: 480, height: 360)
+    w.contentView = wv
+    w.delegate = self
+    let origin = (linkWindows.last ?? window).frame.origin
+    w.setFrameOrigin(NSPoint(x: origin.x + 28, y: origin.y - 28))
+    linkWindows.append(w)
+    w.makeKeyAndOrderFront(nil)
+  }
+
+  /// A loopback link from the main page opens a new window of this app,
+  /// with the main page's data store (the same session as a popup gets).
+  func openInApp(_ url: URL) {
+    let cfg = WKWebViewConfiguration()
+    if let store = webView?.configuration.websiteDataStore { cfg.websiteDataStore = store }
+    let wv = WKWebView(frame: .zero, configuration: cfg)
+    showInWindow(wv)
+    wv.load(URLRequest(url: url))
   }
 
   func webView(_ wv: WKWebView, decidePolicyFor action: WKNavigationAction,
@@ -388,35 +423,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     if ["about", "blob", "data"].contains(url.scheme ?? "") { decisionHandler(.allow); return }
     if wv === webView {
       if isOwnOrigin(url) { decisionHandler(.allow); return }
-      if action.targetFrame?.isMainFrame ?? true { openOutside(url) }
+      if action.targetFrame?.isMainFrame ?? true {
+        if isLoopback(url) { openInApp(url) } else { openOutside(url) }
+      }
       decisionHandler(.cancel)
       return
     }
-    // A popup (window.open("about:blank"), then a new address) hands the
-    // address to the default browser, or to the main window for this origin.
+    // A link window keeps loopback addresses. Another address goes to the
+    // default browser; a window that never showed a page then closes (the
+    // page's window.open("about:blank") followed by an outside address).
+    if isLoopback(url) { decisionHandler(.allow); return }
     decisionHandler(.cancel)
-    if isOwnOrigin(url) { webView?.load(URLRequest(url: url)) } else { openOutside(url) }
-    popups.removeAll { $0 === wv }
+    openOutside(url)
+    if wv.url == nil || wv.url?.scheme == "about" { wv.window?.close() }
   }
 
   func webView(_ wv: WKWebView, createWebViewWith cfg: WKWebViewConfiguration, for action: WKNavigationAction,
                windowFeatures: WKWindowFeatures) -> WKWebView? {
     if let url = action.request.url, url.scheme == "http" || url.scheme == "https" {
-      if isOwnOrigin(url) { webView?.load(URLRequest(url: url)) } else { openOutside(url) }
-      return nil
+      if wv === webView && isOwnOrigin(url) { webView?.load(URLRequest(url: url)); return nil }
+      if !isLoopback(url) { openOutside(url); return nil }
     }
-    // An off-screen view for the page's "Opening…" tab; it lives until it
-    // navigates away, closes, or 60 s pass.
-    let popup = WKWebView(frame: .zero, configuration: cfg)
-    popup.navigationDelegate = self
-    popup.uiDelegate = self
-    popups.append(popup)
-    DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in self?.popups.removeAll { $0 === popup } }
-    return popup
+    // about:blank (the page's "Opening…" tab) or a loopback address: a window
+    // of this app. WebKit loads the request into the view returned here.
+    let child = WKWebView(frame: .zero, configuration: cfg)
+    showInWindow(child)
+    return child
+  }
+
+  func webView(_ wv: WKWebView, didFinish navigation: WKNavigation!) {
+    guard wv !== webView, let title = wv.title, !title.isEmpty else { return }
+    wv.window?.title = title
   }
 
   func webViewDidClose(_ wv: WKWebView) {
-    popups.removeAll { $0 === wv }
+    if wv !== webView { wv.window?.close() }
+  }
+
+  func windowWillClose(_ note: Notification) {
+    guard let w = note.object as? NSWindow else { return }
+    if w === window {
+      // Closing the main window quits the app, so the link windows go with it.
+      for lw in linkWindows { lw.close() }
+      return
+    }
+    (w.contentView as? WKWebView)?.stopLoading()
+    linkWindows.removeAll { $0 === w }
   }
 
   func webViewWebContentProcessDidTerminate(_ wv: WKWebView) {
@@ -427,7 +479,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
     let alert = NSAlert()
     alert.messageText = message
-    alert.beginSheetModal(for: window) { _ in completionHandler() }
+    alert.beginSheetModal(for: wv.window ?? window) { _ in completionHandler() }
   }
 
   func webView(_ wv: WKWebView, runJavaScriptConfirmPanelWithMessage message: String,
@@ -436,7 +488,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     alert.messageText = message
     alert.addButton(withTitle: "OK")
     alert.addButton(withTitle: "Cancel")
-    alert.beginSheetModal(for: window) { completionHandler($0 == .alertFirstButtonReturn) }
+    alert.beginSheetModal(for: wv.window ?? window) { completionHandler($0 == .alertFirstButtonReturn) }
   }
 
   func webView(_ wv: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?,
@@ -448,7 +500,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     alert.accessoryView = field
     alert.addButton(withTitle: "OK")
     alert.addButton(withTitle: "Cancel")
-    alert.beginSheetModal(for: window) { completionHandler($0 == .alertFirstButtonReturn ? field.stringValue : nil) }
+    alert.beginSheetModal(for: wv.window ?? window) { completionHandler($0 == .alertFirstButtonReturn ? field.stringValue : nil) }
   }
 
   func webView(_ wv: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,
@@ -457,7 +509,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     panel.allowsMultipleSelection = parameters.allowsMultipleSelection
     panel.canChooseDirectories = false
     panel.canChooseFiles = true
-    panel.beginSheetModal(for: window) { completionHandler($0 == .OK ? panel.urls : nil) }
+    panel.beginSheetModal(for: wv.window ?? window) { completionHandler($0 == .OK ? panel.urls : nil) }
   }
 
   // ── window and menus ──
@@ -471,6 +523,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     window.minSize = NSSize(width: 720, height: 480)
     window.center()
     window.setFrameAutosaveName("FleetObservatoryMain")
+    window.delegate = self
     statusScroll = NSTextView.scrollableTextView()
     statusView = (statusScroll.documentView as! NSTextView)
     statusView.isEditable = false
@@ -482,7 +535,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
   func showStatusView() {
     webView = nil
-    popups.removeAll()
     window.contentView = statusScroll
   }
 
