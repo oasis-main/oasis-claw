@@ -10,7 +10,8 @@ every repository:
   ~/Library/Application Support/oasis-x/yesman-secrets/
     providers.env      env_file for Yes Man only: SCW_*, MODAL_TOKEN_*, GH_TOKEN,
                        DIGITALOCEAN_ACCESS_TOKEN, STRIPE_API_KEY (a RESTRICTED key),
-                       HCLOUD_TOKEN (model archive), HCLOUD_TOKEN_GENERATION (gateway VM)
+                       HCLOUD_TOKEN (model archive), HCLOUD_TOKEN_GENERATION (gateway VM),
+                       GHOST_ADMIN_API_KEY + GHOST_API_URL (blog admin integration)
     aws/credentials    mounted read-only at /home/node/.aws in Yes Man:
     aws/config         profiles oasis-dev, oasis-prod, default (personal account)
 
@@ -25,7 +26,7 @@ nothing. So egress is derived from the keys:
   scripts/claw-provider-creds revoke <p>     # remove provider p's key (aws: also deletes the IAM
                                              # keys) and its egress, restart
 
-Providers: aws, scaleway, modal, github, digitalocean, gcp, hetzner, workspace, stripe. Each host in bots/yesman/role.yaml
+Providers: aws, scaleway, modal, github, digitalocean, gcp, hetzner, workspace, stripe, ghost. Each host in bots/yesman/role.yaml
 origins.trusted carries a `# provider:<name>` tag; `apply` writes
 sandbox/egress-proxy/seeds/yesman/allowlist.txt with only the hosts of the
 providers that have keys. `apply` refuses while the known secret files still sit
@@ -58,7 +59,7 @@ FALLBACK_FILES = [
     "bots/docker-compose.bots.yml",
     "bots/docker-compose.yesman-reach.yml",
 ]
-PROVIDERS = ("aws", "scaleway", "modal", "github", "digitalocean", "gcp", "hetzner", "workspace", "stripe")
+PROVIDERS = ("aws", "scaleway", "modal", "github", "digitalocean", "gcp", "hetzner", "workspace", "stripe", "ghost")
 
 # (admin profile on Mike's Mac, profile name inside Yes Man's credentials file)
 AWS_ACCOUNTS = [
@@ -80,6 +81,12 @@ ENV_KEYS = {
     # (an approval card every time). A later design moves the key out of Yes
     # Man into a broker (CLAW-120).
     "stripe": ("STRIPE_API_KEY",),
+    # Ghost (Mike, 2026-10-26): the Admin API key of a custom integration on
+    # oasisx.ghost.io, for the retraction edits to the blog. Admin keys have no
+    # scopes, so every Yes Man command that names the Ghost admin API or this
+    # key needs an approval-ledger entry (reviewer infraGateExtra "ghost-admin").
+    # Time-boxed: revoke it (and delete the integration in Ghost) when the job is done.
+    "ghost": ("GHOST_ADMIN_API_KEY",),
 }
 
 # Extra keys of a provider that do not decide whether it is active, but are
@@ -90,6 +97,7 @@ ENV_KEYS = {
 # Terraform takes it as TF_VAR_hcloud_token; hcloud as HCLOUD_TOKEN=... per call.
 EXTRA_ENV_KEYS = {
     "hetzner": ("HCLOUD_TOKEN_GENERATION",),
+    "ghost": ("GHOST_API_URL",),
 }
 
 # Providers whose credential is a FILE, not a providers.env key (Mike,
@@ -303,6 +311,29 @@ except Exception as e:
     print(f"{kind} key; FAILED {type(e).__name__}")
 """
 
+PY_GHOST = r"""
+import base64, hashlib, hmac, json, os, time, urllib.error, urllib.request
+key = os.environ.get("GHOST_ADMIN_API_KEY", ""); url = os.environ.get("GHOST_API_URL", "https://oasisx.ghost.io").rstrip("/")
+kid, _, secret = key.partition(":")
+b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=")
+now = int(time.time())
+head = b64(json.dumps({"alg": "HS256", "typ": "JWT", "kid": kid}).encode())
+body = b64(json.dumps({"iat": now, "exp": now + 300, "aud": "/admin/"}).encode())
+try:
+    sig = b64(hmac.new(bytes.fromhex(secret), head + b"." + body, hashlib.sha256).digest())
+except ValueError:
+    print("FAILED key is not <id>:<hex secret>"); raise SystemExit
+req = urllib.request.Request(url + "/ghost/api/admin/posts/?limit=1&fields=id",
+                             headers={"Authorization": "Ghost " + (head + b"." + body + b"." + sig).decode()})
+try:
+    with urllib.request.urlopen(req, timeout=20) as r:
+        print(f"admin read HTTP {r.status}, posts total {json.load(r).get('meta', {}).get('pagination', {}).get('total')}")
+except urllib.error.HTTPError as e:
+    print(f"admin read FAILED HTTP {e.code}")
+except Exception as e:
+    print(f"FAILED {type(e).__name__}")
+"""
+
 PY_BLOCKED = r"""
 import sys, urllib.error, urllib.request
 try:
@@ -360,6 +391,10 @@ def probe(provider):
         # Key TYPE and one read only; the key itself is never printed.
         r = dexec(["python3", "-c", PY_STRIPE], timeout=60)
         print(f"  stripe: {r.stdout.strip() or tail(r)}")
+    elif provider == "ghost":
+        # One authenticated read (post count); the key is never printed.
+        r = dexec(["python3", "-c", PY_GHOST], timeout=60)
+        print(f"  ghost: {r.stdout.strip() or tail(r)}")
     elif provider == "digitalocean":
         # Status and droplet limit only: `account get` also shows the email.
         r = dexec(["sh", "-c", "command -v doctl >/dev/null || { echo 'doctl not staged (claw-infra-tools stage)'; exit 3; }; doctl account get --format Status,DropletLimit --no-header"], timeout=60)
@@ -495,7 +530,9 @@ def cmd_revoke(args):
     else:
         comment_out_env(set(ENV_KEYS[p]) | set(EXTRA_ENV_KEYS.get(p, ())) | ({"OASIS_GIT_REPOS"} if p == "github" else set()))
         print(f"commented out {p} keys in providers.env")
-        if p != "github":
+        if p == "ghost":
+            print("Also delete the integration in Ghost admin (Settings > Integrations): removing it here does not revoke it.")
+        elif p != "github":
             print(f"Also delete the {p} token in the provider console: removing it here does not revoke it.")
         else:
             print("Also delete the token at https://github.com/settings/personal-access-tokens")
