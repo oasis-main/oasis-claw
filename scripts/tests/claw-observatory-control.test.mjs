@@ -297,3 +297,84 @@ test("the board item route reads, comments and edits only a discovered board", a
     server.close();
   }
 });
+
+test("fleet containers: only fleet names, services first, bots after", async () => {
+  const { parseFleetRows, isFleetContainer } = await import("../claw-observatory.mjs");
+  const out = [
+    "oasis-claw-house\texited\tExited (137) 40 minutes ago",
+    "oasis-kin-postgres\trunning\tUp 3 weeks (healthy)",
+    "oasis-autoreviewer\texited\tExited (137) 28 minutes ago",
+    "sharp_lovelace\tcreated\tCreated",
+    "oasis-claw-runtime\trunning\tUp 22 hours (healthy)",
+    "oasis-egress-proxy\trunning\tUp 22 hours",
+    "oasis-claw-kaizen\trunning\tUp 1 hour",
+  ].join("\n");
+  const rows = parseFleetRows(out, /kaizen/i);
+  assert.deepEqual(rows.map((r) => [r.name, r.kind, r.down]), [
+    ["oasis-egress-proxy", "service", false],
+    ["oasis-autoreviewer", "service", true],
+    ["oasis-claw-runtime", "bot", false],
+    ["oasis-claw-house", "bot", true],
+  ]);
+  assert.equal(isFleetContainer("oasis-kin-minio", null), false);
+  assert.equal(isFleetContainer("oasis-claw-kaizen", /kaizen/), false);
+});
+
+test("the fleet routes start, restart and recover only fleet containers", async () => {
+  const state = new Map([
+    ["oasis-autoreviewer", "exited"],
+    ["oasis-claw-house", "exited"],
+    ["oasis-claw-runtime", "running"],
+  ]);
+  const calls = [];
+  const ctx = {
+    token: "t".repeat(32),
+    discover: async () => ({ bots: [], proxy: null }),
+    swarm: { port: 1, url: "http://127.0.0.1:1/" },
+    snapshotDir: tmp("obs-empty-"),
+    mailRoot: tmp("obs-mail-empty-"),
+    identities: identityStore(tmp("obs-ident-")),
+    readIdentity: async () => ({ name: null, role: null, avatar: null }),
+    settings: settingsStore(path.join(tmp("obs-set-"), "settings.json")),
+    fleetPollMs: 5,
+    listFleet: async () =>
+      [...state].map(([name, s]) => ({ name, state: s, status: s, health: s === "running" ? "healthy" : null, kind: name.includes("claw-") ? "bot" : "service", down: s !== "running" })),
+    dockerCtl: async (action, name) => {
+      calls.push([action, name]);
+      state.set(name, "running");
+    },
+  };
+  const server = createObservatoryServer(ctx);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  ctx.port = server.address().port;
+  const own = `http://127.0.0.1:${ctx.port}`;
+  const call = (pathname, { method = "GET", origin = own } = {}) =>
+    new Promise((resolve, reject) => {
+      const headers = { host: `127.0.0.1:${ctx.port}`, "x-observatory-token": ctx.token };
+      if (method !== "GET" && origin) headers.origin = origin;
+      const r = http.request({ host: "127.0.0.1", port: ctx.port, path: pathname, method, headers, agent: false }, (res) => {
+        let text = "";
+        res.on("data", (c) => (text += c));
+        res.on("end", () => resolve({ status: res.statusCode, json: JSON.parse(text || "null") }));
+      });
+      r.on("error", reject);
+      r.end();
+    });
+  try {
+    assert.equal((await call("/api/fleet/containers")).json.containers.length, 3);
+    assert.equal((await call("/api/fleet/containers/oasis-kin-postgres/start", { method: "POST" })).status, 404);
+    assert.equal((await call("/api/fleet/containers/oasis-claw-runtime/restart", { method: "POST", origin: null })).status, 403);
+    assert.equal((await call("/api/fleet/containers/oasis-claw-runtime/stop", { method: "POST" })).status, 405);
+    const r = await call("/api/fleet/containers/oasis-claw-runtime/restart", { method: "POST" });
+    assert.equal(r.status, 200);
+    assert.deepEqual(calls.at(-1), ["restart", "oasis-claw-runtime"]);
+
+    assert.equal((await call("/api/fleet/recover", { method: "POST" })).status, 202);
+    for (let i = 0; i < 100 && !(await call("/api/fleet/recover")).json.job.done; i++) await new Promise((res) => setTimeout(res, 10));
+    const job = (await call("/api/fleet/recover")).json.job;
+    assert.deepEqual(job.steps.map((s) => [s.name, s.status]), [["oasis-autoreviewer", "ok"], ["oasis-claw-house", "ok"]]);
+    assert.deepEqual(calls.slice(-2), [["start", "oasis-autoreviewer"], ["start", "oasis-claw-house"]]);
+  } finally {
+    server.close();
+  }
+});

@@ -641,7 +641,13 @@ function renderFleetStatus() {
   const proxyText = f.proxy ? `port proxy ${f.proxy.state}${f.proxy.health ? `, ${f.proxy.health}` : ""}` : "port proxy not created";
   statusEl.replaceChildren(
     ...[
-      chip(`${running} of ${f.bots.length} bots running`, running === f.bots.length ? "ok" : "warn"),
+      h("button", {
+        type: "button",
+        class: `chip chip-button ${running === f.bots.length ? "ok" : "warn"}`,
+        title: "Fleet health: start or restart bots and services",
+        text: `${running} of ${f.bots.length} bots running`,
+        onclick: openFleetDialog,
+      }),
       chip(proxyText, f.proxy?.state === "running" ? "ok" : "warn"),
       swarmChip(f.swarm),
       chip(f.snapshot.last ? `last snapshot ${ago(f.snapshot.last.date)}` : "no snapshot yet", f.snapshot.last ? "" : "warn"),
@@ -723,6 +729,107 @@ function renderView() {
   else if (app.view === "approvals") renderApprovals();
   else if (app.view === "cron") renderCron();
   else renderAgents();
+}
+
+// ── fleet health (Mike, 2026-10-26) ──────────────────────────────────────────
+// Every fleet container with its state, a Start or Restart button each, and
+// "Start all that are down": shared services first, then the autoreviewer,
+// then each bot, each one healthy before the next. `docker start` keeps a
+// container's config; a recreate (new .env or image) stays in bots/Makefile.
+
+function openFleetDialog() {
+  document.querySelector("dialog.fleet-dialog")?.close();
+  const dialog = h("dialog", { class: "settings-dialog fleet-dialog", "aria-label": "Fleet health" });
+  const inner = h("div", { class: "settings-inner" }, placeholder("Reading the fleet's containers…"));
+  dialog.append(inner);
+  let timer = null;
+  dialog.addEventListener("close", () => {
+    clearTimeout(timer);
+    dialog.remove();
+  });
+  document.body.append(dialog);
+  dialog.showModal();
+  let busy = null;
+  const stateText = (r) => (r.state === "running" ? (r.health ? `running, ${r.health}` : "running") : r.state);
+  const tone = (r) => (r.down ? "bad" : r.health && r.health !== "healthy" ? "warn" : "ok");
+  const draw = (d, note = "") => {
+    const job = d.recover;
+    const running = job && !job.done;
+    const down = d.containers.filter((r) => r.down);
+    const act = async (r, action) => {
+      if (action === "restart" && !window.confirm(`Restart ${r.name}? A bot drops its current turn.`)) return;
+      busy = r.name;
+      draw(d, `${action === "start" ? "Starting" : "Restarting"} ${r.name} and waiting until it is healthy…`);
+      let msg;
+      try {
+        const res = await api(`/api/fleet/containers/${encodeURIComponent(r.name)}/${action}`, { method: "POST" });
+        msg = `${r.name}: ${res.detail}.`;
+      } catch (err) {
+        msg = `${r.name}: ${err.message}`;
+      }
+      busy = null;
+      load(msg);
+    };
+    const rows = d.containers.map((r) => {
+      const step = job?.steps?.find((x) => x.name === r.name);
+      return h(
+        "tr",
+        null,
+        h("td", null, h("span", { class: `dot ${tone(r)}` }), " ", h("span", { class: "mono small", text: r.name })),
+        h("td", { class: "muted small", text: r.kind }),
+        h("td", null, h("div", { text: stateText(r) }), h("div", { class: "muted small", text: step ? `start-all: ${step.status}${step.detail ? ` (${step.detail})` : ""}` : r.status })),
+        h(
+          "td",
+          null,
+          h("button", {
+            type: "button",
+            class: `button small${r.down ? "" : " danger"}`,
+            disabled: Boolean(busy || running),
+            text: busy === r.name ? "…" : r.down ? "Start" : "Restart",
+            onclick: () => act(r, r.down ? "start" : "restart"),
+          }),
+        ),
+      );
+    });
+    inner.replaceChildren(...[
+      h(
+        "header",
+        { class: "settings-head" },
+        h("h2", { class: "grow", text: "Fleet health" }),
+        h("button", {
+          type: "button",
+          class: "button",
+          disabled: Boolean(busy || running || !down.length),
+          text: running ? "Starting…" : `Start all that are down (${down.length})`,
+          onclick: async () => {
+            try {
+              await api("/api/fleet/recover", { method: "POST" });
+            } catch (err) {
+              note = err.message;
+            }
+            load(note);
+          },
+        }),
+        h("button", { type: "button", class: "button small", text: "Close", onclick: () => dialog.close() }),
+      ),
+      h("p", { class: "muted small", text: "Start keeps a container's config, as after a crash. Services start before the bots. A new .env or image needs a recreate: cd bots && make BOT=<bot> recreate." }),
+      note ? h("p", { class: "small", role: "status", text: note }) : null,
+      job?.done && job.steps.length ? h("p", { class: "small", text: `Last start-all ${ago(job.finishedAt)}: ${job.steps.filter((x) => x.status === "ok").length} of ${job.steps.length} started.${job.error ? ` ${job.error}` : ""}` }) : null,
+      apTable(["Container", "Kind", "State", ""], rows),
+    ].filter(Boolean));
+    clearTimeout(timer);
+    if (running) timer = setTimeout(() => load(note), 2000);
+  };
+  const load = async (note) => {
+    try {
+      const d = await api("/api/fleet/containers");
+      draw(d, note);
+      refreshFleet(false);
+    } catch (err) {
+      inner.replaceChildren(errorBox(err));
+    }
+  };
+  load("");
 }
 
 // ── Approvals (CLAW-122 slice 2) ──────────────────────────────────────────────

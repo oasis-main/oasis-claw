@@ -62,7 +62,9 @@ A link to a loopback address opens in a new window of the app. Examples are
 a bot's Control UI and the swarm dashboard. A link to any other address opens
 in the default browser.
 
-The menu item **View > Show Log** opens the log. The menu item
+The menu item **View > Fleet Health…** (⇧⌘H) lists the fleet's containers.
+It starts one that is down, restarts one, or starts all that are down. The
+menu item **View > Show Log** opens the log. The menu item
 **View > Start Observatory** starts the observatory again after it stops.
 
 ## Log

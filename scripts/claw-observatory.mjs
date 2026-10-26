@@ -42,7 +42,7 @@
 //   5. The only writes the API takes are change requests (/api/feedback),
 //      the Control UI open and approve (item 7), the settings (item 8), and
 //      the decisions and cron changes (item 9), and .swarm item comments
-//      and edits (item 10).
+//      and edits (item 10), and fleet start/restart (item 11).
 //      A write needs the token AND this page's Origin. The requests and their screenshots stay in the
 //      state folder, which no bot mounts: a screenshot can show any agent's
 //      memory.
@@ -76,6 +76,11 @@
 //      item's queue.md block, which the bots read) or replaces one item's
 //      title and body when its block hash still matches. Only a bot board
 //      that fleet discovery found is writable; token + Origin as item 5.
+//  11. Fleet health (Mike, 2026-10-26). POST /api/fleet/containers/<name>/
+//      start|restart and POST /api/fleet/recover run `docker start` or
+//      `docker restart` on fleet containers only (the bot prefix and
+//      FLEET_SERVICES, minus the exclude pattern); argv only; token + Origin.
+//      No recreate: a container keeps the config it had.
 //   6. `serve` also starts the dot_swarm dashboard (`swarm gui`, 18781), where
 //      the human claims, finishes, blocks and comments on items. A bot can
 //      reach that port too, so the observatory starts it only after it proves
@@ -2222,6 +2227,7 @@ export function checkRequest(req, port) {
     isGenrouteWrite(req.method, pathname) ||
     isCronWrite(req.method, pathname) ||
     isBoardWrite(req.method, pathname) ||
+    isFleetWrite(req.method, pathname) ||
     (req.method === "POST" && pathname === DECIDE_PATH);
   if (!WRITE_METHODS.has(req.method) || !writable) {
     return { status: 405, error: "read-only" };
@@ -3220,6 +3226,140 @@ export function pickEffectiveTools(r) {
   };
 }
 
+// ── fleet health: start and restart containers (Mike, 2026-10-26) ────────────
+// After a Mac out-of-memory event, some bots and services stayed down
+// (killed from outside Docker, exit 137, so `restart: unless-stopped` did not
+// bring them back). Mike: "restart the fleet where necessary ... nice to be
+// able to do from the desktop app". This lists the fleet's containers and
+// runs `docker start` or `docker restart` on one of them: the container keeps
+// its config, as after a crash. A recreate (new .env, new image) stays a
+// compose job in bots/Makefile. Only names on FLEET_SERVICES or with the bot
+// prefix are touched, and never one the exclude pattern hides (TRUST MODEL
+// item 11). "Start all that are down" starts the shared services first, then
+// the autoreviewer, then each bot, and waits for each to be healthy.
+const FLEET_SERVICES = [
+  // In start order: what the bots need first.
+  "oasis-egress-proxy",
+  "oasis-semantics",
+  "oasis-voice",
+  "oasis-decider",
+  "claw-mail-relay",
+  PROXY_CONTAINER,
+  "oasis-claw-vet",
+  "oasis-claw-vanhelsing-sandbox",
+  "oasis-autoreviewer",
+];
+const FLEET_PATH_RE = /^\/api\/fleet\/(containers|recover)(?:\/([a-z0-9][a-z0-9_.-]{0,80})\/(start|restart))?$/;
+const isFleetWrite = (method, pathname) => {
+  const m = FLEET_PATH_RE.exec(pathname);
+  return method === "POST" && !!m && (m[1] === "recover" ? !m[2] : !!m[2]);
+};
+const FLEET_WAIT_MS = 180_000;
+
+export function isFleetContainer(name, exclude = EXCLUDE_RE) {
+  if (exclude?.test(name)) return false;
+  return FLEET_SERVICES.includes(name) || name.startsWith(CONTAINER_PREFIX);
+}
+
+/** Start order: services in FLEET_SERVICES order, then bots (Nimbus's runtime first). */
+export function fleetOrder(names) {
+  const rank = (n) => {
+    const i = FLEET_SERVICES.indexOf(n);
+    if (i >= 0) return i;
+    return FLEET_SERVICES.length + (n === `${CONTAINER_PREFIX}runtime` ? 0 : 1);
+  };
+  return [...names].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+}
+
+export function parseFleetRows(out, exclude = EXCLUDE_RE) {
+  const rows = out
+    .split("\n")
+    .map((line) => {
+      const [name, state, status] = line.split("\t");
+      return { name, state, status, health: parseHealth(status) };
+    })
+    .filter((r) => r.name && isFleetContainer(r.name, exclude));
+  const order = fleetOrder(rows.map((r) => r.name));
+  return order.map((n) => {
+    const r = rows.find((x) => x.name === n);
+    return { ...r, kind: FLEET_SERVICES.includes(n) ? "service" : "bot", down: r.state !== "running" };
+  });
+}
+
+async function listFleetContainers() {
+  return parseFleetRows(await docker(["ps", "-a", "--format", "{{.Names}}\t{{.State}}\t{{.Status}}"]));
+}
+
+/** Wait until a started container is healthy (or running, with no health check). */
+async function waitReady(ctx, name, waitMs = FLEET_WAIT_MS) {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const row = (await ctx.listFleet()).find((r) => r.name === name);
+    if (!row) return { ok: false, detail: "gone" };
+    if (row.state === "running" && (row.health === null || row.health === "healthy")) return { ok: true, detail: row.health ?? "running" };
+    if (row.state !== "running" && row.state !== "restarting") return { ok: false, detail: row.state };
+    if (Date.now() > deadline) return { ok: false, detail: `not healthy after ${Math.round(waitMs / 1000)} s (${row.health ?? row.state})` };
+    await new Promise((r) => setTimeout(r, ctx.fleetPollMs ?? 3000));
+  }
+}
+
+/** Start every fleet container that is down, in order, one at a time. */
+async function runRecover(ctx, job) {
+  const down = (await ctx.listFleet()).filter((r) => r.down);
+  job.steps = down.map((r) => ({ name: r.name, kind: r.kind, status: "waiting", detail: r.status }));
+  for (const step of job.steps) {
+    step.status = "starting";
+    try {
+      await ctx.dockerCtl("start", step.name);
+      const ready = await waitReady(ctx, step.name);
+      step.status = ready.ok ? "ok" : "failed";
+      step.detail = ready.detail;
+    } catch (err) {
+      step.status = "failed";
+      step.detail = err.message;
+    }
+    ctx.cache.delete("fleet");
+  }
+  job.done = true;
+  job.finishedAt = Date.now();
+}
+
+/** /api/fleet/containers                 GET   the fleet's containers, with state and health
+ *  /api/fleet/containers/<name>/start    POST  docker start
+ *  /api/fleet/containers/<name>/restart  POST  docker restart
+ *  /api/fleet/recover                    GET   the last "start all that are down" job
+ *                                        POST  start one (409 while one runs) */
+async function routeFleet(req, url, ctx) {
+  const [, what, name, action] = FLEET_PATH_RE.exec(url.pathname) ?? [];
+  if (what === "containers" && !name) {
+    if (req.method !== "GET") return [405, { error: "method not allowed here" }];
+    return [200, { containers: await ctx.listFleet(), recover: ctx.recoverJob ?? null }];
+  }
+  if (what === "containers") {
+    if (req.method !== "POST") return [405, { error: "method not allowed here" }];
+    const row = (await ctx.listFleet()).find((r) => r.name === name);
+    if (!row) return [404, { error: `${name} is not a fleet container` }];
+    if (ctx.recoverJob && !ctx.recoverJob.done) return [409, { error: "a start-all job is running; wait for it" }];
+    await ctx.dockerCtl(action, name);
+    ctx.cache.delete("fleet");
+    const ready = await waitReady(ctx, name, 120_000);
+    return [ready.ok ? 200 : 502, { name, action, ...ready }];
+  }
+  if (what === "recover" && !name) {
+    if (req.method === "GET") return [200, { job: ctx.recoverJob ?? null }];
+    if (req.method !== "POST") return [405, { error: "method not allowed here" }];
+    if (ctx.recoverJob && !ctx.recoverJob.done) return [409, { error: "a start-all job is already running", job: ctx.recoverJob }];
+    const job = { startedAt: Date.now(), done: false, steps: [] };
+    ctx.recoverJob = job;
+    runRecover(ctx, job).catch((err) => {
+      job.done = true;
+      job.error = err.message;
+    });
+    return [202, { job }];
+  }
+  return [404, { error: "not found" }];
+}
+
 async function routeApi(url, ctx) {
   const parts = url.pathname.split("/").filter(Boolean);
   const fleet = () => cached(ctx, "fleet", 4000, ctx.discover);
@@ -3377,6 +3517,8 @@ export function createObservatoryServer(ctx) {
       { timeoutMs: 60_000 },
     ).then(parseCliJson);
   ctx.readEgress ??= readEgress;
+  ctx.listFleet ??= listFleetContainers;
+  ctx.dockerCtl ??= (action, name) => docker([action, name], { timeoutMs: 120_000 });
   ctx.readEgressAudit ??= readEgressAudit;
   ctx.readProxyAllowlistEnv ??= readProxyAllowlistEnv;
   return http.createServer((req, res) => {
@@ -3454,6 +3596,13 @@ export function createObservatoryServer(ctx) {
     }
     if (GENROUTE_PATH_RE.test(url.pathname)) {
       routeGenroute(req, url, ctx).then(
+        ([status, body]) => sendJson(res, status, body),
+        (err) => sendJson(res, err.status ?? 502, { error: err.message }),
+      );
+      return;
+    }
+    if (FLEET_PATH_RE.test(url.pathname)) {
+      routeFleet(req, url, ctx).then(
         ([status, body]) => sendJson(res, status, body),
         (err) => sendJson(res, err.status ?? 502, { error: err.message }),
       );

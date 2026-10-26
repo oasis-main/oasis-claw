@@ -343,6 +343,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     begin()
   }
 
+  /// View > Fleet Health: the page's start/restart panel (Mike, 2026-10-26).
+  @objc func showFleetHealth(_ sender: Any?) {
+    guard let wv = webView else {
+      NSSound.beep()
+      return
+    }
+    window.makeKeyAndOrderFront(nil)
+    wv.evaluateJavaScript("typeof openFleetDialog === 'function' && openFleetDialog()", completionHandler: nil)
+  }
+
   @objc func showLog(_ sender: Any?) {
     NSWorkspace.shared.open(config.logFile)
   }
@@ -592,9 +602,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     start.target = self
     let log = item("Show Log", #selector(showLog(_:)), "l", [.command, .shift])
     log.target = self
+    let fleet = item("Fleet Health…", #selector(showFleetHealth(_:)), "h", [.command, .shift])
+    fleet.target = self
     submenu("View", [
       item("Reload Page", #selector(WKWebView.reload(_:)), "r"),
       start,
+      fleet,
       log,
       .separator(),
       item("Enter Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control]),
