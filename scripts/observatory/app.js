@@ -533,6 +533,7 @@ const VIEWS = [
   { id: "agents", label: "Agents", sub: "System 3" },
   { id: "approvals", label: "Approvals & work", sub: "Brief · directives · open work · grants" },
   { id: "cron", label: "Cron", sub: "Schedules · per-job models" },
+  { id: "studio", label: "Studio", sub: "Pictures · profiles · Control UI themes" },
   { id: "settings", label: "Settings", sub: "You · background" },
 ];
 
@@ -728,6 +729,7 @@ function renderView() {
   else if (app.view === "settings") renderSettings();
   else if (app.view === "approvals") renderApprovals();
   else if (app.view === "cron") renderCron();
+  else if (app.view === "studio") renderStudio();
   else renderAgents();
 }
 
@@ -3147,14 +3149,17 @@ const PROFILE_FIELDS = [
 const USER_MD_MAX = 16000;
 const SETTINGS_SECTION_KEY = "claw-observatory-settings-section";
 
-app.settings = { profile: {}, swarm: {}, loaded: false };
+app.settings = { profile: {}, swarm: {}, appearance: { mode: "system" }, loaded: false };
 
-/** Read the kept settings once, and give the swarm its kept parameters. */
+const keptSettings = (s) => ({ profile: s.profile ?? {}, swarm: s.swarm ?? {}, appearance: s.appearance ?? { mode: "system" }, loaded: true });
+
+/** Read the kept settings once, give the swarm its kept parameters, and use
+ *  the kept Appearance (the desktop app forgets localStorage at each start). */
 async function loadSettings() {
   try {
-    const s = await api("/api/settings");
-    app.settings = { profile: s.profile ?? {}, swarm: s.swarm ?? {}, loaded: true };
+    app.settings = keptSettings(await api("/api/settings"));
     window.observatorySwarm?.set(app.settings.swarm);
+    if (app.settings.appearance.mode !== window.observatoryTheme?.mode) window.observatoryTheme?.set(app.settings.appearance.mode);
   } catch {
     // The page works without them: the swarm keeps its defaults.
   }
@@ -3162,8 +3167,43 @@ async function loadSettings() {
 
 async function saveSettings(patch) {
   const s = await api("/api/settings", { method: "PUT", type: "application/json", body: JSON.stringify(patch) });
-  app.settings = { profile: s.profile ?? {}, swarm: s.swarm ?? {}, loaded: true };
+  app.settings = keptSettings(s);
   return s;
+}
+
+// ── Appearance: System, Light or Dark, for this page and every Control UI ────
+
+const APPEARANCE = {
+  system: { icon: "◐", text: "System" },
+  light: { icon: "☀", text: "Light" },
+  dark: { icon: "☾", text: "Dark" },
+};
+
+function appearanceButton() {
+  const theme = window.observatoryTheme;
+  const btn = h("button", { type: "button", class: "gear appearance" });
+  const draw = () => {
+    const mode = theme?.mode ?? "system";
+    const next = theme.MODES[(theme.MODES.indexOf(mode) + 1) % theme.MODES.length];
+    btn.textContent = APPEARANCE[mode].icon;
+    btn.title =
+      `Appearance: ${APPEARANCE[mode].text}${mode === "system" ? ` (${theme.resolved()} now)` : ""}. ` +
+      `Click for ${APPEARANCE[next].text}. Each bot's Control UI opens with the same appearance.`;
+    btn.setAttribute("aria-label", `Appearance: ${APPEARANCE[mode].text}`);
+  };
+  btn.addEventListener("click", async () => {
+    const mode = theme.MODES[(theme.MODES.indexOf(theme.mode) + 1) % theme.MODES.length];
+    theme.set(mode);
+    try {
+      await saveSettings({ appearance: { mode } });
+    } catch {
+      // kept in this browser only; the next save tries again
+    }
+  });
+  document.addEventListener("observatory:theme", draw);
+  if (theme) draw();
+  else btn.hidden = true;
+  return btn;
 }
 
 function settingsPanel(where) {
@@ -3654,10 +3694,544 @@ function mountSettings() {
     },
   });
   document.querySelector("header.top").insertBefore(gear, botBarEl);
+  document.querySelector("header.top").insertBefore(appearanceButton(), gear);
 }
 
 function renderSettings() {
   mainEl.append(section("Settings", "Your profile, the USER.md file in each bot, and the background swarm.", settingsPanel("page")));
+}
+
+// ── Studio: each bot's face, IDENTITY.md and Control UI theme (2026-10-30) ───
+// Mike: "the correct content is loaded and settable for each agent's Control
+// UI" and "an observatory location for using built-in AI (oasis-generation,
+// oasis-ai, etc.) to make edits to avatars, themes". A draft from the model is
+// only shown here; nothing reaches a bot until a Save. An SVG draft is shown
+// as an <img> (it runs nothing) and saved as the PNG this page draws from it.
+
+const STUDIO_BOT_KEY = "claw-observatory-studio-bot";
+const STUDIO_MODEL_KEY = "claw-observatory-studio-model";
+const PALETTE_VARS = [
+  "background", "foreground", "card", "card-foreground", "popover", "popover-foreground",
+  "primary", "primary-foreground", "secondary", "secondary-foreground", "muted", "muted-foreground",
+  "accent", "accent-foreground", "destructive", "destructive-foreground", "border", "input", "ring",
+];
+const IDENTITY_INPUTS = [
+  ["name", "Name", "input"],
+  ["emoji", "Emoji", "input"],
+  ["creature", "Creature", "textarea"],
+  ["vibe", "Vibe", "textarea"],
+  ["theme", "Theme", "input"],
+];
+const AVATAR_SIDE = 512;
+
+app.studio = { bot: recallEarly(STUDIO_BOT_KEY), models: null, data: null };
+
+const studioApi = (key, sub, opts) => api(`/api/studio/${encodeURIComponent(key)}${sub ? `/${sub}` : ""}`, opts);
+const jsonBody = (method, value) => ({ method, type: "application/json", body: JSON.stringify(value) });
+
+/** The most common colors of an image, as #rrggbb (for a theme draft). */
+async function imageColors(blob, count = 6) {
+  const img = await decodeImage(blob);
+  const c = document.createElement("canvas");
+  c.width = 32;
+  c.height = 32;
+  const g = c.getContext("2d");
+  g.drawImage(img, 0, 0, 32, 32);
+  const px = g.getImageData(0, 0, 32, 32).data;
+  const bins = new Map();
+  for (let i = 0; i < px.length; i += 4) {
+    if (px[i + 3] < 128) continue;
+    const k = ((px[i] >> 4) << 8) | ((px[i + 1] >> 4) << 4) | (px[i + 2] >> 4);
+    bins.set(k, (bins.get(k) ?? 0) + 1);
+  }
+  const hex = (n) => ((n << 4) | 8).toString(16).padStart(2, "0");
+  return [...bins.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, count)
+    .map(([k]) => `#${hex((k >> 8) & 15)}${hex((k >> 4) & 15)}${hex(k & 15)}`);
+}
+
+/** A square PNG of an image (the middle of it), `side` pixels. */
+async function squarePng(blob, side = AVATAR_SIDE) {
+  const img = await decodeImage(blob);
+  const s = Math.min(img.width, img.height);
+  const c = document.createElement("canvas");
+  c.width = side;
+  c.height = side;
+  c.getContext("2d").drawImage(img, (img.width - s) / 2, (img.height - s) / 2, s, s, 0, 0, side, side);
+  return canvasBlob(c, "image/png");
+}
+
+const svgBlob = (svg) => new Blob([svg], { type: "image/svg+xml" });
+
+function studioModels() {
+  app.studio.models ??= api("/api/studio/models").catch((err) => ({ error: err.message }));
+  return app.studio.models;
+}
+
+function modelSelect() {
+  const sel = h("select", { class: "field small-field", "aria-label": "Model for drafts" });
+  studioModels().then((r) => {
+    if (r.error) {
+      sel.replaceChildren(h("option", { value: "", text: "no models" }));
+      sel.disabled = true;
+      sel.title = r.error;
+      return;
+    }
+    const want = recall(STUDIO_MODEL_KEY) || r.default;
+    const ids = r.models.includes(r.default) ? r.models : [r.default, ...r.models];
+    sel.replaceChildren(...ids.map((id) => h("option", { value: id, text: id, selected: id === want })));
+  });
+  sel.addEventListener("change", () => remember(STUDIO_MODEL_KEY, sel.value));
+  return sel;
+}
+
+/** A prompt box with a "Draft with AI" button. `run(prompt, model)` makes
+ *  the request; the button waits for it. */
+function draftBox(placeholderText, aiReady, model, run) {
+  const prompt = h("textarea", { class: "field", rows: "2", placeholder: placeholderText, "aria-label": placeholderText });
+  const status = h("span", { class: "muted small", role: "status" });
+  const btn = h("button", { type: "button", class: "button", text: "Draft with AI", disabled: !aiReady });
+  if (!aiReady) btn.title = "The observatory has no oasis-generation key: run `make observatory-ai-key`";
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    status.className = "muted small";
+    status.textContent = `Asking ${model.value || "the model"}… (up to a minute)`;
+    try {
+      await run(prompt.value, model.value);
+      status.textContent = "Draft ready. Nothing is saved yet.";
+    } catch (err) {
+      status.className = "small bad-text";
+      status.textContent = err.message;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+  return h("div", { class: "draft-box" }, prompt, h("div", { class: "toolbar tight-row" }, btn, status));
+}
+
+function renderStudio() {
+  const bots = app.fleet.bots;
+  if (!bots.some((b) => b.key === app.studio.bot)) app.studio.bot = (inScope(bots)[0] ?? bots[0])?.key ?? null;
+  const picker = h("div", { class: "studio-picker", role: "tablist", "aria-label": "Bot" });
+  const model = modelSelect();
+  const body = h("div", { class: "studio-body" });
+  mainEl.append(
+    section(
+      "Studio",
+      "Each bot's picture, IDENTITY.md profile and Control UI theme. Drafts come from oasis-generation; nothing reaches a bot until you save.",
+      h("div", { class: "toolbar" }, picker, h("span", { class: "grow" }), h("label", { class: "muted small" }, "Model ", model)),
+      body,
+    ),
+  );
+  const drawPicker = () =>
+    picker.replaceChildren(
+      ...bots.map((b) =>
+        h(
+          "button",
+          {
+            type: "button",
+            role: "tab",
+            class: `bot-chip fam-${famOf(b)}${b.key === app.studio.bot ? " active" : ""}${b.running ? "" : " stopped"}`,
+            "aria-selected": String(b.key === app.studio.bot),
+            onclick: () => {
+              app.studio.bot = b.key;
+              remember(STUDIO_BOT_KEY, b.key);
+              drawPicker();
+              load();
+            },
+          },
+          botIcon(b),
+          botLabel(b),
+        ),
+      ),
+    );
+  const load = async () => {
+    const key = app.studio.bot;
+    if (!key) return body.replaceChildren(empty("No bot."));
+    body.replaceChildren(placeholder("Reading the bot…"));
+    try {
+      const data = await studioApi(key);
+      if (app.studio.bot !== key) return;
+      app.studio.data = data;
+      body.replaceChildren(...studioCards(botByKey(key), data, model, load));
+    } catch (err) {
+      body.replaceChildren(errorBox(err));
+    }
+  };
+  drawPicker();
+  load();
+}
+
+function studioCards(bot, data, model, reload) {
+  if (data.error && !data.identityMd) {
+    return [h("div", { class: "card studio-card" }, empty(data.error)), themeCard(bot, data, model)];
+  }
+  return [h("div", { class: "grid studio-grid" }, faceCard(bot, data, model, reload), identityCard(bot, data, model, reload)), themeCard(bot, data, model)];
+}
+
+// ── the picture ───────────────────────────────────────────────────────────────
+
+function faceCard(bot, data, model, reload) {
+  const name = botLabel(bot);
+  const status = h("span", { class: "muted small", role: "status" });
+  const say = (text, tone = "") => {
+    status.className = `small ${tone || "muted"}`;
+    status.textContent = text;
+  };
+  const current = h("div", { class: "studio-face" }, botIcon(bot, "xl"));
+  const preview = h("div", { class: "studio-preview", hidden: true });
+  let pending = null; // a Blob ready to save
+
+  const showPending = (blob, label) => {
+    pending = blob;
+    const url = URL.createObjectURL(blob);
+    preview.hidden = false;
+    preview.replaceChildren(
+      h("img", { src: url, alt: `Draft picture for ${name}` }),
+      h("div", { class: "studio-preview-side" }, h("p", { class: "small", text: label }), saveBtn, h("button", { type: "button", class: "button", text: "Discard", onclick: () => ((pending = null), (preview.hidden = true)) })),
+    );
+  };
+
+  const saveBtn = h("button", {
+    type: "button",
+    class: "button primary",
+    text: "Save as the picture",
+    onclick: async () => {
+      if (!pending) return;
+      saveBtn.disabled = true;
+      say(`Saving to ${name}…`);
+      try {
+        const png = pending.type === "image/svg+xml" || pending.size > 4 * 1024 * 1024 ? await squarePng(pending) : pending;
+        const r = await studioApi(bot.key, "avatar", { method: "PUT", type: png.type, body: png });
+        say(`Saved as ${r.avatar}. The Control UI shows it at its next load.`, "ok-text");
+        pending = null;
+        await refreshFleet(false);
+        setTimeout(reload, 1500);
+      } catch (err) {
+        say(err.message, "bad-text");
+      } finally {
+        saveBtn.disabled = false;
+      }
+    },
+  });
+
+  // What the Control UI shows now, and why.
+  const face = data.face ?? {};
+  const fileAvatar = data.identityMd?.fields?.avatar || "";
+  const notes = [];
+  if (face.source) {
+    notes.push(h("p", { class: "small" }, "The Control UI shows ", h("strong", { text: face.image ? "a picture" : `the emoji ${face.value}` }), ` (from ${face.source}${face.image ? `: ${face.value}` : ""}).`));
+  } else {
+    notes.push(h("p", { class: "small muted", text: "The Control UI shows the letter A: the bot has no picture and no emoji." }));
+  }
+  if (data.avatarMissing) notes.push(h("p", { class: "small warn-text", text: `IDENTITY.md names ${fileAvatar}, but ${name} has no such file. Save a picture to fix this.` }));
+  if (fileAvatar && !data.avatarMissing && !face.image) {
+    const fix = h("button", {
+      type: "button",
+      class: "button primary small",
+      text: `Show ${fileAvatar} in the Control UI`,
+      onclick: async () => {
+        fix.disabled = true;
+        try {
+          await studioApi(bot.key, "avatar-use", jsonBody("POST", { avatar: fileAvatar }));
+          say(`The Control UI now uses ${fileAvatar}.`, "ok-text");
+          reload();
+        } catch (err) {
+          say(err.message, "bad-text");
+          fix.disabled = false;
+        }
+      },
+    });
+    notes.push(h("p", { class: "small warn-text", text: `The picture in IDENTITY.md (${fileAvatar}) is not in the agent config, so the Control UI shows the emoji.` }), fix);
+  }
+
+  // Pictures the bot has already.
+  const others = (data.avatars ?? []).filter((a) => a !== face.value && a !== fileAvatar);
+  const pick = others.length
+    ? h("div", { class: "toolbar tight-row" }, (() => {
+        const sel = h("select", { class: "field small-field", "aria-label": "Other pictures" }, ...others.map((a) => h("option", { value: a, text: a })));
+        const use = h("button", {
+          type: "button",
+          class: "button small",
+          text: "Use this one",
+          onclick: async () => {
+            use.disabled = true;
+            try {
+              await studioApi(bot.key, "avatar-use", jsonBody("POST", { avatar: sel.value }));
+              say(`The picture is now ${sel.value}.`, "ok-text");
+              await refreshFleet(false);
+              reload();
+            } catch (err) {
+              say(err.message, "bad-text");
+              use.disabled = false;
+            }
+          },
+        });
+        return [h("span", { class: "muted small", text: "Other pictures:" }), sel, use];
+      })())
+    : null;
+
+  const file = h("input", { type: "file", accept: "image/png,image/jpeg,image/webp", hidden: true });
+  file.addEventListener("change", async () => {
+    const f = file.files?.[0];
+    file.value = "";
+    if (!f) return;
+    try {
+      showPending(await squarePng(f, 1024), `${f.name}, cut to a square. Not saved yet.`);
+    } catch (err) {
+      say(err.message, "bad-text");
+    }
+  });
+  const upload = h("button", { type: "button", class: "button", text: "Upload a picture…", onclick: () => file.click() });
+
+  const draft = draftBox(`Describe a picture for ${name}, or leave empty for one that fits the profile`, data.aiReady, model, async (prompt, m) => {
+    const colors = bot.identity?.avatar ? await avatarSrc(bot.identity.avatar).then((u) => (u ? fetch(u).then((r) => r.blob()).then((b) => imageColors(b)) : [])).catch(() => []) : [];
+    const r = await studioApi(bot.key, "draft", jsonBody("POST", { kind: "avatar", prompt, model: m, colors }));
+    const blob = svgBlob(r.svg);
+    await decodeImage(blob); // refuse a draft this browser cannot draw
+    showPending(blob, `A drawing by ${r.model}. Saved as a ${AVATAR_SIDE} px PNG. Not saved yet.`);
+  });
+
+  return h(
+    "article",
+    { class: "card studio-card" },
+    h("h3", { text: "Picture" }),
+    h("div", { class: "studio-face-row" }, current, h("div", {}, ...notes)),
+    pick,
+    h("div", { class: "toolbar tight-row" }, upload, file, controlUiLink(bot, "Open the Control UI ↗")),
+    draft,
+    preview,
+    status,
+  );
+}
+
+// ── IDENTITY.md ───────────────────────────────────────────────────────────────
+
+function identityCard(bot, data, model, reload) {
+  const fields = data.identityMd?.fields ?? {};
+  const status = h("span", { class: "muted small", role: "status" });
+  const inputs = {};
+  const rows = IDENTITY_INPUTS.map(([k, label, kind]) => {
+    const el = kind === "textarea" ? h("textarea", { class: "field", rows: "3" }) : h("input", { class: "field", type: "text" });
+    el.value = fields[k] ?? "";
+    el.addEventListener("input", () => el.classList.toggle("overridden", el.value !== (fields[k] ?? "")));
+    inputs[k] = el;
+    return h("label", { class: "field-row" }, h("span", { text: label }), el);
+  });
+  const cfg = data.config;
+  const notes = [];
+  if (cfg?.name) {
+    const differs = (fields.name && fields.name !== cfg.name) || (fields.emoji && cfg.emoji && fields.emoji !== cfg.emoji);
+    notes.push(
+      h("p", {
+        class: `small ${differs ? "warn-text" : "muted"}`,
+        text:
+          `The Control UI and the message prefix use the agent config: ${cfg.name}${cfg.emoji ? ` ${cfg.emoji}` : ""}. ` +
+          "The bot's start sets that from OASIS_AGENT_NAME and OASIS_AGENT_EMOJI in its .env, so an edit here changes what the bot reads about itself, not that label.",
+      }),
+    );
+  }
+  const save = h("button", {
+    type: "button",
+    class: "button primary",
+    text: "Save IDENTITY.md",
+    onclick: async () => {
+      const changed = Object.fromEntries(Object.entries(inputs).filter(([k, el]) => el.value.trim() !== (fields[k] ?? "")).map(([k, el]) => [k, el.value.trim()]));
+      if (!Object.keys(changed).length) {
+        status.textContent = "Nothing changed.";
+        return;
+      }
+      if (Object.values(changed).some((v) => v === "")) {
+        status.className = "small bad-text";
+        status.textContent = "An empty field keeps its old value. Write a new value instead.";
+        return;
+      }
+      save.disabled = true;
+      try {
+        await studioApi(bot.key, "identity", jsonBody("PUT", { fields: changed, baseHash: data.identityMd.hash }));
+        status.className = "small ok-text";
+        status.textContent = `Saved: ${Object.keys(changed).join(", ")}. The old text is kept in the observatory state folder.`;
+        setTimeout(reload, 1200);
+      } catch (err) {
+        status.className = "small bad-text";
+        status.textContent = err.message;
+      } finally {
+        save.disabled = false;
+      }
+    },
+  });
+  const draft = draftBox("What to change, for example: make the vibe drier", data.aiReady, model, async (prompt, m) => {
+    const r = await studioApi(bot.key, "draft", jsonBody("POST", { kind: "identity", prompt, model: m }));
+    for (const [k, v] of Object.entries(r.fields)) {
+      inputs[k].value = v;
+      inputs[k].classList.toggle("overridden", v !== (fields[k] ?? ""));
+    }
+  });
+  return h(
+    "article",
+    { class: "card studio-card" },
+    h("h3", { text: "IDENTITY.md" }),
+    data.identityMd?.exists ? null : h("p", { class: "small warn-text", text: "The bot has no IDENTITY.md yet. A save makes one." }),
+    ...rows,
+    ...notes,
+    draft,
+    h("div", { class: "toolbar tight-row" }, save, status),
+  );
+}
+
+// ── Control UI theme ──────────────────────────────────────────────────────────
+
+const DEFAULT_PALETTE = {
+  label: "Custom",
+  light: {
+    background: "#ffffff", foreground: "#111827", card: "#ffffff", "card-foreground": "#111827", popover: "#ffffff", "popover-foreground": "#111827",
+    primary: "#2563eb", "primary-foreground": "#ffffff", secondary: "#f3f4f6", "secondary-foreground": "#111827", muted: "#f3f4f6", "muted-foreground": "#4b5563",
+    accent: "#e0e7ff", "accent-foreground": "#1e3a8a", destructive: "#dc2626", "destructive-foreground": "#ffffff", border: "#e5e7eb", input: "#e5e7eb", ring: "#2563eb",
+  },
+  dark: {
+    background: "#0b0f17", foreground: "#e5e7eb", card: "#111827", "card-foreground": "#e5e7eb", popover: "#111827", "popover-foreground": "#e5e7eb",
+    primary: "#60a5fa", "primary-foreground": "#0b0f17", secondary: "#1f2937", "secondary-foreground": "#e5e7eb", muted: "#1f2937", "muted-foreground": "#9ca3af",
+    accent: "#1e3a8a", "accent-foreground": "#e0e7ff", destructive: "#f87171", "destructive-foreground": "#0b0f17", border: "#1f2937", input: "#374151", ring: "#60a5fa",
+  },
+};
+
+/** A small picture of a Control UI in one mode of the palette. */
+function themeMock(p, mode) {
+  const box = (cls, vars, ...kids) => {
+    const el = h("div", { class: cls }, ...kids);
+    for (const [prop, v] of Object.entries(vars)) el.style.setProperty(prop, p[v]);
+    return el;
+  };
+  return box(
+    "theme-mock",
+    { background: "background", color: "foreground", "border-color": "border" },
+    h("div", { class: "theme-mock-head small", text: `${mode === "light" ? "Light" : "Dark"} mode` }),
+    box(
+      "theme-mock-card",
+      { background: "card", color: "card-foreground", "border-color": "border" },
+      h("div", { text: "A reply from the agent." }),
+      box("theme-mock-muted small", { color: "muted-foreground" }, "12:04 · thinking shown"),
+    ),
+    h(
+      "div",
+      { class: "theme-mock-row" },
+      box("theme-mock-btn", { background: "primary", color: "primary-foreground" }, "Send"),
+      box("theme-mock-btn", { background: "secondary", color: "secondary-foreground" }, "Stop"),
+      box("theme-mock-btn", { background: "accent", color: "accent-foreground" }, "Tool"),
+      box("theme-mock-btn", { background: "destructive", color: "destructive-foreground" }, "Delete"),
+    ),
+    box("theme-mock-input", { background: "background", "border-color": "input", color: "muted-foreground", "outline-color": "ring" }, "Message…"),
+  );
+}
+
+function themeCard(bot, data, model) {
+  const name = botLabel(bot);
+  const status = h("span", { class: "muted small", role: "status" });
+  const warnBox = h("ul", { class: "small warn-text theme-warnings" });
+  let palette = structuredClone(data.theme ?? DEFAULT_PALETTE);
+  delete palette.updatedAt;
+  const label = h("input", { class: "field small-field", type: "text", "aria-label": "Theme name", value: palette.label ?? "Custom" });
+  label.addEventListener("input", () => (palette.label = label.value));
+  const mocks = h("div", { class: "theme-mocks" });
+  const editor = h("div", { class: "theme-editor" });
+  const drawWarnings = (list) => warnBox.replaceChildren(...(list ?? []).map((w) => h("li", { text: w })));
+  const draw = () => {
+    mocks.replaceChildren(themeMock(palette.light, "light"), themeMock(palette.dark, "dark"));
+    editor.replaceChildren(
+      h("div", { class: "theme-editor-head small muted" }, h("span", { text: "Color" }), h("span", { text: "Light" }), h("span", { text: "Dark" })),
+      ...PALETTE_VARS.map((v) =>
+        h(
+          "div",
+          { class: "theme-editor-row small" },
+          h("span", { class: "mono", text: v }),
+          ...["light", "dark"].map((mode) => {
+            const input = h("input", { type: "color", value: palette[mode][v], "aria-label": `${v}, ${mode}` });
+            input.addEventListener("input", () => {
+              palette[mode][v] = input.value;
+              mocks.replaceChildren(themeMock(palette.light, "light"), themeMock(palette.dark, "dark"));
+            });
+            return input;
+          }),
+        ),
+      ),
+    );
+  };
+  draw();
+  drawWarnings(data.themeWarnings);
+
+  const saveBtn = h("button", {
+    type: "button",
+    class: "button primary",
+    text: "Save theme",
+    onclick: async () => {
+      saveBtn.disabled = true;
+      try {
+        const r = await studioApi(bot.key, "theme", jsonBody("PUT", palette));
+        drawWarnings(r.warnings);
+        data.theme = r.theme;
+        status.className = "small ok-text";
+        status.textContent = data.themeable ? `Saved. ${name}'s Control UI uses it from the next open from this page.` : "Saved here.";
+      } catch (err) {
+        status.className = "small bad-text";
+        status.textContent = err.message;
+      } finally {
+        saveBtn.disabled = false;
+      }
+    },
+  });
+  const removeBtn = h("button", {
+    type: "button",
+    class: "button danger",
+    text: "Remove theme",
+    disabled: !data.theme,
+    onclick: async () => {
+      try {
+        await studioApi(bot.key, "theme", { method: "DELETE" });
+        data.theme = null;
+        removeBtn.disabled = true;
+        status.className = "small ok-text";
+        status.textContent = "Removed. The Control UI goes back to the openclaw theme at the next open from this page.";
+      } catch (err) {
+        status.className = "small bad-text";
+        status.textContent = err.message;
+      }
+    },
+  });
+  const useColors = h("input", { type: "checkbox", checked: Boolean(bot.identity?.avatar) });
+  const draft = draftBox(`Describe a theme for ${name}, for example: storm clouds, calm and cool`, data.aiReady, model, async (prompt, m) => {
+    let colors = [];
+    if (useColors.checked && bot.identity?.avatar) {
+      const src = await avatarSrc(bot.identity.avatar);
+      if (src) colors = await fetch(src).then((r) => r.blob()).then((b) => imageColors(b)).catch(() => []);
+    }
+    const r = await studioApi(bot.key, "draft", jsonBody("POST", { kind: "theme", prompt, model: m, colors }));
+    palette = r.theme;
+    label.value = palette.label;
+    draw();
+    drawWarnings(r.warnings);
+  });
+
+  const where = data.themeable
+    ? h("p", { class: "small muted", text: `${name}'s Control UI gets this theme and the Appearance mode (◐ ☀ ☾ in the header) each time this page opens it.` })
+    : h("p", {
+        class: "small warn-text",
+        text:
+          `${name}'s Control UI is published directly (${data.controlUiVia ?? "not proxied"}), so no page of the observatory runs on its address to set the theme. ` +
+          "Set the look in that Control UI: Settings, Appearance. The theme here is kept for when the bot goes through the port proxy.",
+      });
+  return h(
+    "article",
+    { class: "card studio-card studio-theme" },
+    h("div", { class: "toolbar tight-row" }, h("h3", { text: "Control UI theme" }), h("span", { class: "grow" }), h("span", { class: "muted small", text: data.theme ? `Saved: ${data.theme.label}` : "None saved: the openclaw theme" })),
+    where,
+    mocks,
+    h("label", { class: "small" }, useColors, " Start from the colors of the picture"),
+    draft,
+    h("details", { class: "form-card" }, h("summary", { text: "Edit the 19 colors" }), editor),
+    warnBox,
+    h("div", { class: "toolbar tight-row" }, h("label", { class: "small muted" }, "Name ", label), saveBtn, removeBtn, controlUiLink(bot, "Open the Control UI ↗"), status),
+  );
 }
 
 // ── boot ──────────────────────────────────────────────────────────────────────

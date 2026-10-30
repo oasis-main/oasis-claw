@@ -270,6 +270,7 @@ python3 - "${CONFIG_FILE}" "${BIND}" "${PORT}" "${GATEWAY_TOKEN_FILE}" <<'PY'
 import glob
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -1968,8 +1969,26 @@ if agent_name:
     _identity["name"] = agent_name
     if agent_emoji:
         _identity["emoji"] = agent_emoji
+    # The avatar IMAGE (2026-10-30). The Control UI picks identity.avatar, then
+    # identity.emoji, then the IDENTITY.md avatar — so with the emoji set above
+    # every bot showed its emoji, never its picture. Copy the IDENTITY.md
+    # `- **Avatar:** avatars/<file>` path in when that file is a regular file and
+    # no avatar is set yet (the observatory's Studio sets one with
+    # `openclaw agents set-identity --avatar`; keep it).
+    if not _identity.get("avatar"):
+        try:
+            _id_text = (home / ".openclaw/workspace/IDENTITY.md").read_text(errors="replace")
+        except OSError:
+            _id_text = ""
+        _m = re.search(r"^\s*[-*]\s*\*\*Avatar:\*\*\s*(avatars/[A-Za-z0-9][A-Za-z0-9._-]{0,120})\s*$", _id_text, re.M | re.I)
+        if _m:
+            _avatar_file = home / ".openclaw/workspace" / _m.group(1)
+            if _avatar_file.is_file() and not _avatar_file.is_symlink():
+                _identity["avatar"] = _m.group(1)
     print(f"[entrypoint] agent identity: {agent_name}"
-          f"{' ' + agent_emoji if agent_emoji else ''} (agents.list[id={_agent_id}].identity)")
+          f"{' ' + agent_emoji if agent_emoji else ''}"
+          f"{' avatar=' + _identity['avatar'] if _identity.get('avatar') else ''}"
+          f" (agents.list[id={_agent_id}].identity)")
 else:
     print("[entrypoint] agent identity: OASIS_AGENT_NAME unset — outbound prefix "
           "will fall back to openclaw's built-in '[openclaw]'")

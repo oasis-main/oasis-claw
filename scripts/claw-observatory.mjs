@@ -42,7 +42,8 @@
 //   5. The only writes the API takes are change requests (/api/feedback),
 //      the Control UI open and approve (item 7), the settings (item 8), and
 //      the decisions and cron changes (item 9), and .swarm item comments
-//      and edits (item 10), and fleet start/restart (item 11).
+//      and edits (item 10), and fleet start/restart (item 11), and the
+//      Studio writes and drafts (item 12).
 //      A write needs the token AND this page's Origin. The requests and their screenshots stay in the
 //      state folder, which no bot mounts: a screenshot can show any agent's
 //      memory.
@@ -81,6 +82,23 @@
 //      `docker restart` on fleet containers only (the bot prefix and
 //      FLEET_SERVICES, minus the exclude pattern); argv only; token + Origin.
 //      No recreate: a container keeps the config it had.
+//  12. Studio (Mike, 2026-10-30: "the correct content is loaded and settable
+//      for each agent's Control UI" and "built-in AI ... to make edits to
+//      avatars, themes"). PUT /api/studio/<bot>/identity replaces only the
+//      identity field lines of workspace/IDENTITY.md (hash check, no symlink,
+//      the replaced text kept in the state folder, as item 8). PUT .../avatar
+//      writes ONE new image file into workspace/avatars/ (a sniffed PNG, JPEG
+//      or WebP, 4 MB at most, never over an existing file), and both avatar
+//      routes then run the bot's own `openclaw agents set-identity --avatar`
+//      (argv only), so the Control UI shows the picture. PUT .../theme keeps
+//      a hex-only palette in the state folder; the Control UI open carries it
+//      (and the Appearance mode) in the URL fragment to the port proxy's
+//      unlock page, which stores it in that Control UI's own settings. POST
+//      .../draft asks oasis-generation with the observatory's own key (a file
+//      in the state folder) and returns a checked draft; it writes nothing.
+//      A model reply and a bot's words are untrusted: an SVG draft is shown
+//      only as an image and saved only as the PNG the page draws from it.
+//      Token + Origin on every write, as item 5.
 //   6. `serve` also starts the dot_swarm dashboard (`swarm gui`, 18781), where
 //      the human claims, finishes, blocks and comments on items. A bot can
 //      reach that port too, so the observatory starts it only after it proves
@@ -157,13 +175,14 @@ const ASSETS = {
   "/app.js": ["app.js", "text/javascript; charset=utf-8"],
   "/app.css": ["app.css", "text/css; charset=utf-8"],
   "/swarm.js": ["swarm.js", "text/javascript; charset=utf-8"],
+  "/theme.js": ["theme.js", "text/javascript; charset=utf-8"],
 };
 
 // ── process helpers ──────────────────────────────────────────────────────────
 
-function run(cmd, args, { timeoutMs = 30_000, cwd } = {}) {
+function run(cmd, args, { timeoutMs = 30_000, cwd, input } = {}) {
   return new Promise((resolve, reject) => {
-    execFile(
+    const child = execFile(
       cmd,
       args,
       { cwd, timeout: timeoutMs, maxBuffer: 128 * 1024 * 1024, encoding: "utf8" },
@@ -179,6 +198,9 @@ function run(cmd, args, { timeoutMs = 30_000, cwd } = {}) {
         resolve(stdout);
       },
     );
+    // `input` goes to stdin: for data larger than one argument may be (Linux
+    // allows 128 KB), such as an avatar image for `docker exec -i`.
+    if (input !== undefined) child.stdin.end(input);
   });
 }
 
@@ -482,13 +504,21 @@ export function collectGatewayToken(fs, path, home) {
 }
 
 /** The address that opens `bot`'s Control UI signed in. The key and the token
- *  are in the fragment, which a browser never sends to a server. */
-export function controlUiSignedInUrl(bot, { proxyKey, gatewayToken }) {
+ *  are in the fragment, which a browser never sends to a server.
+ *  Through the port proxy the fragment also carries the look (2026-10-30):
+ *  `m=` the Appearance mode and `ct=` the bot's Studio theme (base64url JSON).
+ *  The proxy's unlock page, on the Control UI's own origin, puts both into the
+ *  Control UI's stored settings. A Control UI that the Mac publishes directly
+ *  (Nimbus) has no page of ours on its origin, so it keeps its own setting. */
+export function controlUiSignedInUrl(bot, { proxyKey, gatewayToken, mode, theme }) {
   const base = bot?.controlUi?.url;
   if (!base) return null;
   if (!GATEWAY_TOKEN_RE.test(String(gatewayToken ?? ""))) throw new Error(`${bot.key}: no usable gateway token`);
   if (bot.controlUi.via === "proxy") {
-    return proxyKey ? `${base}__claw-proxy/unlock#k=${proxyKey}&token=${gatewayToken}` : null;
+    if (!proxyKey) return null;
+    let look = APPEARANCE_MODES.has(mode) ? `&m=${mode}` : "";
+    if (theme && /^[A-Za-z0-9_-]{16,24000}$/.test(theme)) look += `&ct=${theme}`;
+    return `${base}__claw-proxy/unlock#k=${proxyKey}&token=${gatewayToken}${look}`;
   }
   return `${base}chat?session=main#token=${gatewayToken}`;
 }
@@ -1725,6 +1755,11 @@ export function identityStore(dir) {
       const entry = mem.get(key);
       mem.set(key, { ...(entry ?? { avatar: null }), at: entry?.at ?? 0, failedAt: Date.now() });
     },
+    /** Read the bot again at the next fleet read (after a Studio write). */
+    markStale(key) {
+      const entry = mem.get(key);
+      if (entry) mem.set(key, { ...entry, at: 0, failedAt: undefined });
+    },
   };
 }
 
@@ -1861,6 +1896,7 @@ const PROFILE_MAX = { context: 8000 };
 const SETTINGS_FILE = path.join(STATE_DIR, "settings.json");
 const USER_MD_HISTORY_DIR = path.join(STATE_DIR, "user-md-history");
 const SWARM_KEY_RE = /^[A-Z][A-Z0-9_]{0,40}$/;
+export const APPEARANCE_MODES = new Set(["system", "light", "dark"]);
 
 /** Read ("read") or replace ("write") workspace/USER.md inside a bot
  *  container. A write needs the hash of the current text (or "missing"), and
@@ -1973,7 +2009,14 @@ export function validateSettings(patch) {
   if (!patch || typeof patch !== "object" || Array.isArray(patch)) throw bad("the body must be a JSON object");
   const out = {};
   for (const key of Object.keys(patch)) {
-    if (key !== "profile" && key !== "swarm") throw bad(`unknown setting "${key}"`);
+    if (key !== "profile" && key !== "swarm" && key !== "appearance") throw bad(`unknown setting "${key}"`);
+  }
+  if (patch.appearance !== undefined) {
+    const a = patch.appearance;
+    if (!a || typeof a !== "object" || Array.isArray(a)) throw bad("appearance must be an object");
+    for (const k of Object.keys(a)) if (k !== "mode") throw bad(`unknown appearance field "${k}"`);
+    if (!APPEARANCE_MODES.has(a.mode)) throw bad("appearance.mode must be system, light or dark");
+    out.appearance = { mode: a.mode };
   }
   if (patch.profile !== undefined) {
     const p = patch.profile;
@@ -2007,14 +2050,17 @@ export function validateSettings(patch) {
   return out;
 }
 
-/** settings.json in the state folder: { profile, swarm, updatedAt }. */
+/** settings.json in the state folder: { profile, swarm, appearance, updatedAt }.
+ *  appearance.mode is the page's Appearance choice; the Control UI open
+ *  carries it to each bot's Control UI (controlUiSignedInUrl). */
 export function settingsStore(file) {
   const read = () => {
     try {
       const v = JSON.parse(fs.readFileSync(file, "utf8"));
-      return { profile: v.profile ?? {}, swarm: v.swarm ?? {}, updatedAt: v.updatedAt ?? null };
+      const mode = APPEARANCE_MODES.has(v.appearance?.mode) ? v.appearance.mode : "system";
+      return { profile: v.profile ?? {}, swarm: v.swarm ?? {}, appearance: { mode }, updatedAt: v.updatedAt ?? null };
     } catch {
-      return { profile: {}, swarm: {}, updatedAt: null };
+      return { profile: {}, swarm: {}, appearance: { mode: "system" }, updatedAt: null };
     }
   };
   return {
@@ -2047,8 +2093,8 @@ const isSettingsWrite = (method, pathname) =>
   method === "PUT" && (SETTINGS_PATH_RE.test(pathname) || /^\/api\/user-md\/[a-z0-9-]{1,40}$/.test(pathname));
 
 /** /api/settings and /api/user-md[/<bot>[/preview]]. Returns [status, json].
- *  settings          GET   { profile, swarm, updatedAt }
- *                    PUT   { profile?, swarm? }: merge and keep
+ *  settings          GET   { profile, swarm, appearance, updatedAt }
+ *                    PUT   { profile?, swarm?, appearance? }: merge and keep
  *  user-md           GET   every bot's USER.md, and the profile
  *  user-md/<bot>     PUT   { text, baseHash }: replace that bot's USER.md
  *  user-md/<bot>/preview
@@ -2189,6 +2235,182 @@ async function routeGenroute(req, url, ctx) {
   return ctx.genAdmin("PUT", `/admin/routing/${encodeURIComponent(genClientOf(key))}`, { target: body.target });
 }
 
+// ── Studio: avatars, IDENTITY.md and Control UI themes (2026-10-30) ─────────
+//
+// Mike: "the correct content is loaded and settable for each agent's Control
+// UI", and "an observatory location for using built-in AI (oasis-generation,
+// oasis-ai, etc.) to make edits to avatars, themes, etc." The logic is in
+// claw-observatory-studio.mjs; see trust model item 12.
+
+const STUDIO_MODULE = new URL("./claw-observatory-studio.mjs", import.meta.url);
+let studioModule = null;
+const loadStudio = () => (studioModule ??= import(STUDIO_MODULE));
+const STUDIO_THEME_DIR = path.join(STATE_DIR, "control-ui-themes");
+const IDENTITY_MD_HISTORY_DIR = path.join(STATE_DIR, "identity-md-history");
+/** The observatory's own oasis-generation key (`make observatory-ai-key`):
+ *  a service token named "observatory" in the gateway's list. */
+export const GEN_KEY_FILE = path.join(STATE_DIR, "generation-key");
+const STUDIO_PATH_RE = /^\/api\/studio\/(?:(models)|([a-z0-9-]{1,40})(?:\/(identity|avatar|avatar-use|theme|draft))?)$/;
+const STUDIO_WRITES = { identity: ["PUT"], avatar: ["PUT"], "avatar-use": ["POST"], theme: ["PUT", "DELETE"], draft: ["POST"] };
+const isStudioWrite = (method, pathname) => (STUDIO_WRITES[STUDIO_PATH_RE.exec(pathname)?.[3]] ?? []).includes(method);
+const STUDIO_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
+
+async function studioThemes(ctx) {
+  ctx.studioThemes ??= (await loadStudio()).themeStore(STUDIO_THEME_DIR);
+  return ctx.studioThemes;
+}
+
+async function readJsonBody(req, max) {
+  try {
+    return JSON.parse((await readBody(req, max)).toString("utf8"));
+  } catch (err) {
+    if (err.status) throw err;
+    throw Object.assign(new Error("the body is not valid JSON"), { status: 400 });
+  }
+}
+
+/** One bot as the Studio shows it: the IDENTITY.md fields, the identity the
+ *  Control UI uses, which picture the Control UI shows, and the theme. */
+async function studioBot(ctx, bot, studio) {
+  const theme = (await studioThemes(ctx)).get(bot.key);
+  const base = {
+    key: bot.key,
+    running: bot.running,
+    state: bot.state,
+    themeable: bot.controlUi?.via === "proxy",
+    controlUiVia: bot.controlUi?.via ?? null,
+    theme,
+    themeWarnings: theme ? studio.paletteWarnings(theme) : [],
+    aiReady: ctx.genKeyReady(),
+  };
+  if (!bot.running) return { ...base, error: `${bot.container} is ${bot.state}` };
+  const [md, config] = await Promise.all([ctx.readIdentityMd(bot), ctx.readIdentityConfig(bot)]);
+  if (md.error) return { ...base, error: md.error };
+  const fields = studio.parseIdentityFields(md.text);
+  const avatarFiles = (md.avatars ?? []).map((n) => `avatars/${n}`);
+  return {
+    ...base,
+    identityMd: { exists: md.exists, hash: md.hash, fields },
+    config: config.error ? null : config,
+    face: studio.controlUiFace(config.error ? null : config, fields),
+    avatars: avatarFiles,
+    avatarMissing: Boolean(fields.avatar) && !avatarFiles.includes(fields.avatar),
+  };
+}
+
+/** Write IDENTITY.md with `change(text)`, keep the replaced text, and read
+ *  the bot's face again. Returns [status, json]. */
+async function writeIdentity(ctx, bot, baseHash, change) {
+  const before = await ctx.readIdentityMd(bot);
+  if (before.error) return [409, { error: before.error }];
+  if (baseHash !== undefined && before.hash !== baseHash) {
+    return [409, { error: `${bot.key} changed its IDENTITY.md after this page read it. Reload, then save again.` }];
+  }
+  const next = change(before.text);
+  if (next === before.text) return [200, { unchanged: true }];
+  const result = await ctx.writeIdentityMd(bot, before.hash, next);
+  if (result.error) return [409, { error: result.error }];
+  if (result.conflict) return [409, { error: `${bot.key} wrote its IDENTITY.md during this save. Reload, then save again.` }];
+  if (before.exists) ctx.keepIdentityMdHistory(bot.key, before.text);
+  ctx.identities.markStale(bot.key);
+  maybeRefreshIdentity(ctx, bot);
+  return [200, { written: true, hash: result.hash }];
+}
+
+/** Make `rel` the bot's avatar: the IDENTITY.md Avatar line, then the agent
+ *  identity in openclaw.json, which the Control UI reads first. */
+async function useAvatar(ctx, bot, rel, studio) {
+  const [status, body] = await writeIdentity(ctx, bot, undefined, (text) => studio.setIdentityFields(text, { avatar: rel }));
+  if (status !== 200) return [status, body];
+  try {
+    await ctx.setIdentityAvatar(bot, rel);
+  } catch (err) {
+    return [502, { error: `IDENTITY.md names ${rel}, but \`openclaw agents set-identity\` failed: ${err.message}` }];
+  }
+  return [200, { avatar: rel }];
+}
+
+/** /api/studio/models          GET     the oasis-generation models
+ *  /api/studio/<bot>           GET     the bot as the Studio shows it
+ *  /api/studio/<bot>/identity  PUT     { fields, baseHash }: IDENTITY.md fields
+ *  /api/studio/<bot>/avatar    PUT     an image body: a new avatar
+ *  /api/studio/<bot>/avatar-use POST   { avatar }: use an avatar the bot has
+ *  /api/studio/<bot>/theme     PUT     { label, light, dark } / DELETE
+ *  /api/studio/<bot>/draft     POST    { kind, prompt, model, colors }: a draft
+ *                                      from oasis-generation (nothing is saved) */
+async function routeStudio(req, url, ctx) {
+  const [, models, key, sub] = STUDIO_PATH_RE.exec(url.pathname) ?? [];
+  const studio = await loadStudio();
+  if (models) {
+    if (req.method !== "GET") return [405, { error: "method not allowed here" }];
+    return [200, { models: await ctx.genModels(), default: studio.DEFAULT_MODEL }];
+  }
+  const fleet = await cached(ctx, "fleet", 4000, ctx.discover);
+  const bot = fleet.bots.find((b) => b.key === key);
+  if (!bot) return [404, { error: `unknown bot "${key}"` }];
+  if (!sub) {
+    if (req.method !== "GET") return [405, { error: "method not allowed here" }];
+    return [200, await studioBot(ctx, bot, studio)];
+  }
+  if (!(STUDIO_WRITES[sub] ?? []).includes(req.method)) return [405, { error: "method not allowed here" }];
+
+  if (sub === "theme") {
+    const themes = await studioThemes(ctx);
+    if (req.method === "DELETE") {
+      themes.remove(key);
+      return [200, { theme: null }];
+    }
+    const theme = themes.set(key, await readJsonBody(req, 16 * 1024));
+    return [200, { theme, warnings: studio.paletteWarnings(theme) }];
+  }
+  if (sub === "draft") {
+    const body = await readJsonBody(req, 16 * 1024);
+    if (!studio.DRAFT_KINDS.has(body?.kind)) return [400, { error: "kind must be theme, avatar or identity" }];
+    const facts = { key, role: bot.role ?? null, name: null, emoji: null, fields: {} };
+    if (bot.running) {
+      const md = await ctx.readIdentityMd(bot);
+      if (!md.error) facts.fields = studio.parseIdentityFields(md.text);
+      const config = await ctx.readIdentityConfig(bot);
+      if (!config.error) Object.assign(facts, { name: config.name, emoji: config.emoji });
+    }
+    const current = body.kind === "theme" ? (await studioThemes(ctx)).get(key) : null;
+    const messages = studio.draftMessages(body.kind, {
+      bot: facts,
+      prompt: typeof body.prompt === "string" ? body.prompt : "",
+      colors: body.colors,
+      current: current ? { light: current.light, dark: current.dark } : null,
+    });
+    const reply = await ctx.genChat({ model: typeof body.model === "string" ? body.model : "", messages });
+    return [200, { kind: body.kind, model: reply.model, ...studio.parseDraft(body.kind, reply.text) }];
+  }
+
+  if (!bot.running) return [409, { error: `${bot.container} is ${bot.state}` }];
+  if (sub === "identity") {
+    const body = await readJsonBody(req, 32 * 1024);
+    if (typeof body?.baseHash !== "string" || !/^(missing|[0-9a-f]{16})$/.test(body.baseHash)) return [400, { error: "baseHash is missing or malformed" }];
+    const fields = studio.validateIdentityFields(body.fields);
+    return writeIdentity(ctx, bot, body.baseHash, (text) => studio.setIdentityFields(text, fields));
+  }
+  if (sub === "avatar-use") {
+    const body = await readJsonBody(req, 1024);
+    const rel = String(body?.avatar ?? "");
+    if (!studio.AVATAR_REL_RE.test(rel)) return [400, { error: "avatar must be avatars/<file>" }];
+    const md = await ctx.readIdentityMd(bot);
+    if (md.error) return [409, { error: md.error }];
+    if (!(md.avatars ?? []).includes(rel.slice("avatars/".length))) return [404, { error: `${bot.key} has no ${rel}` }];
+    return useAvatar(ctx, bot, rel, studio);
+  }
+  // sub === "avatar": a new image
+  const type = String(req.headers["content-type"] ?? "").split(";")[0].trim().toLowerCase();
+  if (!STUDIO_IMAGE_TYPES.has(type)) return [415, { error: "send a PNG, JPEG or WebP image" }];
+  const bytes = await readBody(req, studio.AVATAR_MAX_BYTES);
+  if (sniffImage(bytes) !== type) return [400, { error: `the body is not a ${type} image` }];
+  const name = studio.avatarFileName(key, type);
+  const written = await ctx.writeAvatar(bot, name, bytes);
+  if (written.error) return [409, { error: written.error }];
+  return useAvatar(ctx, bot, written.avatar, studio);
+}
+
 // ── observatory HTTP server ──────────────────────────────────────────────────
 
 const SECURITY_HEADERS = {
@@ -2228,6 +2450,7 @@ export function checkRequest(req, port) {
     isCronWrite(req.method, pathname) ||
     isBoardWrite(req.method, pathname) ||
     isFleetWrite(req.method, pathname) ||
+    isStudioWrite(req.method, pathname) ||
     (req.method === "POST" && pathname === DECIDE_PATH);
   if (!WRITE_METHODS.has(req.method) || !writable) {
     return { status: 405, error: "read-only" };
@@ -2634,7 +2857,15 @@ async function routeControlUi(req, url, ctx) {
   if (action === "open" && req.method === "POST") {
     const { mode, token } = await ctx.readGatewayToken(bot);
     if (mode !== "token") return [409, { error: `${bot.key}: gateway auth mode is ${mode ?? "unknown"}, not token` }];
-    const openUrl = controlUiSignedInUrl(bot, { proxyKey: ctx.proxyKey(), gatewayToken: token });
+    const look = { mode: ctx.settings.read().appearance?.mode, theme: null };
+    if (bot.controlUi.via === "proxy") {
+      const palette = (await studioThemes(ctx)).get(key);
+      if (palette) {
+        const studio = await loadStudio();
+        look.theme = studio.themeFragment(studio.controlUiCustomTheme(key, palette, palette.updatedAt));
+      }
+    }
+    const openUrl = controlUiSignedInUrl(bot, { proxyKey: ctx.proxyKey(), gatewayToken: token, ...look });
     if (!openUrl) return [409, { error: `${bot.key} has no reachable Control UI (${bot.controlUi.via})` }];
     ctx.pairingArmed.set(key, Date.now());
     return [200, { url: openUrl }];
@@ -3521,6 +3752,23 @@ export function createObservatoryServer(ctx) {
   ctx.dockerCtl ??= (action, name) => docker([action, name], { timeoutMs: 120_000 });
   ctx.readEgressAudit ??= readEgressAudit;
   ctx.readProxyAllowlistEnv ??= readProxyAllowlistEnv;
+  ctx.readIdentityMd ??= async (bot) => collect(bot.container, (await loadStudio()).collectIdentityMd, ["read"]);
+  ctx.writeIdentityMd ??= async (bot, baseHash, text) =>
+    collect(bot.container, (await loadStudio()).collectIdentityMd, ["write", baseHash, Buffer.from(text, "utf8").toString("base64")]);
+  ctx.keepIdentityMdHistory ??= (key, text) => keepUserMdHistory(IDENTITY_MD_HISTORY_DIR, key, text);
+  ctx.readIdentityConfig ??= async (bot) => collect(bot.container, (await loadStudio()).collectIdentityConfig);
+  ctx.writeAvatar ??= async (bot, name, bytes) =>
+    JSON.parse(
+      await docker(["exec", "-i", bot.container, "node", "-e", collectorScript((await loadStudio()).collectAvatarWrite), name, "-"], {
+        timeoutMs: 60_000,
+        input: bytes,
+      }),
+    );
+  ctx.setIdentityAvatar ??= (bot, rel) =>
+    docker(["exec", bot.container, "openclaw", "agents", "set-identity", "--agent", "main", "--avatar", rel, "--json"], { timeoutMs: 60_000 }).then(parseCliJson);
+  ctx.genModels ??= async () => (await loadStudio()).genModels({ url: GEN_ADMIN_URL, tokenFile: GEN_KEY_FILE });
+  ctx.genChat ??= async (opts) => (await loadStudio()).genChat({ url: GEN_ADMIN_URL, tokenFile: GEN_KEY_FILE, ...opts });
+  ctx.genKeyReady ??= () => fs.existsSync(GEN_KEY_FILE);
   return http.createServer((req, res) => {
     const refused = checkRequest(req, ctx.port);
     if (refused) {
@@ -3620,6 +3868,16 @@ export function createObservatoryServer(ctx) {
     }
     if (CRON_PATH_RE.test(url.pathname) || url.pathname === DECIDE_PATH) {
       (url.pathname === DECIDE_PATH ? routeDecide(req, ctx) : routeCron(req, url, ctx)).then(
+        ([status, body]) => sendJson(res, status, body),
+        (err) => {
+          if (err.status === 413) res.once("finish", () => req.destroy());
+          sendJson(res, err.status ?? 502, { error: err.message });
+        },
+      );
+      return;
+    }
+    if (STUDIO_PATH_RE.test(url.pathname)) {
+      routeStudio(req, url, ctx).then(
         ([status, body]) => sendJson(res, status, body),
         (err) => {
           if (err.status === 413) res.once("finish", () => req.destroy());

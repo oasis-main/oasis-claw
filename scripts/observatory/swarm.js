@@ -123,7 +123,8 @@
   const TAU = Math.PI * 2;
 
   const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)");
-  const darkScheme = matchMedia("(prefers-color-scheme: dark)");
+  // theme.js sets data-theme from the Appearance choice.
+  const darkScheme = { get matches() { return document.documentElement.dataset.theme === "dark"; } };
 
   const canvas = document.createElement("canvas");
   canvas.id = "swarm-bg";
@@ -836,7 +837,7 @@
   });
   document.addEventListener("visibilitychange", () => (document.hidden ? stop() : start()));
   reduceMotion.addEventListener("change", () => (reduceMotion.matches ? placeStill() : ((dots = []), start())));
-  darkScheme.addEventListener("change", () => {
+  document.addEventListener("observatory:theme", () => {
     recolor();
     if (reduceMotion.matches) draw(true);
   });
