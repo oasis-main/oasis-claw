@@ -92,7 +92,9 @@ adds these rules:
 
 - The page settings in `localStorage` reset each time that the app starts.
   Examples are the last view, the selected bots, and an unsent change-request
-  draft. The browser page at the bookmark keeps these settings.
+  draft. The browser page at the bookmark keeps these settings. The
+  Appearance choice (◐ System, ☀ Light, ☾ Dark in the header) is an
+  exception: the observatory keeps it in its settings file, so it stays.
 - **Capture screen** in the change-request drawer does not work in a web view.
   Use **Add image** or paste an image.
 - The app does not adopt an observatory that an earlier app session started

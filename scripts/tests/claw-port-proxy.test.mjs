@@ -303,3 +303,49 @@ test("unlock page: hands a gateway token on to the Control UI in the fragment on
     assert.equal((await run(`#k=${KEY}&token=${gw}`, false)).replaced, null, "a refused key goes nowhere");
   });
 });
+
+test("unlock page: puts the observatory's Appearance mode and theme into the Control UI settings", async () => {
+  await withUpstream(async ({ port }) => {
+    const page = await request(port, { pathname: UNLOCK_PATH });
+    const script = page.data.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)[1];
+    const KEY_NAME = "openclaw.control.settings.v1:ws://127.0.0.1:18891";
+    const run = async (hash, stored = {}, ok = true) => {
+      const store = new Map(Object.entries(stored));
+      const seen = { replaced: null };
+      const sandbox = {
+        location: { hash, pathname: UNLOCK_PATH, protocol: "http:", host: "127.0.0.1:18891", replace: (u) => (seen.replaced = u) },
+        history: { replaceState: () => {} },
+        document: { getElementById: () => ({ textContent: "" }) },
+        fetch: async () => ({ ok, status: ok ? 204 : 403 }),
+        localStorage: { getItem: (k) => store.get(k) ?? null, setItem: (k, v) => store.set(k, String(v)) },
+        atob: (s) => Buffer.from(s, "base64").toString("latin1"),
+        TextDecoder,
+        Uint8Array,
+      };
+      vm.runInNewContext(script, sandbox);
+      await new Promise((r) => setImmediate(r));
+      return { seen, settings: store.has(KEY_NAME) ? JSON.parse(store.get(KEY_NAME)) : null };
+    };
+    const gw = "a1".repeat(32);
+    const theme = { themeId: "fleet-observatory-house", label: "Felt ✦", light: { bg: "#fff" }, dark: { bg: "#000" } };
+    const ct = Buffer.from(JSON.stringify(theme)).toString("base64url");
+
+    const first = await run(`#k=${KEY}&token=${gw}&m=light&ct=${ct}`);
+    assert.equal(first.seen.replaced, `/chat?session=main#token=${gw}`, "the token still goes on alone");
+    assert.deepEqual(first.settings, { themeMode: "light", customTheme: theme, theme: "custom" });
+
+    const kept = { [KEY_NAME]: JSON.stringify({ gatewayUrl: "ws://127.0.0.1:18891", chatShowThinking: false, theme: "custom", customTheme: theme }) };
+    const removed = await run(`#k=${KEY}&token=${gw}&m=dark`, kept);
+    assert.deepEqual(removed.settings, { gatewayUrl: "ws://127.0.0.1:18891", chatShowThinking: false, theme: "claw", themeMode: "dark" }, "no Studio theme: ours goes, the rest stays");
+
+    const own = { themeId: "tweakcn-abc", label: "Mine" };
+    const mine = await run(`#k=${KEY}&m=system`, { [KEY_NAME]: JSON.stringify({ theme: "custom", customTheme: own }) });
+    assert.deepEqual(mine.settings, { theme: "custom", customTheme: own, themeMode: "system" }, "a theme Mike imported himself stays");
+
+    const foreign = Buffer.from(JSON.stringify({ ...theme, themeId: "other" })).toString("base64url");
+    assert.equal((await run(`#k=${KEY}&m=light&ct=${foreign}`)).settings.customTheme, undefined, "only an observatory theme id is installed");
+    assert.equal((await run(`#k=${KEY}&m=sepia`)).settings, null, "a bad mode changes nothing");
+    assert.equal((await run(`#k=${KEY}&m=light&ct=${ct}`, {}, false)).settings, null, "a refused key changes nothing");
+    assert.equal((await run(`#k=${KEY}&m=light&ct=!!notbase64!!`)).settings.customTheme, undefined, "a bad ct is dropped");
+  });
+});
