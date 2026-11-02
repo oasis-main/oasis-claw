@@ -88,12 +88,13 @@ describe("digestMessage", () => {
     assert.deepEqual(buttons, ["w:beta", "w:alpha"]);
   });
 
-  it("offers Renew only for a directive that ends within 48 h", () => {
+  it("points a directive that ends within 48 h to the reminder card, with no Renew button", () => {
     const f = fixture();
     activeDirective(f.ledger, "alpha", 24);
     const m = digestMessage(snap(f.now()), f.ledger, f.now());
-    assert.match(m.text, /24 h left \(renew\)/);
-    assert.equal(m.replyMarkup.inline_keyboard[0][0].callback_data, "dr:DIR-0001");
+    assert.match(m.text, /24 h left \(renew from the reminder card\)/);
+    const buttons = (m.replyMarkup?.inline_keyboard ?? []).flat().map((b) => b.callback_data);
+    assert.ok(!buttons.some((b) => b.startsWith("dr:")));
   });
 
   it("NEGATIVE CONTROL: with no directive it says the sessions only read; with no brief it says so", () => {

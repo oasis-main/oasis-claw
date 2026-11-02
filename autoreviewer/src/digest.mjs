@@ -68,13 +68,12 @@ export function digestMessage(snap, ledger, now = Date.now()) {
   const lines = [`MORNING DIGEST ${today} (New York ${nyTime(new Date(now).toISOString())})`];
   const dirs = activeDirectives(ledger);
   const covered = new Set(dirs.map((d) => d.grantees[0]));
-  const renew = [];
   lines.push("", "DIRECTIVES");
   if (!dirs.length) lines.push("- none active. Morning sessions only read and rewrite STATUS.md. Set one: /directive <bot> <goal> | may: … | must not: …");
   for (const d of dirs) {
     const ms = Date.parse(d.expires) - now;
-    if (ms <= RENEW_WITHIN_MS) renew.push(d);
-    lines.push(`- ${d.id} ${d.grantees[0]}${d.lane ? ` (${d.lane})` : ""}: ${left(ms)} left${ms <= RENEW_WITHIN_MS ? " (renew)" : ""}`);
+    // Renew from the reminder card only (Mike, 2026-11-02).
+    lines.push(`- ${d.id} ${d.grantees[0]}${d.lane ? ` (${d.lane})` : ""}: ${left(ms)} left${ms <= RENEW_WITHIN_MS ? " (renew from the reminder card)" : ""}`);
   }
   const without = laneBots(snap).map(([bot]) => bot).filter((bot) => !covered.has(bot));
   if (dirs.length && without.length) lines.push(`- no directive: ${without.join(", ")}`);
@@ -113,7 +112,6 @@ export function digestMessage(snap, ledger, now = Date.now()) {
   lines.push("More: /open, /needs, /fleet, /bot <name>, and the observatory Approvals & work tab.");
 
   const rows = [];
-  for (const d of renew) rows.push([{ text: `Renew ${d.id} (${d.grantees[0]}) 7 d`, callback_data: CALLBACK.dirRenew(d.id) }]);
   const watch = [...new Set([...silent, ...refusals.map(([b]) => b)])].slice(0, 4);
   if (watch.length) rows.push(watch.map((bot) => ({ text: `Watch ${bot} 8 h`, callback_data: CALLBACK.watch(bot) })));
   return { text: fit(lines.join("\n")), replyMarkup: rows.length ? { inline_keyboard: rows } : undefined, stale };

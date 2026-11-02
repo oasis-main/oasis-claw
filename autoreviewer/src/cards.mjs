@@ -186,6 +186,70 @@ export function directiveKeyboard(d) {
   };
 }
 
+// ── Directive reminder (Mike, 2026-11-02: plain language first, code last) ──
+
+const DISPLAY_NAMES = { yesman: "Yes Man", helloworld: "Hello World", vanhelsing: "Van Helsing" };
+
+export function botName(bot) {
+  return DISPLAY_NAMES[bot] ?? `${bot.charAt(0).toUpperCase()}${bot.slice(1)}`;
+}
+
+function clip(s, max) {
+  const t = String(s ?? "").replace(/\s+/g, " ").trim();
+  if (t.length <= max) return t;
+  const cut = t.slice(0, max);
+  return `${cut.slice(0, cut.lastIndexOf(" ") > max / 2 ? cut.lastIndexOf(" ") : max)}…`;
+}
+
+function newYork(iso) {
+  const p = Object.fromEntries(
+    new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", weekday: "short", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" })
+      .formatToParts(new Date(iso))
+      .map((x) => [x.type, x.value]),
+  );
+  return `${p.weekday} ${p.month}-${p.day} ${p.hour}:${p.minute} New York`;
+}
+
+function hoursLeft(ms) {
+  const h = Math.max(0, Math.round(ms / 3600000));
+  return h >= 48 ? `${Math.round(h / 24)} days` : `${h} h`;
+}
+
+/**
+ * The reminder card. `activity` is the bot's entry in the fleet snapshot (or
+ * null): its STATUS.md and its reviewer counts for the last 24 h. STATUS.md is
+ * bot-written, so the card only checks whether it names the directive.
+ */
+export function directiveReminderText(d, activity, now = Date.now()) {
+  const name = botName(d.grantees[0]);
+  const lines = [`${name}: renew this directive?`, `Ends ${newYork(d.expires)} (in ${hoursLeft(Date.parse(d.expires) - now)}).`];
+  if (d.grace_until) lines.push("It ran out while the Mac was asleep. It runs 4 more hours so that you can decide.");
+  lines.push("", `What it is for: ${clip(d.topic, 160)}`);
+  if (d.intent) lines.push(`What it lets ${name} do: ${clip(d.intent, 200)}`);
+  if (d.lane) lines.push(`Lane: ${d.lane}`);
+
+  lines.push("", "Recent use:");
+  const sf = activity?.status_file;
+  const named = typeof sf?.text === "string" && sf.text.includes(d.id);
+  if (!activity) lines.push("- No fleet snapshot, so no activity data.");
+  else if (!sf?.text) lines.push(`- ${name} has no STATUS.md.`);
+  else lines.push(`- ${name}'s STATUS.md ${named ? "names" : "does not name"} this directive (updated ${newYork(sf.updated_at)}).`);
+  const r = activity?.reviewer;
+  if (r) {
+    const v = r.verdicts24h ?? {};
+    lines.push(`- Last 24 h: ${v.allow ?? 0} actions allowed, ${r.grantAllows24h ?? 0} of them under a grant or directive, ${(v.deny ?? 0) + (v.escalate ?? 0)} refused or sent to you.`);
+  }
+  lines.push(
+    "",
+    named
+      ? `Recommendation: renew. ${name} reports work under this directive.`
+      : `Recommendation: check before you renew. ${name} does not report work under this directive.`,
+    "",
+    `${d.id}, proposed by ${d.requester === "mike" ? "you" : d.requester}${d.approved_at ? `, approved ${d.approved_at.slice(5, 10)}` : ""}.`,
+  );
+  return lines.join("\n");
+}
+
 /** Parse "/directive <bot> <goal> | may: … | must not: … | lane: …". */
 export function parseDirectiveCommand(args) {
   const [head, ...parts] = String(args ?? "").split("|").map((x) => x.trim());

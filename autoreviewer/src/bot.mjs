@@ -16,6 +16,7 @@ import {
   directiveCardText,
   directiveDecidedText,
   directiveKeyboard,
+  directiveReminderText,
   ghCardText,
   ghDecidedText,
   ghKeyboard,
@@ -59,9 +60,10 @@ export class AutoreviewerBot {
    * @param {number} o.chatId    the autoreviewer chat (Mike's DM with the bot by default)
    * @param {number[]} [o.ttlButtons]
    * @param {(row: object) => void} [o.log]
+   * @param {(bot: string) => object|null} [o.activity]  the bot's fleet snapshot entry, for reminder cards
    * @param {() => number} [o.now]
    */
-  constructor({ telegram, ledger, ghStore = null, mailer = null, coordinator = null, ownerId, chatId, ttlButtons = [1, 4, 24], log = () => {}, now = Date.now }) {
+  constructor({ telegram, ledger, ghStore = null, mailer = null, coordinator = null, ownerId, chatId, ttlButtons = [1, 4, 24], log = () => {}, activity = () => null, now = Date.now }) {
     if (!Number.isSafeInteger(ownerId) || !Number.isSafeInteger(chatId)) throw new Error("ownerId and chatId must be integers");
     this.telegram = telegram;
     this.ledger = ledger;
@@ -72,6 +74,7 @@ export class AutoreviewerBot {
     this.chatId = chatId;
     this.ttlButtons = ttlButtons;
     this.log = log;
+    this.activity = activity;
     this.now = now;
     this.startedAt = now();
     this.lastPollOkAt = null;
@@ -135,13 +138,23 @@ export class AutoreviewerBot {
     return msg;
   }
 
-  /** One reminder card per directive, 24 h before it ends, with Renew. */
+  /**
+   * One reminder card per directive period, with Renew. This card is the only
+   * Telegram place to renew (Mike, 2026-11-02), so each renewal follows a
+   * look at what the bot did under the directive.
+   */
   async remindDirectives() {
     for (const d of this.ledger.dueReminders()) {
+      let activity = null;
+      try {
+        activity = this.activity(d.grantees[0]);
+      } catch {
+        // No snapshot: the card says so.
+      }
       try {
         await this.telegram.sendMessage(
           this.chatId,
-          `Directive ${d.id} for ${d.grantees[0]} ends ${utc(d.expires)}.\nGoal: ${d.topic}`,
+          directiveReminderText(d, activity, this.now()),
           { inline_keyboard: [[{ text: "Renew 7 d", callback_data: CALLBACK.dirRenew(d.id) }, { text: `Revoke ${d.id}`, callback_data: CALLBACK.revoke(d.id) }]] },
         );
         this.ledger.markReminded(d.id);
@@ -165,7 +178,18 @@ export class AutoreviewerBot {
         }
         this.ledger.decide(parsed.id, parsed.hours, `telegram:${cq.from.id}`);
       } else {
+        const before = d.expires;
         this.ledger.renew(parsed.id, 168, `telegram:${cq.from.id}`);
+        if (d.expires === before) {
+          await this.telegram.answerCallbackQuery(cq.id, `${d.id} is already renewed, until ${utc(d.expires)}.`);
+          return;
+        }
+        // Close the pressed card, so a second press cannot renew again.
+        try {
+          await this.telegram.editMessageText(cq.message.chat.id, cq.message.message_id, `${cq.message.text ?? d.id}\n\n>> RENEWED until ${utc(d.expires)}.`);
+        } catch (err) {
+          this.log({ event: "card_edit_failed", id: d.id, error: String(err.message ?? err) });
+        }
       }
       this.log({ event: parsed.kind === "dir-renew" ? "directive_renewed" : `directive_${d.status}`, id: d.id, bot: d.grantees[0] });
       await this.refreshCard(d);
@@ -406,7 +430,7 @@ export class AutoreviewerBot {
     });
     this.commands.register({
       name: "directives",
-      description: "Standing directives with time left, Renew and Revoke buttons",
+      description: "Standing directives with time left and Revoke buttons (renew from the reminder card)",
       run: async () => {
         this.ledger.sweep();
         const live = this.ledger.list({ statuses: ["active", "proposed"] }).filter((g) => g.kind === "directive");
@@ -415,7 +439,8 @@ export class AutoreviewerBot {
           await this.telegram.sendMessage(
             this.chatId,
             `${d.id} [${d.status}] ${d.grantees[0]}${d.lane ? ` (${d.lane})` : ""}${d.expires ? ` until ${utc(d.expires)}` : ""}\n  ${d.topic}`,
-            { inline_keyboard: [[...(d.status === "active" ? [{ text: "Renew 7 d", callback_data: CALLBACK.dirRenew(d.id) }] : []), { text: `Revoke ${d.id}`, callback_data: CALLBACK.revoke(d.id) }]] },
+            // No Renew here: the reminder card is the one place to renew.
+            { inline_keyboard: [[{ text: `Revoke ${d.id}`, callback_data: CALLBACK.revoke(d.id) }]] },
           );
         }
         return undefined;

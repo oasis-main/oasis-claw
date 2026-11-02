@@ -20,7 +20,18 @@ export const HISTORY_FILE = "peer-grants.history.jsonl";
 export const MAX_TTL_HOURS = 24;
 /** CLAW-124 directives: Mike 2026-10-15, a rolling 7 days. */
 export const DIRECTIVE_MAX_HOURS = 168;
-const DIRECTIVE_REMIND_MS = 24 * 3600 * 1000;
+// Mike, 2026-11-02: remind 48 h before the end. A short directive gets its
+// reminder at half its length instead, so a 1-day directive does not remind
+// at once.
+const DIRECTIVE_REMIND_MS = 48 * 3600 * 1000;
+/**
+ * A directive that ran out with no reminder (the Mac slept through the
+ * reminder) runs this much longer after the wake, so Mike sees the reminder
+ * before it ends. Once per period.
+ */
+export const DIRECTIVE_GRACE_MS = 4 * 3600 * 1000;
+/** A second Renew within this time is a repeat press, not a new renewal. */
+const RENEW_REPEAT_MS = 60 * 1000;
 /** An unanswered proposal lapses after this long. */
 export const PROPOSAL_TTL_MS = 60 * 60 * 1000;
 /** Open proposals allowed for one requester at a time. */
@@ -161,18 +172,26 @@ export class GrantLedger {
     if (g.status !== "active") throw new GrantError(`${id} is ${g.status}`, 409);
     const h = Number(hours);
     if (!(h > 0 && h <= DIRECTIVE_MAX_HOURS)) throw new GrantError(`at most ${DIRECTIVE_MAX_HOURS} h`);
+    // A double press renewed DIR-0012 5 times in seconds (week of 10-26).
+    if (g.renewed_at && this.now() - Date.parse(g.renewed_at) < RENEW_REPEAT_MS) return g;
     g.expires = this.iso(this.now() + h * 3600 * 1000);
+    g.renewed_at = this.iso();
     g.reminded = false;
+    g.grace_until = null;
     this.save({ event: "directive_renewed", id, hours: h, by });
     return g;
   }
 
-  /** Active directives ending within 24 h that have not had a reminder. */
+  /** Active directives in their reminder window that have not had a reminder. */
   dueReminders() {
     const now = this.now();
-    return this.data.grants.filter(
-      (g) => g.kind === "directive" && g.status === "active" && !g.reminded && Date.parse(g.expires) - now <= DIRECTIVE_REMIND_MS,
-    );
+    return this.data.grants.filter((g) => {
+      if (g.kind !== "directive" || g.status !== "active" || g.reminded) return false;
+      const end = Date.parse(g.expires);
+      const start = Date.parse(g.renewed_at ?? g.approved_at);
+      const window = Number.isFinite(start) ? Math.min(DIRECTIVE_REMIND_MS, (end - start) / 2) : DIRECTIVE_REMIND_MS;
+      return end - now <= window;
+    });
   }
 
   markReminded(id) {
@@ -316,8 +335,15 @@ export class GrantLedger {
   sweep() {
     const now = this.now();
     const changed = [];
+    const graced = [];
     for (const g of this.data.grants) {
       if (g.status === "active" && Date.parse(g.expires) <= now) {
+        if (g.kind === "directive" && !g.reminded && !g.grace_until) {
+          g.grace_until = this.iso(now + DIRECTIVE_GRACE_MS);
+          g.expires = g.grace_until;
+          graced.push(g.id);
+          continue;
+        }
         g.status = "expired";
         changed.push(g);
       } else if (g.status === "proposed" && Date.parse(g.proposal_expires) <= now) {
@@ -325,6 +351,7 @@ export class GrantLedger {
         changed.push(g);
       }
     }
+    if (graced.length) this.save({ event: "directive_grace", ids: graced, hours: DIRECTIVE_GRACE_MS / 3600000 });
     if (changed.length) {
       this.save({ event: "sweep", ids: changed.map((g) => `${g.id}:${g.status}`) });
       // Any caller can trigger a sweep; the bot closes the cards from here so

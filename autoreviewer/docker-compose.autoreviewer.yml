@@ -65,6 +65,8 @@ services:
       AUTOREVIEWER_DECISION_DIR: /run/observatory-decisions
       # CLAW-122: sanitized fleet snapshot (scripts/claw-fleet-snapshot.mjs), read-only.
       AUTOREVIEWER_SNAPSHOT: /run/fleet-snapshot/snapshot.json
+      # Mike, 2026-11-02: the weekday 08:00 digest is off by default. "on" restores it.
+      AUTOREVIEWER_DIGEST: "${AUTOREVIEWER_DIGEST:-off}"
       # CLAW-122: writable state (the /watch list). Only this container mounts it.
       AUTOREVIEWER_STATE_DIR: /var/lib/autoreviewer
       # CLAW-123: grant notices by fleet mail. This container mounts ONLY its own

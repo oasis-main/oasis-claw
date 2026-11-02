@@ -60,19 +60,28 @@ describe("/directive", () => {
     assert.equal(d.status, "proposed");
   });
 
-  it("renew is rolling; a reminder comes once 24 h before the end; revoke mails", async () => {
+  it("renew is rolling; a reminder comes once 48 h before the end; revoke mails", async () => {
     const s = setup();
     await s.bot.handleUpdate(text(CMD));
     const d = s.ledger.get("DIR-0001");
-    await s.bot.handleUpdate(press(d.card.message_id, "d:DIR-0001:72"));
-    s.now.advance(50 * 3600 * 1000); // 22 h left
+    await s.bot.handleUpdate(press(d.card.message_id, "d:DIR-0001:168"));
+    s.now.advance(119 * 3600 * 1000); // 49 h left: no reminder yet
+    await s.bot.remindDirectives();
+    s.now.advance(2 * 3600 * 1000); // 47 h left
     await s.bot.remindDirectives();
     await s.bot.remindDirectives();
-    const reminders = s.telegram.calls.filter((c) => c.method === "sendMessage" && /ends/.test(c.text));
+    const reminders = s.telegram.calls.filter((c) => c.method === "sendMessage" && /renew this directive\?/.test(c.text));
     assert.equal(reminders.length, 1);
+    assert.match(reminders[0].text, /^Beta: renew this directive\?\nEnds .* New York \(in 47 h\)\./);
+    assert.match(reminders[0].text, /What it is for: Ship KIN-218 then KIN-215/);
+    assert.match(reminders[0].text, /No fleet snapshot/);
+    assert.match(reminders[0].text, /DIR-0001, proposed by you/);
     assert.equal(reminders[0].replyMarkup.inline_keyboard[0][0].callback_data, "dr:DIR-0001");
     await s.bot.handleUpdate(press(999, "dr:DIR-0001"));
     assert.equal(Date.parse(d.expires) - s.now(), 168 * 3600 * 1000);
+    const closed = s.telegram.calls.find((c) => c.method === "editMessageText" && c.messageId === 999);
+    assert.match(closed.text, /RENEWED until/);
+    assert.equal(closed.replyMarkup, undefined);
     await s.bot.handleUpdate(text("/revoke DIR-0001"));
     assert.equal(d.status, "revoked");
     assert.match(s.mails().find((x) => /revoked/.test(x.subject)).body, /now needs Mike again/);
@@ -83,11 +92,81 @@ describe("/directive", () => {
     await s.bot.handleUpdate(text(CMD));
     const d = s.ledger.get("DIR-0001");
     await s.bot.handleUpdate(press(d.card.message_id, "d:DIR-0001:72"));
-    s.now.advance(73 * 3600 * 1000);
+    s.now.advance(40 * 3600 * 1000);
+    await s.bot.remindDirectives();
+    s.now.advance(33 * 3600 * 1000);
     s.ledger.sweep();
     await new Promise((r) => setImmediate(r));
     assert.equal(d.status, "expired");
     assert.ok(s.mails().some((x) => /expired/.test(x.subject)));
+  });
+
+  it("a directive that ran out with no reminder (Mac asleep) runs 4 h more, once, and gets its reminder", async () => {
+    const s = setup();
+    await s.bot.handleUpdate(text(CMD));
+    const d = s.ledger.get("DIR-0001");
+    await s.bot.handleUpdate(press(d.card.message_id, "d:DIR-0001:72"));
+    s.now.advance(80 * 3600 * 1000); // asleep through the reminder and the end
+    s.ledger.sweep();
+    assert.equal(d.status, "active");
+    assert.equal(Date.parse(d.expires) - s.now(), 4 * 3600 * 1000);
+    await s.bot.remindDirectives();
+    const card = s.telegram.calls.find((c) => c.method === "sendMessage" && /renew this directive\?/.test(c.text));
+    assert.match(card.text, /ran out while the Mac was asleep/);
+    s.now.advance(4 * 3600 * 1000);
+    s.ledger.sweep();
+    assert.equal(d.status, "expired");
+  });
+
+  it("NEGATIVE CONTROL: no second grace in one period", () => {
+    const s = setup();
+    const d = s.ledger.proposeDirective("mike", { bot: "beta", goal: "x" });
+    s.ledger.decide(d.id, 24, "test");
+    s.now.advance(25 * 3600 * 1000);
+    s.ledger.sweep();
+    s.ledger.get(d.id).reminded = false; // even with no reminder recorded
+    s.now.advance(5 * 3600 * 1000);
+    s.ledger.sweep();
+    assert.equal(d.status, "expired");
+  });
+
+  it("a 1-day directive is not reminded at once; its reminder comes at half its length", async () => {
+    const s = setup();
+    const d = s.ledger.proposeDirective("mike", { bot: "beta", goal: "x" });
+    s.ledger.decide(d.id, 24, "test");
+    assert.equal(s.ledger.dueReminders().length, 0);
+    s.now.advance(12 * 3600 * 1000);
+    assert.deepEqual(s.ledger.dueReminders().map((g) => g.id), [d.id]);
+  });
+
+  it("NEGATIVE CONTROL: a second Renew within 60 s does not renew again", async () => {
+    const s = setup();
+    await s.bot.handleUpdate(text(CMD));
+    const d = s.ledger.get("DIR-0001");
+    await s.bot.handleUpdate(press(d.card.message_id, "d:DIR-0001:168"));
+    s.now.advance(130 * 3600 * 1000);
+    await s.bot.handleUpdate(press(500, "dr:DIR-0001"));
+    const first = d.expires;
+    s.now.advance(20 * 1000);
+    await s.bot.handleUpdate(press(500, "dr:DIR-0001"));
+    assert.equal(d.expires, first);
+    assert.match(s.telegram.calls.filter((c) => c.method === "answerCallbackQuery").at(-1).text, /already renewed/);
+    const history = readFileSync(join(t.dir, "ledger", "peer-grants.history.jsonl"), "utf8");
+    assert.equal(history.split("\n").filter((l) => l.includes("directive_renewed")).length, 1);
+  });
+
+  it("the reminder card uses the snapshot: STATUS.md that names the directive gives a renew recommendation", async () => {
+    const s = setup();
+    s.bot.activity = (name) => (name === "beta" ? { status_file: { text: "Working under DIR-0001", updated_at: "2026-10-12T12:00:00Z" }, reviewer: { verdicts24h: { allow: 40, deny: 1 }, grantAllows24h: 5 } } : null);
+    await s.bot.handleUpdate(text(CMD));
+    const d = s.ledger.get("DIR-0001");
+    await s.bot.handleUpdate(press(d.card.message_id, "d:DIR-0001:168"));
+    s.now.advance(150 * 3600 * 1000);
+    await s.bot.remindDirectives();
+    const card = s.telegram.calls.find((c) => c.method === "sendMessage" && /renew this directive\?/.test(c.text));
+    assert.match(card.text, /STATUS\.md names this directive/);
+    assert.match(card.text, /40 actions allowed, 5 of them under a grant or directive, 1 refused or sent to you/);
+    assert.match(card.text, /Recommendation: renew\./);
   });
 
   it("NEGATIVE CONTROL: more than 7 days is refused; /grants does not list directives", async () => {

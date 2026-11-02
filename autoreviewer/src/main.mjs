@@ -19,6 +19,7 @@
 //   AUTOREVIEWER_DECISION_DIR         host-only folder for Mike's decisions from the fleet observatory (unset = off)
 //   AUTOREVIEWER_STATE_DIR            writable state (watches.json); default /var/lib/autoreviewer
 //   AUTOREVIEWER_SNAPSHOT             fleet snapshot (scripts/claw-fleet-snapshot.mjs), read-only
+//   AUTOREVIEWER_DIGEST               "off" stops the weekday 08:00 digest; /brief still sends it (default on)
 //   HTTPS_PROXY                       the fleet egress proxy, the only route to api.telegram.org
 
 import { readFileSync } from "node:fs";
@@ -30,7 +31,7 @@ import { ClientMap } from "./clientmap.mjs";
 import { GithubGrantStore } from "./ghgrants.mjs";
 import { Mailer } from "./mailer.mjs";
 import { DigestScheduler, registerDigestCommands } from "./digest.mjs";
-import { registerMonitorCommands } from "./monitor.mjs";
+import { loadSnapshot, registerMonitorCommands } from "./monitor.mjs";
 import { registerWatchCommands, Watcher } from "./watch.mjs";
 import { GrantLedger } from "./ledger.mjs";
 import { TelegramClient } from "./telegram.mjs";
@@ -81,10 +82,12 @@ const ghStore = env.AUTOREVIEWER_GH_DIR && list(env.AUTOREVIEWER_GH_ACCOUNTS).le
 const mailer = new Mailer({ outbox: env.AUTOREVIEWER_MAIL_OUTBOX || null, log });
 // CLAW-124: the coordinator bot may propose directives for any bot and is copied on directive notices.
 const coordinators = list(env.AUTOREVIEWER_COORDINATORS);
-const bot = new AutoreviewerBot({ telegram, ledger, ghStore, mailer, coordinator: coordinators[0] ?? null, ownerId, chatId, ttlButtons, log });
-ledger.onSweep = (changed) => bot.onSwept(changed);
-// CLAW-122: fleet monitoring commands over the Mac's sanitized snapshot.
+// CLAW-122: the Mac's sanitized fleet snapshot.
 const snapshotPath = env.AUTOREVIEWER_SNAPSHOT || "/run/fleet-snapshot/snapshot.json";
+const activity = (name) => loadSnapshot(snapshotPath).snap?.bots?.[name] ?? null;
+const bot = new AutoreviewerBot({ telegram, ledger, ghStore, mailer, coordinator: coordinators[0] ?? null, ownerId, chatId, ttlButtons, log, activity });
+ledger.onSweep = (changed) => bot.onSwept(changed);
+// CLAW-122: fleet monitoring commands over the snapshot.
 registerMonitorCommands(bot.commands, snapshotPath);
 // CLAW-122 slice 3: /watch alerts, checked every minute against the snapshot.
 const watcher = new Watcher({
@@ -105,8 +108,12 @@ const digest = new DigestScheduler({
   send: (text, markup) => telegram.sendMessage(chatId, text, markup),
 });
 registerDigestCommands(bot.commands, digest, snapshotPath);
+// Mike, 2026-11-02: the weekday digest is off; Yes Man's Monday, Wednesday and
+// Friday report replaces it. This timer also drives /watch, so it stays.
+const digestOn = (env.AUTOREVIEWER_DIGEST || "on").trim().toLowerCase() !== "off";
+log({ event: "digest_schedule", on: digestOn });
 setInterval(() => {
-  digest.tick().catch((err) => log({ event: "digest_failed", error: String(err.message ?? err) }));
+  if (digestOn) digest.tick().catch((err) => log({ event: "digest_failed", error: String(err.message ?? err) }));
   watcher.tick().catch((err) => log({ event: "watch_tick_failed", error: String(err.message ?? err) }));
 }, 60_000).unref();
 
@@ -131,10 +138,11 @@ createApi({ ledger, clientMap, bot, ghStore, coordinators, log }).listen(Number(
 );
 
 setInterval(() => ledger.sweep(), 30_000).unref();
-// CLAW-124: directive reminders 24 h before the end.
+// CLAW-124: directive reminders (ledger.mjs sets the window). Each minute, so a
+// directive that ran out during Mac sleep gets its card soon after the wake.
 setInterval(() => {
   bot.remindDirectives().catch((err) => log({ event: "remind_failed", error: String(err.message ?? err) }));
-}, 600_000).unref();
+}, 60_000).unref();
 
 try {
   await telegram.setMyCommands(bot.commands.menu());
