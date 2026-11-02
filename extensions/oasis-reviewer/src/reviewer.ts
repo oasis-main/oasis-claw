@@ -52,6 +52,16 @@ import {
   TOOL_CALL_QUESTIONS,
 } from "./decider.js";
 import { sendTelegramMessage } from "./telegram.js";
+import {
+  DEFAULT_AUTHORITY_FILE,
+  STALE_MS,
+  failClosed,
+  mirrorState,
+  readAuthorityView,
+  restrictionBlocks,
+  restrictionsInForce,
+  type MirrorState,
+} from "./authority.js";
 import { fallbackSessionFilePath, readSessionTranscriptSummary } from "./transcript.js";
 
 // Layer 2 concurrency cap — bound the number of in-flight model judgments so a
@@ -532,6 +542,8 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
   const DECIDER_MAX_INFLIGHT = 4;
   // ── Peer grants (CLAW-119 phase 2) — see peer-grants.ts ──
   const peerGrantsFile = process.env.OASIS_REVIEWER_PEER_GRANTS_FILE || DEFAULT_PEER_GRANTS_FILE;
+  // Step 3 part 2: the authority hub's view for this bot (see authority.ts).
+  const authorityFile = process.env.OASIS_REVIEWER_AUTHORITY_FILE || DEFAULT_AUTHORITY_FILE;
   const mailInbox = process.env.OASIS_REVIEWER_MAIL_INBOX || DEFAULT_MAIL_INBOX;
   // Mike, 2026-10-12: in a run that peer mail woke up, an escalation becomes an
   // allow only when a grant covers it (reverses CLAW-090 §1-§2 for mail-woken
@@ -625,6 +637,9 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
     // Labeling record for an approval card (see onCardResolution). Filled in
     // the try block, read at the requireApproval returns below it.
     let cardContext: Record<string, unknown> = {};
+    // Step 3 part 2: true when an authority restriction changed this call's
+    // verdict. Such a deny blocks even when the reviewer runs in shadow mode.
+    let restrictionEnforced = false;
     try {
       toolName = String(event.toolName ?? "unknown");
       const toolKind = event.toolKind as string | undefined;
@@ -632,6 +647,47 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
       const params = event.params as Record<string, unknown> | undefined;
       const derivedPaths = event.derivedPaths as readonly string[] | undefined;
       const family = classifyTool(toolName, toolKind, toolInputKind);
+
+      // ── Authority restrictions (step 3 part 2; authority.ts) ──
+      // chat-only, stopped, and read-only for a call that is not an inert read
+      // block here, before Layer 1 and before any model call. fail-closed needs
+      // the verdict and is applied after the unattended adjustment below.
+      const authority = readAuthorityView(authorityFile);
+      const inForce = restrictionsInForce(authority.view);
+      const callShape = { toolName, family, command: family === "exec" ? execCommandOf(params) : undefined };
+      const authorityAudit = {
+        authorityFault: authority.fault ?? undefined,
+        authorityStale: authority.view && Date.now() - Date.parse(authority.view.at) > STALE_MS ? true : undefined,
+      };
+      const blockedBy = restrictionBlocks(inForce.level, callShape);
+      if (blockedBy) {
+        decision = {
+          verdict: "deny",
+          principle: `authority:${inForce.level}`,
+          reason: `restricted (${inForce.level}): ${blockedBy}. ${inForce.reasons.join("; ").slice(0, 300)}`,
+          retryHint: "tell Mike what you were doing and that this bot is restricted; do not route around the restriction",
+        };
+        restrictionEnforced = true;
+        write({
+          ts: new Date().toISOString(),
+          phase: "before_tool_call",
+          mode,
+          bot: botKey,
+          sessionId: ctx?.sessionId ?? "unknown",
+          sessionKey: String(ctx?.sessionKey ?? "") || null,
+          toolCallId: event.toolCallId ?? null,
+          toolName,
+          family,
+          verdict: decision.verdict,
+          principle: decision.principle,
+          reason: decision.reason,
+          restriction: { level: inForce.level, ids: inForce.ids, changed: true },
+          ...authorityAudit,
+          enforced: true,
+        });
+        return { block: true, blockReason: `reviewer: ${decision.reason} — ${decision.retryHint}` };
+      }
+      const shadowBlockedBy = restrictionBlocks(inForce.shadowLevel, callShape);
 
       // ── Layer 1: hard constraints (per-bot) ──
       decision = evaluateHard({ family, toolName, params, derivedPaths }, hardPolicy);
@@ -660,13 +716,25 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
           }
         }
       }
-      const liveGrants: PeerGrant[] = [
+      const ledgerLive: PeerGrant[] = [
         ...[...(grantsBySession.get(sid) ?? [])]
           .map((id) => ledgerGrants.find((g) => g.id === id))
           .filter((g): g is PeerGrant => !!g && isLive(g) && g.grantees.includes(botKey)),
         // CLAW-124: standing directives cover this bot's own work in any session.
         ...liveDirectives(ledgerGrants, botKey),
       ];
+      // Step 3 part 2: each live grant against the authority hub's signed
+      // mirror of the ledger. "require" (OASIS_AUTHORITY_GRANTS on the hub)
+      // uses only grants whose mirror is legal and current; "observe" only
+      // records the state.
+      const grantMirror: Record<string, MirrorState> | undefined =
+        authority.view && ledgerLive.length
+          ? Object.fromEntries(ledgerLive.map((g) => [g.id, mirrorState(authority.view!, g)]))
+          : undefined;
+      const liveGrants =
+        grantMirror && authority.view?.ledger.grantMode === "require"
+          ? ledgerLive.filter((g) => grantMirror[g.id] === "ok")
+          : ledgerLive;
       // A grant can turn a Layer 1 ESCALATE into an allow, never a deny, never a
       // NEVER_DOWNGRADE or infra principle, and only if Layer 2 then agrees the
       // call fits the grant's topic and intent (see grantDowngrade below).
@@ -1037,6 +1105,22 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         }
       }
 
+      // ── Authority restrictions, fail-closed part (step 3 part 2) ──
+      // Every level includes fail-closed: no card and no downgrade. Applied
+      // last, so that no grant, consent or unattended rule loosens it.
+      let restrictionRow: Record<string, unknown> | undefined;
+      if (inForce.level) {
+        const tightened = failClosed(decision);
+        if (tightened) {
+          decision = { ...tightened, retryHint: "tell Mike that this bot is restricted and what you needed; do not route around the restriction" };
+          restrictionEnforced = true;
+        }
+        restrictionRow = { level: inForce.level, ids: inForce.ids, changed: !!tightened };
+      }
+      const restrictionShadow = inForce.shadowLevel
+        ? { level: inForce.shadowLevel, ids: inForce.shadowIds, wouldDeny: !!shadowBlockedBy || !!failClosed(decision) }
+        : undefined;
+
       write({
         ...(l2Row ?? {}),
         ts: new Date().toISOString(),
@@ -1059,6 +1143,13 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         grantBindRefused: grantBindRefused ?? undefined,
         liveGrants: liveGrants.length ? liveGrants.map((g) => g.id) : undefined,
         coveringGrant: coveringGrant?.id ?? undefined,
+        // Step 3 part 2: the authority hub's view (authority.ts). restriction:
+        // an enforced restriction in force; restrictionShadow: an automatic one
+        // in shadow mode; grantMirror: each live grant against the hub's mirror.
+        restriction: restrictionRow,
+        restrictionShadow,
+        grantMirror,
+        ...authorityAudit,
         agentId: ctx?.agentId ?? null,
         toolCallId: event.toolCallId ?? null,
         toolName,
@@ -1104,7 +1195,7 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
         // phase:"injection_review" row for this same toolCallId follows once the
         // model judgment lands (async, never blocks this row or the tool call).
         injectionReviewPending: injectionReviewEligible,
-        enforced: mode === "enforce" && decision.verdict !== "allow",
+        enforced: (mode === "enforce" || restrictionEnforced) && decision.verdict !== "allow",
       });
 
       cardContext = {
@@ -1348,7 +1439,8 @@ export function registerReviewer(api: OpenClawPluginApi, opts: ReviewerOptions):
       return;
     }
 
-    if (mode !== "enforce") return; // shadow: log only
+    // shadow: log only. A restriction's deny blocks in shadow mode too.
+    if (mode !== "enforce" && !restrictionEnforced) return;
 
     // 2026-08-24: surface the retry hint (if any) alongside the reason, so the
     // agent reading a deny — or Mike reading an escalate — has something

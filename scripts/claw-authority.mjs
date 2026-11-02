@@ -19,6 +19,8 @@
 //   control       root.genesis, root.add, root.remove, hub.cert, hub.revoke,
 //                 key.void: who may sign what. Only roots sign here.
 //   restrictions  restriction.add, restriction.lift.
+//   ledger        grant.state, grant.removed: the hub's signed mirror of the
+//                 peer-grant and directive ledger (see LEDGER below).
 // Each event: { v, stream, seq, prev, hlc, at, kind, scope, body, signer }
 // plus id = sha256(canonical form) and sig over the same bytes. prev is the
 // id of the event before it, so a changed, dropped or reordered line breaks
@@ -37,10 +39,36 @@
 //   - Merge: an observed-remove set. A lift names the add ids it removes; a
 //     key.void removes a key's adds from a time on.
 //
+// LEDGER (step 3 part 2)
+//   The autoreviewer bot stays the only writer of peer-grants.json (CLAW-119),
+//   and the JSON file stays the format that the bots read. `sync` mirrors
+//   each change of a record into the ledger stream and checks the change
+//   against the ledger's own rules (autoreviewer/src/ledger.mjs): a grant
+//   that skips a step, outlives its maximum, or changes a fixed field is
+//   mirrored with an `anomaly` and stays suspect. The mirror is a record,
+//   not an approval: Mike's tap on the autoreviewer card is the approval.
+//
+// THE REVIEWER LINK
+//   `sync` also writes one view per bot, authority-view/<bot>/authority.json
+//   (outside the observatory state folder): the restrictions in force that
+//   name the bot, and the mirror state of its live grants. Each bot mounts
+//   only its own folder, read-only, at /reach/authority. The reviewer
+//   (extensions/oasis-reviewer/src/authority.ts) applies the levels, checks
+//   expiry with its own clock, and keeps the last good view when the file
+//   is gone or goes back (fail static). A root restriction enforces at once;
+//   an automatic one is shadow (audit only) until OASIS_AUTHORITY_AUTO=enforce.
+//   OASIS_AUTHORITY_GRANTS=require makes the reviewer use only grants whose
+//   mirror is legal and current (default observe: audit only).
+//
+// THE COUNT RULE
+//   `sync` reads the deny rows of each bot's reviewer audit (docker exec) and
+//   restricts an instance to fail-closed for 24 h after 5 enforced denials in
+//   10 minutes. A reviewer health failure (l2:unavailable, l2FailClosed) and a
+//   restriction's own deny never count, so a restriction never feeds itself.
+//
 // TRUST: the genesis root is pinned out of band (root.pin; `init` prints the
 // fingerprint). There is no trust on first use: without a pin nothing
-// verifies. Nothing enforces these restrictions yet; the reviewer reads them
-// in a later step. Nothing here talks to the network.
+// verifies. Nothing here talks to the network; `sync` runs docker exec.
 //
 // LIMIT: the folder (~/Library/Application Support/oasis-x/observatory/
 // authority, 0700) is mounted into no bot container (checked 2026-11-02:
@@ -60,7 +88,10 @@
 //   lift <id>...                        (Touch ID)
 //   void-key <key> --since ISO          (Touch ID)
 //   renew-hub [--agents a,b]            a new 90-day hub certificate (Touch ID)
+//   sync [--no-count]                   one pass: ledger mirror, count rule, views
+//   daemon [--interval S]               sync on each ledger change and every S s
 // A target is `fleet`, `agent:<bot>` or `instance:<bot>@<container>`.
+// restrict and freeze refuse a bot that has no view folder, unless --force.
 
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
@@ -72,8 +103,13 @@ import { fileURLToPath } from "node:url";
 const STATE_DIR =
   process.env.OASIS_OBSERVATORY_STATE_DIR || path.join(os.homedir(), "Library", "Application Support", "oasis-x", "observatory");
 export const DEFAULT_DIR = path.join(STATE_DIR, "authority");
+const OASIS_DIR = path.join(os.homedir(), "Library", "Application Support", "oasis-x");
+export const DEFAULT_LEDGER_FILE = path.join(OASIS_DIR, "approvals", "peer-grants", "peer-grants.json");
+// Not inside the observatory state folder: no bot mounts that folder (CLAW-108).
+export const DEFAULT_VIEW_DIR = path.join(OASIS_DIR, "authority-view");
+export const VIEW_FILE = "authority.json";
 
-export const STREAMS = ["control", "restrictions"];
+export const STREAMS = ["control", "restrictions", "ledger"];
 export const LEVELS = ["fail-closed", "read-only", "chat-only", "stopped"];
 export const AUTO_FLOOR = "chat-only";
 export const HUB_TRIGGERS = ["hard-rule", "canary", "never-downgrade", "count-rule", "x-model"];
@@ -86,6 +122,7 @@ export const EXPIRY_NOTICE_MS = 2 * 3600_000;
 const LOCK_STALE_MS = 10 * 60_000;
 const TARGET_RE = /^(?:fleet|agent:[a-z0-9-]{1,40}|instance:[a-z0-9-]{1,40}@[a-z0-9][a-z0-9_.-]{0,80})$/;
 const ID_RE = /^[0-9a-f]{64}$/;
+const BOT_RE = /^[a-z0-9-]{1,40}$/;
 
 // ── canonical form and keys ──────────────────────────────────────────────────
 
@@ -148,12 +185,12 @@ export function keySigner(privateKey) {
   };
 }
 
-function runTool(tool, args, input) {
+function runTool(tool, args, input, timeoutMs = 180_000) {
   return new Promise((resolve, reject) => {
     const child = spawn(tool, args, { stdio: ["pipe", "pipe", "pipe"] });
     let out = "";
     let err = "";
-    const timer = setTimeout(() => child.kill("SIGTERM"), 180_000);
+    const timer = setTimeout(() => child.kill("SIGTERM"), timeoutMs);
     child.stdout.on("data", (c) => (out += c));
     child.stderr.on("data", (c) => (err += c));
     child.on("error", (e) => {
@@ -356,6 +393,156 @@ export function authorizeRestriction(trust, event) {
   return null;
 }
 
+// ── the ledger mirror ────────────────────────────────────────────────────────
+
+const GRANT_ID_RE = /^(?:GRANT|DIR)-\d{4,}$/;
+export const GRANT_STATUSES = ["proposed", "active", "denied", "revoked", "lapsed", "expired"];
+const TERMINAL = new Set(["denied", "revoked", "lapsed", "expired"]);
+/** What the mirror records of a ledger record. Cards, reminders and notes stay out. */
+export const GRANT_RECORD_FIELDS = [
+  "id", "kind", "status", "requester", "grantees", "thread_id", "lane", "topic", "intent", "must_not",
+  "families", "path_prefixes", "max_actions", "proposed_at", "approved_at", "expires", "decided_by",
+  "renewed_at", "revoked_at", "grace_until",
+];
+/**
+ * The fields that the reviewer acts on (PeerGrant in extensions/oasis-reviewer/
+ * src/peer-grants.ts). MUST match USE_FIELDS in extensions/oasis-reviewer/src/
+ * authority.ts: both sides hash these fields, and a test in each pins the hash.
+ */
+export const USE_FIELDS = [
+  "id", "kind", "status", "requester", "grantees", "thread_id", "lane", "topic", "intent", "must_not",
+  "families", "path_prefixes", "max_actions", "approved_at", "expires",
+];
+const FIXED_FIELDS = [
+  "kind", "requester", "grantees", "thread_id", "lane", "topic", "intent", "must_not",
+  "families", "path_prefixes", "max_actions", "proposed_at",
+];
+// autoreviewer/src/ledger.mjs: MAX_TTL_HOURS, DIRECTIVE_MAX_HOURS, DIRECTIVE_GRACE_MS.
+const GRANT_MAX_MS = 24 * 3600_000;
+const DIRECTIVE_MAX_MS = 168 * 3600_000;
+const DIRECTIVE_GRACE_MS = 4 * 3600_000;
+const SLACK_MS = 60_000;
+
+/** One value in the canonical form: a float or an object becomes text. */
+function cleanValue(v) {
+  if (v === undefined || v === null) return null;
+  if (typeof v === "number") return Number.isSafeInteger(v) ? v : String(v);
+  if (typeof v === "string" || typeof v === "boolean") return v;
+  if (Array.isArray(v)) return v.map(cleanValue);
+  return JSON.stringify(v);
+}
+
+export function projectGrant(g, fields = GRANT_RECORD_FIELDS) {
+  return Object.fromEntries(fields.map((f) => [f, cleanValue(g?.[f])]));
+}
+
+/** The hash of the fields the reviewer acts on (the same on both sides). */
+export function useFingerprint(g) {
+  return sha256(canonical(projectGrant(g, USE_FIELDS)));
+}
+
+/**
+ * The ledger rules that a change from `prev` to `next` breaks, as one text,
+ * or null. `prev` is null for a record the mirror sees first. `observedMs`
+ * is the mirror's clock: no time in a record can be later than that.
+ */
+export function grantAnomaly(prev, next, observedMs) {
+  const problems = [];
+  const directive = next.kind === "directive";
+  const approved = ms(next.approved_at);
+  const renewed = ms(next.renewed_at);
+  const expires = ms(next.expires);
+  if (!GRANT_STATUSES.includes(next.status)) problems.push(`unknown status ${next.status}`);
+  if (next.status === "active" && !(Number.isFinite(approved) && Number.isFinite(expires) && next.decided_by !== null && next.decided_by !== "")) {
+    problems.push("an active record has no approval time, end time or decider");
+  }
+  if (approved > observedMs + SLACK_MS || renewed > observedMs + SLACK_MS) problems.push("an approval or renewal time is in the future");
+  if (Number.isFinite(approved) && Number.isFinite(expires)) {
+    if (!directive && expires - approved > GRANT_MAX_MS + SLACK_MS) problems.push("a peer grant runs longer than 24 hours");
+    // Every legal end time was set at a time no later than now, to at most 7
+    // days after that time (decide, renew) or 4 hours (grace). So no legal
+    // directive ends more than 7 days from now. A renewal by older ledger code
+    // left no renewed_at (no start time); this bound still holds for it.
+    if (directive && expires - observedMs > DIRECTIVE_MAX_MS + SLACK_MS) problems.push("a directive ends more than 7 days from now");
+    const graced = next.grace_until !== null && next.grace_until === next.expires;
+    if (directive && !graced && Number.isFinite(renewed) && expires - Math.max(approved, renewed) > DIRECTIVE_MAX_MS + SLACK_MS) {
+      problems.push("a directive runs longer than 7 days after its renewal");
+    }
+  }
+  if (!directive && Array.isArray(next.grantees) && next.grantees.includes(next.requester)) problems.push("a bot grants itself");
+  if (prev) {
+    if (TERMINAL.has(prev.status) && next.status !== prev.status) problems.push(`a ${prev.status} record became ${next.status}`);
+    if (prev.status === "active" && next.status === "proposed") problems.push("an active record went back to proposed");
+    for (const f of FIXED_FIELDS) if (canonical(prev[f]) !== canonical(next[f])) problems.push(`${f} changed`);
+    if (prev.approved_at !== null && next.approved_at !== prev.approved_at) problems.push("approved_at changed");
+    if (prev.status === "active" && next.status === "active" && next.expires !== prev.expires) {
+      const renewal = directive && next.renewed_at !== null && next.renewed_at !== prev.renewed_at;
+      const grace =
+        directive && prev.grace_until === null && next.grace_until !== null && next.expires === next.grace_until &&
+        ms(next.grace_until) <= observedMs + DIRECTIVE_GRACE_MS + SLACK_MS;
+      if (!renewal && !grace) problems.push("the end time changed without a renewal");
+    }
+  }
+  return problems.length ? problems.join("; ").slice(0, 300) : null;
+}
+
+/**
+ * Checks for the ledger stream. `state` holds the mirror of each record:
+ * { record, hash, legal, anomaly, removed }. A record with one anomaly stays
+ * not legal (sticky), so a later clean change does not clear it.
+ */
+function ledgerChecker(trust) {
+  const state = new Map();
+  const check = (e) => {
+    const signerKey = e.signer?.key;
+    const isRoot = trust.roots.has(signerKey);
+    const hub = isRoot ? null : hubValidAt(trust, signerKey, ms(e.at));
+    const pool = new Map(isRoot ? [[signerKey, trust.roots.get(signerKey)]] : hub ? [[signerKey, hub]] : []);
+    if (!signersOf(trust, e, pool).has(signerKey)) return isRoot || hub ? "bad signature" : "the signer is not a root or a valid hub";
+    const b = e.body ?? {};
+    if (!GRANT_ID_RE.test(String(b.id)) || e.scope !== b.id) return "a ledger event names its grant id (GRANT-n or DIR-n)";
+    if (b.anomaly !== null && (typeof b.anomaly !== "string" || !b.anomaly || b.anomaly.length > 300)) return "anomaly is null or a short text";
+    const cur = state.get(b.id);
+    if (e.kind === "grant.state") {
+      if (!b.record || typeof b.record !== "object" || Array.isArray(b.record) || b.record.id !== b.id) return "grant.state holds the record";
+      if (b.hash !== sha256(canonical(b.record))) return "the record hash does not match the record";
+      if (hub && !hub.agents.includes("*") && !(Array.isArray(b.record.grantees) && b.record.grantees.every((g) => hub.agents.includes(g)))) {
+        return "this hub is not certified for every grantee";
+      }
+      state.set(b.id, { record: b.record, hash: b.hash, legal: (cur?.legal ?? true) && b.anomaly === null, anomaly: cur?.anomaly ?? b.anomaly, removed: false });
+      return null;
+    }
+    if (e.kind === "grant.removed") {
+      if (!cur || cur.removed) return "grant.removed names a record that the mirror does not hold";
+      state.set(b.id, { ...cur, removed: true, legal: cur.legal && b.anomaly === null, anomaly: cur.anomaly ?? b.anomaly });
+      return null;
+    }
+    return `unknown ledger kind ${e.kind}`;
+  };
+  return { check, state };
+}
+
+/** The ledger events that bring the mirror up to `grants` (the JSON file's records). */
+export function planLedgerSync(state, grants, observedMs) {
+  const entries = [];
+  const seen = new Set();
+  for (const g of grants) {
+    // A second record with the same id is not mirrored: the reviewer uses the first.
+    if (!g || !GRANT_ID_RE.test(String(g.id)) || seen.has(g.id)) continue;
+    seen.add(g.id);
+    const record = projectGrant(g);
+    const hash = sha256(canonical(record));
+    const cur = state.get(g.id);
+    if (cur && !cur.removed && cur.hash === hash) continue;
+    const anomaly = cur?.removed ? "a removed record came back" : grantAnomaly(cur ? cur.record : null, record, observedMs);
+    entries.push({ kind: "grant.state", scope: g.id, body: { id: g.id, record, hash, anomaly } });
+  }
+  for (const [id, cur] of state) {
+    if (!cur.removed && !seen.has(id)) entries.push({ kind: "grant.removed", scope: id, body: { id, anomaly: "removed from the ledger file" } });
+  }
+  return entries;
+}
+
 // ── reading and verifying streams ────────────────────────────────────────────
 
 /** Chain checks for one stream's parsed lines; `check(event)` adds the rules. */
@@ -416,13 +603,63 @@ export function readPin(dir) {
   }
 }
 
+// heads.json: the last head of each stream that this hub appended. A stream
+// that ends before that head, or has another event there, was truncated or
+// rewritten: emptying the restrictions stream would otherwise lift every
+// restriction and still verify. Same LIMIT as the hub key: a process that
+// runs as Mike can change both files.
+const HEADS_FILE = "heads.json";
+
+export function readHeads(dir) {
+  let text;
+  try {
+    text = fs.readFileSync(path.join(dir, HEADS_FILE), "utf8");
+  } catch (err) {
+    if (err.code === "ENOENT") return {};
+    throw err;
+  }
+  const heads = JSON.parse(text);
+  if (!heads || typeof heads !== "object" || Array.isArray(heads)) throw new Error(`${HEADS_FILE} is not an object`);
+  return heads;
+}
+
+function headFault(stream, pinned) {
+  if (!pinned) return null;
+  const e = stream.events[pinned.seq];
+  if (!e) return `the stream ends before seq ${pinned.seq}, the last head that this hub wrote (truncated or rolled back)`;
+  if (e.id !== pinned.id) return `the event at seq ${pinned.seq} is not the one that this hub wrote (history rewritten)`;
+  return null;
+}
+
+/**
+ * Verify every stream. `checks` continue from the verified state, so an
+ * append checks a new event against the same rules as verify.
+ */
 export function loadAuthority(dir, { pin = readPin(dir) } = {}) {
   const trust = emptyTrust(pin);
-  const control = verifyChain("control", readLines(path.join(dir, "streams", "control.jsonl")), (e) => applyControl(trust, e));
-  const restrictions = verifyChain("restrictions", readLines(path.join(dir, "streams", "restrictions.jsonl")), (e) =>
-    authorizeRestriction(trust, e),
-  );
-  return { dir, pin, trust, streams: { control, restrictions }, ok: !control.errors.length && !restrictions.errors.length };
+  const ledger = ledgerChecker(trust);
+  const checks = {
+    control: (e) => applyControl(trust, e),
+    restrictions: (e) => authorizeRestriction(trust, e),
+    ledger: ledger.check,
+  };
+  const streams = {};
+  for (const name of STREAMS) streams[name] = verifyChain(name, readLines(path.join(dir, "streams", `${name}.jsonl`)), checks[name]);
+  let heads = {};
+  try {
+    heads = readHeads(dir);
+  } catch (err) {
+    streams.control.errors.push(`${HEADS_FILE} does not read: ${err.message}`);
+  }
+  for (const name of STREAMS) {
+    const fault = streams[name].errors.length ? null : headFault(streams[name], heads[name]);
+    if (fault) streams[name].errors.push(fault);
+  }
+  return { dir, pin, trust, streams, checks, ledger: ledger.state, ok: STREAMS.every((n) => !streams[n].errors.length) };
+}
+
+export function streamErrors(auth) {
+  return STREAMS.flatMap((n) => auth.streams[n].errors.map((err) => `${n} ${err}`));
 }
 
 // ── restrictions in force ────────────────────────────────────────────────────
@@ -547,48 +784,66 @@ function ensureDirs(dir) {
 }
 
 /**
- * Append one event: lock, verify the whole log, check the signer's right to
- * this event, sign, append, fsync. Returns the stored event.
+ * Append events to one stream: lock, verify the whole log, check the signer's
+ * right to each event, sign, append, fsync. All or none. Returns the stored
+ * events. `entries` is a list of { kind, scope, body }, or a function that
+ * gets the verified log (under the lock) and returns that list.
  *   cosigners: extra roots for a root set change.
  */
-export async function appendEvent(dir, stream, { kind, scope, body }, signer, { cosigners = [], now = Date.now, pin } = {}) {
+export async function appendEvents(dir, stream, entries, signer, { cosigners = [], now = Date.now, pin } = {}) {
   if (!STREAMS.includes(stream)) throw new Error(`unknown stream ${stream}`);
   ensureDirs(dir);
   return withLock(dir, async () => {
     const auth = loadAuthority(dir, pin ? { pin } : undefined);
-    if (!auth.ok) throw new Error(`the log does not verify: ${[...auth.streams.control.errors, ...auth.streams.restrictions.errors].join("; ")}`);
-    const last = auth.streams[stream].events.at(-1) ?? null;
+    if (!auth.ok) throw new Error(`the log does not verify: ${streamErrors(auth).join("; ")}`);
+    const list = typeof entries === "function" ? entries(auth) : entries;
+    if (!list.length) return [];
+    let last = auth.streams[stream].events.at(-1) ?? null;
     const nowMs = now();
-    const event = {
-      v: 1,
-      stream,
-      seq: last ? last.seq + 1 : 0,
-      prev: last ? last.id : null,
-      hlc: nextHlc(last?.hlc, nowMs),
-      at: new Date(Math.max(nowMs, last ? ms(last.at) : 0)).toISOString(),
-      kind,
-      scope,
-      body,
-      signer: { key: signer.key, alg: signer.alg },
-    };
-    const bytes = signingBytes(event);
-    event.id = sha256(bytes);
-    event.sig = await signer.sign(bytes);
-    if (cosigners.length) event.cosigs = [];
-    for (const c of cosigners) event.cosigs.push({ key: c.key, alg: c.alg, sig: await c.sign(bytes) });
-    // The same rules as verify, against the trust before this event.
-    const fault = stream === "control" ? applyControl(auth.trust, event) : authorizeRestriction(auth.trust, event);
-    if (fault) throw new Error(`refused: ${fault}`);
+    const out = [];
+    for (const { kind, scope, body } of list) {
+      const event = {
+        v: 1,
+        stream,
+        seq: last ? last.seq + 1 : 0,
+        prev: last ? last.id : null,
+        hlc: nextHlc(last?.hlc, nowMs),
+        at: new Date(Math.max(nowMs, last ? ms(last.at) : 0)).toISOString(),
+        kind,
+        scope,
+        body,
+        signer: { key: signer.key, alg: signer.alg },
+      };
+      const bytes = signingBytes(event);
+      event.id = sha256(bytes);
+      event.sig = await signer.sign(bytes);
+      if (cosigners.length) event.cosigs = [];
+      for (const c of cosigners) event.cosigs.push({ key: c.key, alg: c.alg, sig: await c.sign(bytes) });
+      // The same rules as verify, against the state before this event.
+      const fault = auth.checks[stream](event);
+      if (fault) throw new Error(`refused: ${fault}`);
+      out.push(event);
+      last = event;
+    }
     const file = path.join(dir, "streams", `${stream}.jsonl`);
     const fd = fs.openSync(file, "a", 0o600);
     try {
-      fs.writeSync(fd, `${JSON.stringify(event)}\n`);
+      fs.writeSync(fd, out.map((e) => `${JSON.stringify(e)}\n`).join(""));
       fs.fsyncSync(fd);
     } finally {
       fs.closeSync(fd);
     }
-    return event;
+    const heads = readHeads(dir);
+    heads[stream] = { seq: last.seq, id: last.id };
+    const tmp = path.join(dir, `.${HEADS_FILE}.${process.pid}.tmp`);
+    fs.writeFileSync(tmp, `${JSON.stringify(heads, null, 2)}\n`, { mode: 0o600 });
+    fs.renameSync(tmp, path.join(dir, HEADS_FILE));
+    return out;
   });
+}
+
+export async function appendEvent(dir, stream, entry, signer, opts) {
+  return (await appendEvents(dir, stream, [entry], signer, opts))[0];
 }
 
 // ── init ─────────────────────────────────────────────────────────────────────
@@ -630,6 +885,285 @@ export async function initAuthority(dir, rootSigner, { now = Date.now, agents = 
   );
 }
 
+// ── sync: the ledger mirror, the count rule, the views ───────────────────────
+
+function readLedgerFile(file) {
+  let data;
+  try {
+    data = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (err) {
+    if (err.code === "ENOENT") return null;
+    throw new Error(`${file}: ${err.message}`);
+  }
+  if (!Array.isArray(data?.grants)) throw new Error(`${file} has no grants list`);
+  return data.grants;
+}
+
+/** Mirror the ledger file into the ledger stream. A missing file mirrors nothing. */
+export async function syncLedger(dir, ledgerFile, signer, { now = Date.now } = {}) {
+  const grants = readLedgerFile(ledgerFile);
+  if (!grants) return { missing: true, appended: [] };
+  const appended = await appendEvents(dir, "ledger", (auth) => planLedgerSync(auth.ledger, grants, now()), signer, { now });
+  return { missing: false, appended };
+}
+
+// Runs INSIDE a bot container (docker exec <container> node -e ...): the deny
+// rows of the last 15 minutes of the last 2 MB of the reviewer audit, metadata
+// only. `h` is the sha256 of the raw line: the evidence id of a restriction.
+export const AUDIT_COLLECTOR = `
+const fs=require("fs"),crypto=require("crypto");const f="/home/node/.openclaw/logs/reviewer/reviewer-audit.jsonl";
+let txt="";try{const s=fs.statSync(f).size;const st=Math.max(0,s-2*1024*1024);const fd=fs.openSync(f,"r");const b=Buffer.alloc(s-st);fs.readSync(fd,b,0,b.length,st);fs.closeSync(fd);txt=b.toString("utf8");if(st>0)txt=txt.slice(txt.indexOf("\\n")+1);}catch(e){}
+const now=Date.now(),out=[];for(const l of txt.split("\\n")){if(!l.includes('"deny"'))continue;let r;try{r=JSON.parse(l)}catch{continue}
+const t=Date.parse(r.ts);if(!(now-t<=15*60000)||r.verdict!=="deny")continue;
+out.push({ts:r.ts,phase:r.phase,verdict:r.verdict,enforced:r.enforced===true,principle:String(r.principle||"").slice(0,120),l2FailClosed:!!r.l2FailClosed,error:!!r.error,restriction:!!(r.restriction&&r.restriction.changed),h:crypto.createHash("sha256").update(l).digest("hex")})}
+process.stdout.write(JSON.stringify(out));`;
+
+/**
+ * The audit rows that count toward the count rule: an enforced deny of a
+ * tool call. A reviewer health failure never counts (Follow-up 3 rule 8), and
+ * a restriction's own deny never counts (no restriction feeds itself).
+ */
+export function countableDenials(rows, agent, instance) {
+  return rows
+    .filter(
+      (r) =>
+        r?.phase === "before_tool_call" &&
+        r.verdict === "deny" &&
+        r.enforced === true &&
+        !r.error &&
+        !r.l2FailClosed &&
+        !r.restriction &&
+        !String(r.principle ?? "").startsWith("l2:unavailable") &&
+        !String(r.principle ?? "").startsWith("authority:") &&
+        ID_RE.test(String(r.h)) &&
+        Number.isFinite(ms(r.ts)),
+    )
+    .map((r) => ({ id: r.h, at: r.ts, agent, instance }));
+}
+
+/**
+ * The count rule: restrict each instance with 5 denials in 10 minutes to
+ * fail-closed for 24 h, signed by the hub. An instance that already has a
+ * count-rule restriction in force (or held by the rate budget) gets no
+ * second one, and one denial is the evidence of one restriction at most.
+ */
+export async function applyCountRule(dir, signer, denials, { now = Date.now } = {}) {
+  const nowMs = now();
+  const hits = countRuleHits(denials, nowMs);
+  if (!hits.length) return [];
+  return appendEvents(
+    dir,
+    "restrictions",
+    (auth) => {
+      const ev = evaluateRestrictions(auth.streams.restrictions.events, auth.trust, nowMs);
+      const busy = new Set([
+        ...ev.active.filter((r) => r.trigger === "count-rule").map((r) => r.target),
+        ...ev.held.filter((h) => nowMs - ms(h.at) < TTL_MS).map((h) => h.target),
+      ]);
+      const used = new Set(auth.streams.restrictions.events.filter((e) => e.kind === "restriction.add").map((e) => e.body.evidence));
+      return hits
+        .map((h) => ({ ...h, target: `instance:${h.agent}@${h.instance}` }))
+        .filter((h) => TARGET_RE.test(h.target) && !busy.has(h.target) && !used.has(h.evidence))
+        .map((h) => ({
+          kind: "restriction.add",
+          scope: h.target,
+          body: {
+            target: h.target,
+            level: "fail-closed",
+            trigger: "count-rule",
+            reason: `${h.count} enforced denials in 10 minutes (count rule)`,
+            evidence: h.evidence,
+            expiresAt: new Date(nowMs + TTL_MS).toISOString(),
+          },
+        }));
+    },
+    signer,
+    { now },
+  );
+}
+
+/**
+ * One bot's view: the restrictions in force that name the bot (fleet, the
+ * agent, its current container), and the mirror state of each grant that
+ * names it as a grantee and is active in the mirror or not legal. The
+ * reviewer checks expiry itself, with its own clock.
+ */
+export function buildView(auth, { key, container }, { nowMs, autoMode = "shadow", grantMode = "observe" }) {
+  const ev = evaluateRestrictions(auth.streams.restrictions.events, auth.trust, nowMs);
+  const targets = new Set(["fleet", `agent:${key}`, ...(container ? [`instance:${key}@${container}`] : [])]);
+  const items = ev.active
+    .filter((r) => targets.has(r.target))
+    .map((r) => ({
+      id: r.id,
+      target: r.target,
+      level: r.level,
+      trigger: r.trigger,
+      byRoot: r.byRoot,
+      at: r.at,
+      expiresAt: r.expiresAt,
+      reason: r.reason.slice(0, 200),
+      mode: r.byRoot || autoMode === "enforce" ? "enforce" : "shadow",
+    }));
+  const grants = {};
+  for (const [id, s] of auth.ledger) {
+    if (s.removed || !Array.isArray(s.record.grantees) || !s.record.grantees.includes(key)) continue;
+    if (s.record.status !== "active" && s.legal) continue;
+    grants[id] = { use: useFingerprint(s.record), legal: s.legal, anomaly: s.anomaly };
+  }
+  const head = (name) => ({ seq: auth.streams[name].events.at(-1)?.seq ?? -1, head: auth.streams[name].head });
+  return {
+    v: 1,
+    kind: "authority.view",
+    bot: key,
+    container: container ?? null,
+    at: new Date(nowMs).toISOString(),
+    restrictions: { ...head("restrictions"), items },
+    ledger: { ...head("ledger"), grantMode, grants },
+  };
+}
+
+function writeAtomic(file, text) {
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.tmp`);
+  fs.writeFileSync(tmp, text, { mode: 0o644 });
+  fs.renameSync(tmp, file);
+}
+
+/**
+ * Write <viewDir>/<bot>/authority.json for each bot, signed by the hub (for
+ * replicas off this Mac; the reviewer trusts its read-only mount, as it
+ * trusts peer-grants.json). A log that does not verify writes no view: the
+ * bots keep the last good one (fail static).
+ */
+export async function publishViews(dir, viewDir, fleet, signer, { now = Date.now, autoMode, grantMode } = {}) {
+  const auth = loadAuthority(dir);
+  if (!auth.ok) return { written: [], fault: streamErrors(auth).join("; ") };
+  const nowMs = now();
+  const written = [];
+  for (const bot of fleet) {
+    if (!BOT_RE.test(String(bot.key))) continue;
+    const view = buildView(auth, bot, { nowMs, autoMode, grantMode });
+    view.hub = signer.key;
+    view.sig = await signer.sign(Buffer.from(canonical(view), "utf8"));
+    const folder = path.join(viewDir, bot.key);
+    fs.mkdirSync(folder, { recursive: true, mode: 0o755 });
+    writeAtomic(path.join(folder, VIEW_FILE), `${JSON.stringify(view, null, 2)}\n`);
+    written.push(bot.key);
+  }
+  return { written, fault: null };
+}
+
+function dockerExec(container, script, timeoutMs = 20_000) {
+  return runTool("docker", ["exec", container, "node", "-e", script], "", timeoutMs);
+}
+
+/** The fleet from the observatory's discovery: key, container, running. Excluded deployments stay out. */
+async function discoverBots() {
+  const { discoverFleet } = await import(new URL("./claw-observatory.mjs", import.meta.url));
+  const { bots } = await discoverFleet();
+  return bots.filter((b) => !b.excluded).map((b) => ({ key: b.key, container: b.container, running: b.running }));
+}
+
+/**
+ * One sync pass. Each part runs even when another part fails; the errors are
+ * returned. `fleet` and `collect` (container -> audit rows) are injectable.
+ */
+export async function syncOnce(
+  dir,
+  { ledgerFile = DEFAULT_LEDGER_FILE, viewDir = DEFAULT_VIEW_DIR, fleet, collect, countRule = true, now = Date.now, autoMode = "shadow", grantMode = "observe" } = {},
+) {
+  const hub = loadHubSigner(dir);
+  const out = { ledger: [], anomalies: [], restricted: [], views: [], errors: [] };
+  let bots = fleet;
+  if (!bots) {
+    try {
+      bots = await discoverBots();
+    } catch (err) {
+      // No fleet, no views: the bots keep their last good view (fail static).
+      out.errors.push(`fleet: ${err.message.split("\n")[0]}`);
+    }
+  }
+  try {
+    const r = await syncLedger(dir, ledgerFile, hub, { now });
+    out.ledger = r.appended.map((e) => e.body.id);
+    out.anomalies = r.appended.filter((e) => e.body.anomaly).map((e) => ({ id: e.body.id, anomaly: e.body.anomaly }));
+  } catch (err) {
+    out.errors.push(`ledger: ${err.message}`);
+  }
+  if (countRule && bots) {
+    const read = collect ?? (async (container) => JSON.parse(await dockerExec(container, AUDIT_COLLECTOR)));
+    const denials = [];
+    await Promise.all(
+      bots
+        .filter((b) => b.running && BOT_RE.test(String(b.key)))
+        .map(async (b) => {
+          try {
+            denials.push(...countableDenials(await read(b.container), b.key, b.container));
+          } catch (err) {
+            out.errors.push(`audit ${b.key}: ${err.message.split("\n")[0]}`);
+          }
+        }),
+    );
+    try {
+      out.restricted = (await applyCountRule(dir, hub, denials, { now })).map((e) => e.body.target);
+    } catch (err) {
+      out.errors.push(`count rule: ${err.message}`);
+    }
+  }
+  if (bots) {
+    try {
+      const v = await publishViews(dir, viewDir, bots, hub, { now, autoMode, grantMode });
+      out.views = v.written;
+      if (v.fault) out.errors.push(`views not written, the log does not verify: ${v.fault}`);
+    } catch (err) {
+      out.errors.push(`views: ${err.message}`);
+    }
+  }
+  return out;
+}
+
+/**
+ * Sync at start, after each change of the ledger folder (1 s debounce, no
+ * count rule) and every `intervalMs` (with the count rule). One pass at a
+ * time. Logs one JSON line for a pass that changed something or failed.
+ */
+export async function runDaemon(dir, { ledgerFile = DEFAULT_LEDGER_FILE, intervalMs = 60_000, log = (row) => console.log(JSON.stringify(row)), ...opts } = {}) {
+  let busy = false;
+  let pending = null;
+  const pass = async (reason) => {
+    if (busy) {
+      pending = pending === "interval" ? pending : reason;
+      return;
+    }
+    busy = true;
+    try {
+      const r = await syncOnce(dir, { ledgerFile, countRule: reason !== "ledger", ...opts });
+      if (r.ledger.length || r.restricted.length || r.errors.length || reason === "start") {
+        log({ ts: new Date().toISOString(), reason, ledger: r.ledger.length, anomalies: r.anomalies, restricted: r.restricted, views: r.views.length, errors: r.errors });
+      }
+    } catch (err) {
+      log({ ts: new Date().toISOString(), reason, errors: [err.message] });
+    } finally {
+      busy = false;
+      if (pending) {
+        const next = pending;
+        pending = null;
+        setImmediate(() => pass(next));
+      }
+    }
+  };
+  let debounce = null;
+  try {
+    fs.watch(path.dirname(ledgerFile), () => {
+      clearTimeout(debounce);
+      debounce = setTimeout(() => pass("ledger"), 1000);
+    });
+  } catch (err) {
+    log({ ts: new Date().toISOString(), reason: "watch", errors: [`no watch on ${path.dirname(ledgerFile)}: ${err.message}; interval only`] });
+  }
+  setInterval(() => pass("interval"), intervalMs);
+  await pass("start");
+}
+
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
 function parseFlags(argv) {
@@ -639,7 +1173,7 @@ function parseFlags(argv) {
     const a = argv[i];
     if (a.startsWith("--")) {
       const name = a.slice(2);
-      if (["json"].includes(name)) flags[name] = true;
+      if (["json", "force", "no-count"].includes(name)) flags[name] = true;
       else {
         const v = argv[++i];
         if (v === undefined) throw new Error(`${a} needs a value`);
@@ -648,6 +1182,12 @@ function parseFlags(argv) {
     } else args.push(a);
   }
   return { args, flags };
+}
+
+function modeFlag(value, allowed) {
+  const v = String(value ?? allowed[0]).toLowerCase();
+  if (!allowed.includes(v)) throw new Error(`${value} is not one of ${allowed.join(", ")}`);
+  return v;
 }
 
 function defaultTool(dir) {
@@ -664,11 +1204,16 @@ function statusReport(auth, nowMs) {
     dir: auth.dir,
     pin: auth.pin,
     ok: auth.ok,
-    errors: [...auth.streams.control.errors, ...auth.streams.restrictions.errors],
+    errors: streamErrors(auth),
     roots: [...auth.trust.roots].map(([key, r]) => ({ key, label: r.label, addedAt: r.addedAt })),
     hubs: [...auth.trust.hubs].map(([key, h]) => ({ key, agents: h.agents, expiresAt: h.expiresAt, revoked: auth.trust.revoked.has(key) })),
     streams: Object.fromEntries(Object.entries(auth.streams).map(([k, s]) => [k, { events: s.events.length, head: s.head }])),
     restrictions: ev,
+    ledger: {
+      records: [...auth.ledger.values()].filter((s) => !s.removed).length,
+      active: [...auth.ledger.values()].filter((s) => !s.removed && s.record.status === "active").length,
+      anomalies: [...auth.ledger].filter(([, s]) => !s.legal).map(([id, s]) => ({ id, anomaly: s.anomaly })),
+    },
   };
 }
 
@@ -697,7 +1242,8 @@ export async function main(argv) {
       const report = statusReport(auth, Date.now());
       if (command === "verify") {
         for (const err of report.errors) say(`FAULT ${err}`);
-        say(report.ok ? `ok: ${report.streams.control.events} control and ${report.streams.restrictions.events} restriction events verify` : "the log does not verify");
+        const n = report.streams;
+        say(report.ok ? `ok: ${n.control.events} control, ${n.restrictions.events} restriction and ${n.ledger.events} ledger events verify` : "the log does not verify");
         return report.ok ? 0 : 1;
       }
       if (flags.json) {
@@ -714,6 +1260,9 @@ export async function main(argv) {
       for (const r of ev.active) say(`  ${r.target} ${r.level} (${r.trigger}) ${r.id.slice(0, 12)}${r.expiresAt ? ` until ${r.expiresAt}` : ""}: ${r.reason}`);
       for (const s of ev.storms) say(`  STORM issuer ${s.issuer}: ${s.held} held from ${s.from} to ${s.to}`);
       for (const r of ev.expiring) say(`  expires soon (keep or let expire): ${r.target} ${r.id.slice(0, 12)}`);
+      const lg = report.ledger;
+      say(`ledger mirror: ${lg.records} records, ${lg.active} active${lg.anomalies.length ? `; ${lg.anomalies.length} not legal` : ""}`);
+      for (const a of lg.anomalies) say(`  ANOMALY ${a.id}: ${a.anomaly}`);
       return 0;
     }
     case "log": {
@@ -729,6 +1278,12 @@ export async function main(argv) {
     case "freeze": {
       const target = args[0];
       if (!target) throw new Error(`usage: ${command} <fleet|agent:<bot>|instance:<bot>@<container>>`);
+      // A typo would restrict no bot while Mike thinks it is restricted.
+      const agent = agentOf(target);
+      const viewDir = flags.views || process.env.OASIS_AUTHORITY_VIEW_DIR || DEFAULT_VIEW_DIR;
+      if (agent && !flags.force && !fs.existsSync(path.join(viewDir, agent, VIEW_FILE))) {
+        throw new Error(`no bot "${agent}" has a view in ${viewDir} (sync writes one per bot); check the name, or pass --force`);
+      }
       const hours = flags.hours ? Number(flags.hours) : null;
       const body = {
         target,
@@ -767,8 +1322,29 @@ export async function main(argv) {
       say(`hub ${hub.key} certified until ${body.hub.expiresAt} in ${e.id.slice(0, 12)}`);
       return 0;
     }
+    case "sync":
+    case "daemon": {
+      const opts = {
+        ledgerFile: flags.ledger || process.env.OASIS_AUTHORITY_LEDGER_FILE || DEFAULT_LEDGER_FILE,
+        viewDir: flags.views || process.env.OASIS_AUTHORITY_VIEW_DIR || DEFAULT_VIEW_DIR,
+        autoMode: modeFlag(flags.auto ?? process.env.OASIS_AUTHORITY_AUTO, ["shadow", "enforce"]),
+        grantMode: modeFlag(flags.grants ?? process.env.OASIS_AUTHORITY_GRANTS, ["observe", "require"]),
+      };
+      if (!readPin(dir) || !fs.existsSync(hubKeyFile(dir))) throw new Error(`${dir} has no authority yet: run make authority-init`);
+      if (command === "daemon") {
+        await runDaemon(dir, { ...opts, intervalMs: Math.max(10, Number(flags.interval ?? 60)) * 1000 });
+        return new Promise(() => {}); // runs until launchd stops it
+      }
+      const r = await syncOnce(dir, { ...opts, countRule: !flags["no-count"] });
+      say(`ledger: ${r.ledger.length} change(s) mirrored${r.anomalies.length ? `, ${r.anomalies.length} NOT LEGAL` : ""}`);
+      for (const a of r.anomalies) say(`  ANOMALY ${a.id}: ${a.anomaly}`);
+      if (!flags["no-count"]) say(`count rule: ${r.restricted.length ? r.restricted.join(", ") : "no new restriction"}`);
+      say(`views: ${r.views.length ? r.views.join(", ") : "none written"} (automatic restrictions ${opts.autoMode}, grants ${opts.grantMode})`);
+      for (const err of r.errors) say(`ERROR ${err}`);
+      return r.errors.length ? 1 : 0;
+    }
     default:
-      console.error("usage: claw-authority init|status|verify|log|restrict|freeze|lift|void-key|renew-hub (see the header)");
+      console.error("usage: claw-authority init|status|verify|log|restrict|freeze|lift|void-key|renew-hub|sync|daemon (see the header)");
       return 2;
   }
 }
