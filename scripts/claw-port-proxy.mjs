@@ -72,6 +72,9 @@ import { fileURLToPath } from "node:url";
 
 export const COOKIE_NAME = "claw_proxy_key";
 export const UNLOCK_PATH = "/__claw-proxy/unlock";
+/** The themeId prefix of a theme that the observatory installs (keep equal
+ *  to THEME_ID_PREFIX in claw-observatory-studio.mjs). */
+export const THEME_ID_PREFIX = "fleet-observatory-";
 const KEY_RE = /^[A-Za-z0-9_-]{32,256}$/;
 const HOST_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$/;
 const ORIGIN_RE = /^https?:\/\/[A-Za-z0-9.-]+(?::\d{1,5})?$/;
@@ -235,6 +238,10 @@ function unlockPage(nonce) {
   // The observatory may add the bot's gateway token. It goes on to the
   // Control UI in the fragment only (the UI reads #token= and then removes it).
   var t = location.hash.match(/(?:^#|&)token=([A-Za-z0-9_-]{16,256})/);
+  // The observatory's look for this Control UI: the Appearance mode (m=) and
+  // the bot's Studio theme (ct=, base64url JSON). See applyLook below.
+  var mode = location.hash.match(/(?:^#|&)m=(system|light|dark)(?:&|$)/);
+  var ct = location.hash.match(/(?:^#|&)ct=([A-Za-z0-9_-]{16,24000})(?:&|$)/);
   history.replaceState(null, "", location.pathname);
   if (!m) {
     msg.textContent = "This address carries no key. Open the bot from the observatory, or run: make control-ui BOT=<bot>";
@@ -242,9 +249,46 @@ function unlockPage(nonce) {
   }
   fetch(location.pathname, { method: "POST", headers: { "content-type": "text/plain" }, body: m[1], credentials: "same-origin" })
     .then(function (r) {
-      if (r.ok) { location.replace(t ? "/chat?session=main#token=" + t[1] : "/"); } else { msg.textContent = "The proxy refused this key (HTTP " + r.status + ")."; }
+      if (r.ok) {
+        if (mode) applyLook(mode[1], ct ? ct[1] : null);
+        location.replace(t ? "/chat?session=main#token=" + t[1] : "/");
+      } else { msg.textContent = "The proxy refused this key (HTTP " + r.status + ")."; }
     })
     .catch(function (e) { msg.textContent = "Unlock failed: " + e.message; });
+
+  // This page is on the Control UI's own origin, so it can set the Control
+  // UI's stored settings before the Control UI loads. Only after a good key.
+  // The key and the fields are those of openclaw 0790d9f (ui/src/app/
+  // settings.ts: "openclaw.control.settings.v1:" + the page's ws:// address;
+  // theme, themeMode, customTheme). The Control UI checks a customTheme again
+  // and drops one it does not accept. A theme that the observatory did not
+  // install (another themeId) stays when the bot has no Studio theme.
+  function applyLook(themeMode, themeB64) {
+    try {
+      var key = "openclaw.control.settings.v1:" + (location.protocol === "https:" ? "wss://" : "ws://") + location.host;
+      var cur = {};
+      try { cur = JSON.parse(localStorage.getItem(key) || "{}") || {}; } catch (e) { cur = {}; }
+      if (typeof cur !== "object" || Array.isArray(cur)) cur = {};
+      cur.themeMode = themeMode;
+      var ours = cur.customTheme && typeof cur.customTheme.themeId === "string" && cur.customTheme.themeId.indexOf("${THEME_ID_PREFIX}") === 0;
+      if (themeB64) {
+        var bin = atob(themeB64.replace(/-/g, "+").replace(/_/g, "/"));
+        var bytes = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        var theme = JSON.parse(new TextDecoder().decode(bytes));
+        if (theme && typeof theme === "object" && String(theme.themeId).indexOf("${THEME_ID_PREFIX}") === 0) {
+          cur.customTheme = theme;
+          cur.theme = "custom";
+        }
+      } else if (ours) {
+        delete cur.customTheme;
+        if (cur.theme === "custom") cur.theme = "claw";
+      }
+      localStorage.setItem(key, JSON.stringify(cur));
+    } catch (e) {
+      // the Control UI opens with its own look
+    }
+  }
 })();
 </script>
 </body>

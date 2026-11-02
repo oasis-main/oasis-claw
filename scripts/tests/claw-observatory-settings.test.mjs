@@ -149,10 +149,24 @@ test("validateSettings takes only the profile fields and finite swarm numbers", 
   assert.equal(validateSettings({ profile: { context: "c".repeat(8000) } }).profile.context.length, 8000);
 });
 
+test("validateSettings takes the Appearance mode; settingsStore keeps it", () => {
+  assert.deepEqual(validateSettings({ appearance: { mode: "light" } }), { appearance: { mode: "light" } });
+  for (const bad of [{ appearance: "light" }, { appearance: { mode: "sepia" } }, { appearance: { mode: "dark", extra: 1 } }, { appearance: [] }]) {
+    assert.throws(() => validateSettings(bad), (err) => err.status === 400, JSON.stringify(bad));
+  }
+  const dir = tmp("obs-appearance-");
+  const store = settingsStore(path.join(dir, "settings.json"));
+  store.update({ profile: { name: "Mike" } });
+  assert.equal(store.update({ appearance: { mode: "dark" } }).appearance.mode, "dark");
+  assert.deepEqual(store.read().profile, { name: "Mike" }, "an appearance save keeps the profile");
+  fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ appearance: { mode: "neon" } }));
+  assert.equal(store.read().appearance.mode, "system", "a bad kept mode reads as system");
+});
+
 test("settingsStore merges, keeps mode 600; keepUserMdHistory keeps the newest 30", () => {
   const dir = tmp("obs-settings-");
   const store = settingsStore(path.join(dir, "settings.json"));
-  assert.deepEqual(store.read(), { profile: {}, swarm: {}, updatedAt: null });
+  assert.deepEqual(store.read(), { profile: {}, swarm: {}, appearance: { mode: "system" }, updatedAt: null });
   store.update({ profile: { name: "Mike" } });
   const after = store.update({ swarm: { LINK_K: 2 } });
   assert.deepEqual([after.profile, after.swarm], [{ name: "Mike" }, { LINK_K: 2 }]);

@@ -19,6 +19,7 @@ import path from "node:path";
 import vm from "node:vm";
 import { execFileSync } from "node:child_process";
 import { test } from "node:test";
+import { PALETTE_VARS, themeStore } from "../claw-observatory-studio.mjs";
 import {
   readApprovals,
   BOT_HOME,
@@ -58,6 +59,7 @@ import {
   roleFamily,
   rotateKey,
   runSnapshot,
+  settingsStore,
   sniffImage,
   ensureProxyKey,
   tokenMatches,
@@ -713,6 +715,10 @@ test("excludePattern: env first, then the state-folder file, else nothing", () =
 // ── one-click Control UI (R2, 2026-10-07) ─────────────────────────────────────
 
 const GW = "a1".repeat(32);
+const SAMPLE_PALETTE = {
+  light: Object.fromEntries(PALETTE_VARS.map((v, i) => [v, i % 2 ? "#111111" : "#fafafa"])),
+  dark: Object.fromEntries(PALETTE_VARS.map((v, i) => [v, i % 2 ? "#eeeeee" : "#101010"])),
+};
 
 test("controlUiSignedInUrl puts the key and the gateway token in the fragment only", () => {
   const proxied = { key: "kolmogorov", controlUi: { url: "http://127.0.0.1:18890/", via: "proxy" } };
@@ -799,6 +805,8 @@ test("server: Control UI open returns the signed-in address; approve pairs only 
     mailRoot: tmp("obs-mail-empty-"),
     proxyKey: () => "k".repeat(43),
     identities: identityStore(tmp("obs-ident-")),
+    settings: settingsStore(path.join(tmp("obs-cui-settings-"), "settings.json")),
+    studioThemes: themeStore(tmp("obs-cui-themes-")),
     readIdentity: async () => ({ name: "Kolmogorov", role: null, avatar: null }),
     readGatewayToken: async () => ({ mode: "token", token: GW }),
     readPendingPairing: async () => pending,
@@ -834,7 +842,19 @@ test("server: Control UI open returns the signed-in address; approve pairs only 
     const open = await call("/api/control-ui/kolmogorov/open", { method: "POST" });
     assert.equal(open.status, 200);
     assert.equal(open.headers["cache-control"], "no-store");
-    assert.equal(open.json.url, `http://127.0.0.1:18890/__claw-proxy/unlock#k=${"k".repeat(43)}&token=${GW}`);
+    assert.equal(open.json.url, `http://127.0.0.1:18890/__claw-proxy/unlock#k=${"k".repeat(43)}&token=${GW}&m=system`);
+    // The Appearance mode and the bot's Studio theme ride in the fragment.
+    ctx.settings.update({ appearance: { mode: "light" } });
+    ctx.studioThemes.set("kolmogorov", { label: "Chalk", light: SAMPLE_PALETTE.light, dark: SAMPLE_PALETTE.dark });
+    const styled = new URL((await call("/api/control-ui/kolmogorov/open", { method: "POST" })).json.url);
+    const frag = new URLSearchParams(styled.hash.slice(1));
+    assert.equal(frag.get("m"), "light");
+    const theme = JSON.parse(Buffer.from(frag.get("ct"), "base64url").toString("utf8"));
+    assert.equal(theme.themeId, "fleet-observatory-kolmogorov");
+    assert.equal(theme.label, "Chalk");
+    assert.equal(theme.light.bg, SAMPLE_PALETTE.light.background);
+    assert.ok(styled.hash.length < 20000, `the fragment stays small (${styled.hash.length})`);
+    ctx.studioThemes.remove("kolmogorov");
     assert.equal((await call("/api/control-ui/down/open", { method: "POST" })).status, 409);
     assert.equal((await call("/api/control-ui/nobody/open", { method: "POST" })).status, 404);
     assert.equal((await call("/api/control-ui/kolmogorov/open")).status, 405, "the token is never served on GET");
