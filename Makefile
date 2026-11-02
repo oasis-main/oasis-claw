@@ -291,7 +291,7 @@ OBSERVATORY_SNAPSHOT_PLIST := $(HOME)/Library/LaunchAgents/com.oasis-x.observato
 OBSERVE_FLAGS ?= --open
 OBSERVATORY_APP_DEST ?= $(HOME)/Applications
 
-.PHONY: observatory observatory-app observe observe-open observe-key observatory-rotate-key swarm-open swarm-dashboard control-ui fleet pair observatory-snapshot \
+.PHONY: observatory observatory-app observatory-ai-key observe observe-open observe-key observatory-rotate-key swarm-open swarm-dashboard control-ui fleet pair observatory-snapshot \
         observatory-snapshot-install observatory-snapshot-status observatory-snapshot-uninstall \
         feedback feedback-show feedback-pull feedback-set
 
@@ -305,6 +305,9 @@ observatory: ## boot the whole observatory: the port proxy (when bots/ has its c
 
 observe: ## serve the fleet observatory on 127.0.0.1:18780 (bookmark it) with the swarm dashboard on 18781, and open it (Ctrl-C stops both)
 	OASIS_SWARM_BIN="$(SWARM_BIN)" OASIS_SWARM_ROOT="$(SWARM_ROOT)" node scripts/claw-observatory.mjs serve $(OBSERVE_FLAGS)
+
+observatory-ai-key: ## give the observatory Studio its own oasis-generation key (a state-folder file + gateway entry "observatory"; recreates the gateway when its list changes)
+	@scripts/claw-rotate-secrets observatory-key
 
 observatory-app: ## build "Fleet Observatory.app" and install it in ~/Applications: one click runs `make observatory` in this checkout (CLAW-126; see scripts/observatory-app/README.md)
 	@scripts/observatory-app/build.sh "$(CURDIR)" "$(OBSERVATORY_APP_DEST)"
