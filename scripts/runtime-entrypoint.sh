@@ -1987,7 +1987,7 @@ oasis_gen_url = (
     os.environ.get("OASIS_GENERATION_URL", "").strip() or "http://host.docker.internal:8800/v1"
 )
 if oasis_gen_token:
-    def _gen_model(mid, name, ctx, inputs=None):
+    def _gen_model(mid, name, ctx, inputs=None, budget=None):
         # input modalities: text everywhere; gpt-5.6-sol also takes images (its
         # mantle/Responses backend translates image_url -> input_image). The
         # Converse-backed models stay text-only (that path still drops images).
@@ -2009,8 +2009,12 @@ if oasis_gen_token:
         # gateway accepted max_tokens=32000 on Opus 5/5.5/4.8/4.7, Sonnet 5/4.6,
         # Haiku 4.5, GPT-5.6-sol and GPT-6 Astra (2026-10-07). Thinking is
         # adaptive, so the larger cap costs nothing unless a turn needs it.
+        #
+        # contextTokens: openclaw's runtime budget for the model. When set, it
+        # replaces contextWindow for the compaction and context-nap triggers.
+        # Pass `budget` to give one model its own value.
         max_tokens = 32000 if mid.startswith(("claude-", "gpt-")) else 8192
-        return {
+        entry = {
             "id": mid,
             "name": name,
             "reasoning": True,
@@ -2020,6 +2024,10 @@ if oasis_gen_token:
             "maxTokens": max_tokens,
             "compat": {"supportsUsageInStreaming": True},
         }
+        context_tokens = min(ctx, budget or _COMPACT_BUDGET)
+        if context_tokens < ctx:
+            entry["contextTokens"] = context_tokens
+        return entry
 
     # Display names carry only the backend tag ("(Bedrock)" / "(Local)"); the
     # provider grouping ("oasis-generation") already supplies the rest, and
@@ -2051,6 +2059,14 @@ if oasis_gen_token:
     _CTX_1M = 1_000_000
     _CTX_GPT = 922_000
     _CTX_200K = 200_000
+    # Auto-compact budget (Mike, 2026-11-02: compaction at 225k tokens).
+    # Compaction fires at budget - reserveTokensFloor (5000) - softThreshold
+    # (4000), so 234,000 puts it at 225,000. The context-nap fires first, at
+    # 0.85 x 234,000 = 198,900. A larger window stays as contextWindow; only
+    # the budget shrinks. House stalled on Opus 5.5 at about 245k-264k tokens
+    # when Bedrock returned 503 (2026-10-30). Models at or under 234k keep
+    # their real window as the budget.
+    _COMPACT_BUDGET = 234_000
     gen_models = [
         _gen_model("gemma-4-12b-coder", "Gemma-4 12B Coder (Local)", 32768),
         _gen_model("gemma-4-12b-agentic", "Gemma-4 12B Agentic (Local)", 32768),
