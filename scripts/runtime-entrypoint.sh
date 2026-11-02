@@ -67,6 +67,41 @@ if [[ "$(cat "${GATEWAY_TOKEN_FILE}" 2>/dev/null)" != "${OPENCLAW_GATEWAY_TOKEN}
 fi
 chmod 600 "${GATEWAY_TOKEN_FILE}"
 
+# ---- persona boot check (Mike, 2026-11-02) ------------------------------
+# Van Helsing ran on openclaw's stock templates from 2026-10-14 to 11-02: the
+# sandbox prune wiped the workspace and openclaw wrote stock AGENTS/SOUL/
+# IDENTITY/TOOLS .md into it (scripts/persona-check.mjs has the full story).
+# The gateway now never starts on a missing or stock persona. A refusal HOLDS
+# here instead of exiting: no restart loop, `make -C bots BOT=<bot> seed`
+# (compose cp + restart) works on the running container, and the healthcheck
+# turns unhealthy so the observatory shows the hold. The check runs again
+# every 15 s, so a seed or `persona-check pin` clears it without a restart.
+#   OASIS_PERSONA_CHECK = enforce (default) | warn (log only) | off
+#   OASIS_PERSONA_DRIFT = warn (default: log, record, pin again) | refuse
+# Only exit 3 holds. Any other failure of the checker itself boots normally,
+# so a bug in the check cannot hold the whole fleet.
+PERSONA_CHECK="$(printf '%s' "${OASIS_PERSONA_CHECK:-enforce}" | tr '[:upper:]' '[:lower:]')"
+if [[ "${PERSONA_CHECK}" != "off" ]]; then
+  _pc_tries=0
+  trap 'exit 143' TERM INT
+  while true; do
+    _pc_quiet=()
+    (( _pc_tries > 0 && _pc_tries % 40 != 0 )) && _pc_quiet=(--quiet)
+    _pc_rc=0
+    persona-check check --workspace "${CONFIG_DIR}/workspace" --lock "${CONFIG_DIR}/persona.lock.json" \
+      --mode "${PERSONA_CHECK}" --drift "${OASIS_PERSONA_DRIFT:-warn}" "${_pc_quiet[@]}" || _pc_rc=$?
+    [[ "${_pc_rc}" -eq 3 ]] || break
+    _pc_tries=$((_pc_tries + 1))
+    sleep 15 & wait $!
+  done
+  trap - TERM INT
+  if [[ "${_pc_rc}" -ne 0 ]]; then
+    echo "[entrypoint] persona check: checker failed (exit ${_pc_rc}); boot continues without it"
+  elif (( _pc_tries > 0 )); then
+    echo "[entrypoint] persona check: passed after a hold of about $((_pc_tries * 15)) s; boot continues"
+  fi
+fi
+
 # ---- .swarm/ first-boot seed: REMOVED 2026-08-10 (CLAW-082) -------------
 # This block used to write a "First-boot placeholder" state.md + queue.md into
 # ${CONFIG_DIR}/.swarm, which was also dot-swarm's swarmDir. Nothing ever
@@ -672,6 +707,17 @@ merge_config("operating-system-sandbox", {
 # registered". `compaction.mode` (e.g. "safeguard") is left untouched.
 config.setdefault("agents", {})
 config["agents"].setdefault("defaults", {})
+# Persona boot check, mid-run half (Mike, 2026-11-02). The boot check above
+# catches a stock persona only at the next boot. Mid-run, openclaw's
+# ensureAgentWorkspace writes the stock templates into any workspace that lost
+# its files, on every turn (agent-command, get-reply, cron, sandbox). With
+# skipBootstrap it writes nothing: a lost persona stays missing (openclaw's own
+# WorkspaceVanishedError guard can then fire) instead of turning silently into
+# a generic assistant, and the next boot holds. Every fleet bot is seeded from
+# bots/<bot>/workspace/, so no bot needs openclaw's first-run templates.
+# Hard-set while the check is on; OASIS_PERSONA_CHECK=off leaves the key alone.
+if os.environ.get("OASIS_PERSONA_CHECK", "enforce").strip().lower() != "off":
+    config["agents"]["defaults"]["skipBootstrap"] = True
 config["agents"]["defaults"].setdefault("compaction", {})
 # Only pin the provider when dot-swarm is actually enabled. A bot with no board
 # (OASIS_SWARM_DIR empty) has dot-swarm disabled, and naming an unregistered
