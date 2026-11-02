@@ -99,6 +99,14 @@
 //      A model reply and a bot's words are untrusted: an SVG draft is shown
 //      only as an image and saved only as the PNG the page draws from it.
 //      Token + Origin on every write, as item 5.
+//  13. Access (Mike, 2026-11-02). GET /api/access shows each bot's level,
+//      exec, reviewer, decider and sandbox settings, tools, mounts and drift
+//      (claw-observatory-access.mjs). It only reads and takes no write method.
+//      From `docker inspect` it reads the mounts and ONLY the environment
+//      names in ACCESS_ENV: the rest of a bot's environment holds tokens, and
+//      none of it reaches the page. In the bot it reads a few keys of
+//      openclaw.json and exec-approvals.json, the persona lock dates, and
+//      role.yaml through the image's own python3 + PyYAML (argv only).
 //   6. `serve` also starts the dot_swarm dashboard (`swarm gui`, 18781), where
 //      the human claims, finishes, blocks and comments on items. A bot can
 //      reach that port too, so the observatory starts it only after it proves
@@ -2411,6 +2419,55 @@ async function routeStudio(req, url, ctx) {
   return useAvatar(ctx, bot, written.avatar, studio);
 }
 
+// ── Access (Mike, 2026-11-02) ────────────────────────────────────────────────
+// Who may do what, per bot: read only (trust model item 13). The logic is in
+// claw-observatory-access.mjs.
+
+const ACCESS_MODULE = new URL("./claw-observatory-access.mjs", import.meta.url);
+let accessModule = null;
+const loadAccess = () => (accessModule ??= import(ACCESS_MODULE));
+const ACCESS_PATH_RE = /^\/api\/access$/;
+// The main checkout, also when this file runs from a worktree: bind sources
+// are main-checkout paths.
+const REPO_ROOT = path.resolve(SCRIPT_DIR, "..").replace(/\/\.claude\/worktrees\/[^/]+$/, "");
+
+/** The cached `docker inspect` of one container (discoverFleet fills it). */
+export function cachedInspect(container) {
+  for (const inspect of inspectCache.values()) {
+    if (inspect?.Name === `/${container}`) return inspect;
+  }
+  return null;
+}
+
+async function routeAccess(req, ctx) {
+  if (req.method !== "GET") return [405, { error: "the Access view only reads" }];
+  const access = await loadAccess();
+  const f = await cached(ctx, "fleet", 4000, ctx.discover);
+  const bots = await cached(ctx, "access", 30_000, () =>
+    Promise.all(
+      f.bots.map(async (bot) => {
+        const inspect = ctx.inspectFor(bot.container);
+        const hasRole = (inspect?.Mounts ?? []).some((m) => m.Destination === access.ROLE_MOUNT);
+        const [live, declared] = await Promise.all([
+          bot.running ? ctx.readAccessConfig(bot).catch((err) => ({ error: err.message })) : null,
+          bot.running && hasRole ? ctx.readRoleDeclared(bot).catch((err) => ({ error: err.message })) : null,
+        ]);
+        const policyFile = hostPathFor(inspect?.Mounts, access.POLICY_MOUNT);
+        return access.describeAccess({
+          bot,
+          inspect,
+          live,
+          declared,
+          policy: policyFile ? await ctx.readPolicy(policyFile) : null,
+          home: HOME,
+          repoRoot: REPO_ROOT,
+        });
+      }),
+    ),
+  );
+  return [200, { bots, levels: access.LEVELS }];
+}
+
 // ── observatory HTTP server ──────────────────────────────────────────────────
 
 const SECURITY_HEADERS = {
@@ -3769,6 +3826,11 @@ export function createObservatoryServer(ctx) {
   ctx.genModels ??= async () => (await loadStudio()).genModels({ url: GEN_ADMIN_URL, tokenFile: GEN_KEY_FILE });
   ctx.genChat ??= async (opts) => (await loadStudio()).genChat({ url: GEN_ADMIN_URL, tokenFile: GEN_KEY_FILE, ...opts });
   ctx.genKeyReady ??= () => fs.existsSync(GEN_KEY_FILE);
+  ctx.inspectFor ??= cachedInspect;
+  ctx.readAccessConfig ??= async (bot) => collect(bot.container, (await loadAccess()).collectAccessConfig);
+  ctx.readRoleDeclared ??= async (bot) =>
+    JSON.parse(await docker(["exec", bot.container, "python3", "-c", (await loadAccess()).ROLE_PY, (await loadAccess()).ROLE_MOUNT], { timeoutMs: 30_000 }));
+  ctx.readPolicy ??= async (file) => (await loadAccess()).readPolicyFile(file);
   return http.createServer((req, res) => {
     const refused = checkRequest(req, ctx.port);
     if (refused) {
@@ -3883,6 +3945,13 @@ export function createObservatoryServer(ctx) {
           if (err.status === 413) res.once("finish", () => req.destroy());
           sendJson(res, err.status ?? 502, { error: err.message });
         },
+      );
+      return;
+    }
+    if (ACCESS_PATH_RE.test(url.pathname)) {
+      routeAccess(req, ctx).then(
+        ([status, body]) => sendJson(res, status, body),
+        (err) => sendJson(res, err.status ?? 502, { error: err.message }),
       );
       return;
     }
