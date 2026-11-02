@@ -218,6 +218,35 @@ stuck-lanes-watchdog-uninstall: ## unload the stuck-lanes watchdog
 	@launchctl bootout gui/$$(id -u)/com.oasis-x.claw-stuck-lanes 2>/dev/null || true
 	@echo "stuck-lanes watchdog unloaded"
 
+# ── swarm-groom (launchd) ───────────────────────────────────────────────────
+# End-of-workday .swarm grooming, stage 1 (no LLM). Same deployment shape as
+# fleet-snapshot: the script is copied out of ~/Documents. See the plist header.
+SWARM_GROOM_PLIST := $(HOME)/Library/LaunchAgents/com.oasis-x.swarm-groom.plist
+
+.PHONY: swarm-groom-install swarm-groom-status swarm-groom-uninstall swarm-groom-run
+
+swarm-groom-install: ## (re)deploy + load the 18:30 weekday .swarm grooming job — re-run after editing the script
+	@mkdir -p "$(WATCHDOG_DIR)"
+	@cp scripts/claw-swarm-groom.mjs "$(WATCHDOG_DIR)/claw-swarm-groom.mjs"
+	@cp scripts/com.oasis-x.swarm-groom.plist "$(SWARM_GROOM_PLIST)"
+	@plutil -lint "$(SWARM_GROOM_PLIST)" >/dev/null
+	@launchctl bootout gui/$$(id -u)/com.oasis-x.swarm-groom 2>/dev/null || true
+	@launchctl bootstrap gui/$$(id -u) "$(SWARM_GROOM_PLIST)"
+	@echo "swarm-groom installed — verify with: make swarm-groom-status"
+
+swarm-groom-status: ## show the grooming job's last exit code and log tail
+	@launchctl print gui/$$(id -u)/com.oasis-x.swarm-groom 2>/dev/null \
+	  | grep -E "state =|last exit code" || echo "not loaded"
+	@tail -3 "$(HOME)/Library/Logs/swarm-groom.stdout.log" 2>/dev/null || true
+	@tail -3 "$(HOME)/Library/Logs/swarm-groom.stderr.log" 2>/dev/null || true
+
+swarm-groom-run: ## run the loaded grooming job now (writes today's GROOM file)
+	@launchctl kickstart gui/$$(id -u)/com.oasis-x.swarm-groom
+
+swarm-groom-uninstall: ## unload the grooming job
+	@launchctl bootout gui/$$(id -u)/com.oasis-x.swarm-groom 2>/dev/null || true
+	@echo "swarm-groom unloaded"
+
 # ── semantic-index build + drift (launchd) ──────────────────────────────────
 # UNLIKE nimbus-watchdog/claw-stuck-lanes above, these plists point DIRECTLY at
 # the real repo path — no script is copied to Application Support. That

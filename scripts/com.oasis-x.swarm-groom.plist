@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  swarm-groom: end-of-workday .swarm grooming, stage 1 (Mike, 2026-11-02).
+
+  WHAT IT DOES: scripts/claw-swarm-groom.mjs finds every .swarm board under
+  ~/Documents/Runes, skips each board whose .swarm files, commits (all
+  branches, after a fetch) and GitHub PRs did not change in 7 days, runs
+  mechanical checks on the rest, and writes
+  ~/Documents/Runes/oasis-x/.swarm/fleet/GROOM-<date>.{md,json}. It changes
+  no board. Yes Man's Monday/Wednesday/Friday report includes every GROOM file
+  since the last report.
+
+  SAME SHAPE AS fleet-snapshot: `make swarm-groom-install` copies the script to
+  ~/Library/Application Support/oasis-x/, because launchd cannot exec a script
+  inside ~/Documents. The job reads ~/Documents/Runes through
+  /opt/homebrew/bin/node, the node that fleet-snapshot already uses to read
+  the fleet board there. If a run logs "Operation not permitted", that node
+  has lost its Documents access: check `make swarm-groom-status`.
+
+  --fetch updates remote-tracking refs only. `gh` uses the Mac's active
+  account; a repository that account cannot see is reported, not an error.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.oasis-x.swarm-groom</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/node</string>
+        <string>/Users/Michaellee/Library/Application Support/oasis-x/claw-swarm-groom.mjs</string>
+        <string>--fetch</string>
+    </array>
+
+    <!-- 18:30 local, Monday to Friday: the end of the workday. A Mac asleep at
+         18:30 runs the job once on wake. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>30</integer></dict>
+    </array>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/Michaellee</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/Michaellee/Library/Logs/swarm-groom.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/Michaellee/Library/Logs/swarm-groom.stderr.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
