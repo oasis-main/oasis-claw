@@ -309,7 +309,10 @@ COPY scripts/oasis-video-describe /usr/local/bin/oasis-video-describe
 # baked-in extensions, then execs `openclaw gateway`.
 COPY scripts/runtime-entrypoint.sh /usr/local/bin/runtime-entrypoint.sh
 COPY scripts/compile-role.py /usr/local/bin/compile-role.py
-RUN chmod +x /usr/local/bin/runtime-entrypoint.sh /usr/local/bin/compile-role.py
+# Persona boot check (runtime-entrypoint.sh runs it first; also
+# `docker exec <bot> persona-check status|pin`).
+COPY scripts/persona-check.mjs /usr/local/bin/persona-check
+RUN chmod +x /usr/local/bin/runtime-entrypoint.sh /usr/local/bin/compile-role.py /usr/local/bin/persona-check
 
 # Run as the unprivileged "node" user that's already present in the base image.
 RUN mkdir -p /home/node/.openclaw /home/node/.openclaw/workspace /home/node/.openclaw/logs && \
