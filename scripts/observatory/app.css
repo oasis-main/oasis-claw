@@ -737,3 +737,15 @@ button.chip-button:hover { background: var(--accent-soft); }
 .theme-editor-row input[type="color"] { width: 56px; height: 24px; padding: 0; border: 1px solid var(--line); border-radius: 4px; background: none; }
 .theme-warnings { margin: 0; padding-left: 18px; }
 .theme-warnings:empty { display: none; }
+
+/* Access (2026-11-02) */
+.access-row { cursor: pointer; }
+.access-row:hover td { background: var(--panel-2); }
+.access-row.active td { background: var(--accent-soft); }
+.access-row td .chip + .chip { margin-left: 4px; }
+.access-detail { margin-top: 16px; }
+.access-detail h3 { margin: 0; }
+.access-detail h4 { margin: 8px 0 0; font-size: 13px; }
+.access-drift { margin: 0; padding-left: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.access-drift li { font-size: 13px; overflow-wrap: anywhere; }
+.access-detail .table td.mono { overflow-wrap: anywhere; }
