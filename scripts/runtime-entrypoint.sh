@@ -1298,12 +1298,24 @@ elif "alsoAllow" in tools_cfg:
 # NOT a gate in sandbox mode: tools.exec security/ask and exec-approvals.json.
 # bash-tools.exec.ts skips them for host=sandbox; the sidecar is the boundary
 # and the oasis-reviewer before_tool_call hook still gates every call.
+#
+# Prune OFF (idleHours 0 + maxAgeDays 0). The sidecar mounts this bot's REAL
+# workspace at <workspaceRoot>/<runtimeId>/workspace; openclaw assumes that path
+# is a disposable remote copy. Its prune (default: idle > 24h or age > 7d, run at
+# the start of every agent turn) calls the ssh backend's removeRuntime, which is
+# `rm -rf <workspaceRoot>/<runtimeId>`. rm walks into the shared mount and deletes
+# every persona and memory file; openclaw then writes its stock templates on the
+# next turn. Van Helsing ran on stock templates from 2026-10-14 to 2026-11-02 for
+# this reason. The sidecar is a long-lived compose service, so prune has nothing
+# to reclaim. `openclaw sandbox recreate|remove` calls the same removeRuntime:
+# never run them against a shared-workspace sidecar.
 sbx_socket = os.environ.get("OASIS_SANDBOX_SSH_SOCKET", "").strip()
 sbx_cfg = config["agents"]["defaults"].setdefault("sandbox", {})
-SBX_KEYS = ("mode", "backend", "scope", "workspaceAccess", "ssh")
+SBX_KEYS = ("mode", "backend", "scope", "workspaceAccess", "ssh", "prune")
 if sbx_socket:
     sbx_key_dir = os.environ.get("OASIS_SANDBOX_SSH_KEY_DIR", "").strip() or "/run/oasis-sbx-keys"
     sbx_cfg.update({"mode": "all", "backend": "ssh", "scope": "agent", "workspaceAccess": "rw"})
+    sbx_cfg["prune"] = {"idleHours": 0, "maxAgeDays": 0}
     sbx_cfg["ssh"] = {
         "target": os.environ.get("OASIS_SANDBOX_SSH_TARGET", "").strip() or "node@openclaw-sbx:22",
         "command": "/usr/local/bin/oasis-sbx-ssh",
@@ -1321,7 +1333,7 @@ if sbx_socket:
     tools_cfg.setdefault("elevated", {})["enabled"] = False
     tools_cfg.setdefault("sandbox", {})["tools"] = {
         "allow": ["*"], "deny": ["gateway", "nodes", "canvas", "browser"]}
-    print(f"[entrypoint] exec sandbox: ssh via {sbx_socket} (exec + file tools run in the sidecar)")
+    print(f"[entrypoint] exec sandbox: ssh via {sbx_socket} (exec + file tools run in the sidecar; prune off)")
 elif sbx_cfg.get("backend") == "ssh":
     # Pilot rolled back: drop what this block wrote, keep sessionToolsVisibility.
     for k in SBX_KEYS:
