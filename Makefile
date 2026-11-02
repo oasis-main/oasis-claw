@@ -341,6 +341,30 @@ observatory-ai-key: ## give the observatory Studio its own oasis-generation key 
 observatory-app: ## build "Fleet Observatory.app" and install it in ~/Applications: one click runs `make observatory` in this checkout (CLAW-126; see scripts/observatory-app/README.md)
 	@scripts/observatory-app/build.sh "$(CURDIR)" "$(OBSERVATORY_APP_DEST)"
 
+# ── authority hub (Mike, 2026-11-02; scripts/claw-authority.mjs) ─────────────
+# The Mac's signed authority log: Mike's root key in the Secure Enclave (each
+# signature asks for Touch ID), this Mac's hub key, and the control and
+# restriction streams. The folder is in the observatory state folder, which
+# no bot mounts.
+AUTHORITY_DIR ?= $(HOME)/Library/Application Support/oasis-x/observatory/authority
+
+.PHONY: authority-tool authority-init authority-status authority-verify
+
+authority-tool: ## build oasis-root-key (the Secure Enclave root signer) into the authority folder
+	@mkdir -p "$(AUTHORITY_DIR)/bin" && chmod 700 "$(AUTHORITY_DIR)"
+	@swiftc -O -swift-version 5 -target "$$(uname -m)-apple-macos13.0" -o "$(AUTHORITY_DIR)/bin/oasis-root-key" scripts/authority/oasis-root-key.swift
+	@codesign --force --sign - --identifier com.oasis-x.root-key "$(AUTHORITY_DIR)/bin/oasis-root-key"
+	@echo "built $(AUTHORITY_DIR)/bin/oasis-root-key"
+
+authority-init: authority-tool ## make the root key (Secure Enclave) and the hub key, and sign the genesis (one Touch ID)
+	@OASIS_AUTHORITY_DIR="$(AUTHORITY_DIR)" node scripts/claw-authority.mjs init
+
+authority-status: ## the authority keys, streams and the restrictions in force
+	@OASIS_AUTHORITY_DIR="$(AUTHORITY_DIR)" node scripts/claw-authority.mjs status
+
+authority-verify: ## check every authority stream (signatures, chain, rules); exit 1 on a fault
+	@OASIS_AUTHORITY_DIR="$(AUTHORITY_DIR)" node scripts/claw-authority.mjs verify
+
 observe-open: ## open the running observatory and unlock this browser (after that, the bookmark http://127.0.0.1:18780/ works)
 	@node scripts/claw-observatory.mjs open observatory
 
