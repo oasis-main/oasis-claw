@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fleet-report-inputs: the host half of the Monday/Wednesday/Friday fleet
+  report (Mike, 2026-11-02).
+
+  07:00 this job writes ~/Documents/Runes/oasis-x/.swarm/fleet/
+  REPORT-INPUTS-<date>.md (commits, PRs, STATUS.md files, briefs, mail
+  subjects, directives, restarts, grooming runs). 07:30 Yes Man's "Fleet
+  report" job (scripts/claw-morning) writes REPORT-<date>.md from it. From
+  08:00 the autoreviewer sends the report to Mike (autoreviewer/src/report.mjs).
+
+  The script runs from the repository, not from a copy, because it imports
+  redact() from claw-fleet-snapshot.mjs. /opt/homebrew/bin/node already reads
+  ~/Documents for fleet-snapshot, so node can read the script there. A Mac
+  asleep at 07:00 runs the job once on wake.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.oasis-x.fleet-report-inputs</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/node</string>
+        <string>/Users/Michaellee/Documents/Runes/oasis-x/oasis-claw/scripts/claw-fleet-report-inputs.mjs</string>
+    </array>
+
+    <!-- 07:00 local on Monday, Wednesday and Friday. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>0</integer></dict>
+    </array>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/Michaellee</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/Michaellee/Library/Logs/fleet-report-inputs.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/Michaellee/Library/Logs/fleet-report-inputs.stderr.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

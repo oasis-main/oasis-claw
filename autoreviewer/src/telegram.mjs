@@ -14,10 +14,14 @@ import { connect as tlsConnect } from "node:tls";
  * POST a JSON body over HTTPS, optionally through an HTTP CONNECT proxy.
  * Resolves { status, body } and never logs the URL.
  */
-export function postJson(urlString, payload, { proxy, timeoutMs = 30_000 } = {}) {
+export function postJson(urlString, payload, opts = {}) {
+  return postBody(urlString, JSON.stringify(payload ?? {}), "application/json", opts);
+}
+
+/** POST a raw body (a string or a Buffer) with its content type; same transport as postJson. */
+export function postBody(urlString, body, contentType, { proxy, timeoutMs = 30_000 } = {}) {
   const url = new URL(urlString);
-  const body = JSON.stringify(payload ?? {});
-  const headers = { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) };
+  const headers = { "Content-Type": contentType, "Content-Length": Buffer.byteLength(body) };
   const port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
 
   const send = (createConnection) =>
@@ -91,8 +95,11 @@ export class TelegramClient {
     this.proxy = proxy || undefined;
   }
 
-  async call(method, params = {}, { timeoutMs = 30_000 } = {}) {
-    const r = await postJson(`${this.apiBase}/bot${this.token}/${method}`, params, { proxy: this.proxy, timeoutMs });
+  async call(method, params = {}, { timeoutMs = 30_000, multipart = null } = {}) {
+    const url = `${this.apiBase}/bot${this.token}/${method}`;
+    const r = multipart
+      ? await postBody(url, multipart.body, multipart.contentType, { proxy: this.proxy, timeoutMs })
+      : await postJson(url, params, { proxy: this.proxy, timeoutMs });
     let o;
     try {
       o = JSON.parse(r.body);
@@ -109,6 +116,11 @@ export class TelegramClient {
       { offset, timeout: timeoutS, allowed_updates: ["message", "callback_query"] },
       { timeoutMs: (timeoutS + 15) * 1000 },
     );
+  }
+
+  /** Upload a text file as a document (multipart/form-data). Plain caption, no parse_mode. */
+  sendDocument(chatId, filename, content, caption = "") {
+    return this.call("sendDocument", {}, { timeoutMs: 60_000, multipart: multipartBody({ chat_id: String(chatId), caption }, { name: "document", filename, type: "text/markdown", content }) });
   }
 
   // Plain text only: no parse_mode, so bot-written text cannot format the card.
@@ -138,4 +150,19 @@ export class TelegramClient {
   setMyCommands(commands) {
     return this.call("setMyCommands", { commands });
   }
+}
+
+/** multipart/form-data body with text fields and one file part. */
+export function multipartBody(fields, file) {
+  const boundary = `----autoreviewer${Math.random().toString(16).slice(2)}`;
+  const safe = (v) => String(v).replace(/["\r\n]/g, "_");
+  const parts = [];
+  for (const [k, v] of Object.entries(fields)) {
+    if (v === undefined || v === null || v === "") continue;
+    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${safe(k)}"\r\n\r\n${v}\r\n`));
+  }
+  parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${safe(file.name)}"; filename="${safe(file.filename)}"\r\nContent-Type: ${file.type}\r\n\r\n`));
+  parts.push(Buffer.isBuffer(file.content) ? file.content : Buffer.from(String(file.content)));
+  parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+  return { body: Buffer.concat(parts), contentType: `multipart/form-data; boundary=${boundary}` };
 }

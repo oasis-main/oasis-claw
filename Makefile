@@ -247,6 +247,33 @@ swarm-groom-uninstall: ## unload the grooming job
 	@launchctl bootout gui/$$(id -u)/com.oasis-x.swarm-groom 2>/dev/null || true
 	@echo "swarm-groom unloaded"
 
+# ── fleet-report-inputs (launchd) ───────────────────────────────────────────
+# Monday/Wednesday/Friday 07:00: the inputs for Yes Man's 07:30 fleet report.
+# Runs from the repository (it imports claw-fleet-snapshot.mjs); see the plist.
+REPORT_INPUTS_PLIST := $(HOME)/Library/LaunchAgents/com.oasis-x.fleet-report-inputs.plist
+
+.PHONY: report-inputs-install report-inputs-status report-inputs-run report-inputs-uninstall
+
+report-inputs-install: ## load the Mon/Wed/Fri 07:00 fleet report inputs job
+	@cp scripts/com.oasis-x.fleet-report-inputs.plist "$(REPORT_INPUTS_PLIST)"
+	@plutil -lint "$(REPORT_INPUTS_PLIST)" >/dev/null
+	@launchctl bootout gui/$$(id -u)/com.oasis-x.fleet-report-inputs 2>/dev/null || true
+	@launchctl bootstrap gui/$$(id -u) "$(REPORT_INPUTS_PLIST)"
+	@echo "fleet-report-inputs installed — verify with: make report-inputs-status"
+
+report-inputs-status: ## show the inputs job's last exit code and log tail
+	@launchctl print gui/$$(id -u)/com.oasis-x.fleet-report-inputs 2>/dev/null \
+	  | grep -E "state =|last exit code" || echo "not loaded"
+	@tail -3 "$(HOME)/Library/Logs/fleet-report-inputs.stdout.log" 2>/dev/null || true
+	@tail -3 "$(HOME)/Library/Logs/fleet-report-inputs.stderr.log" 2>/dev/null || true
+
+report-inputs-run: ## run the loaded inputs job now (writes today's REPORT-INPUTS file)
+	@launchctl kickstart gui/$$(id -u)/com.oasis-x.fleet-report-inputs
+
+report-inputs-uninstall: ## unload the inputs job
+	@launchctl bootout gui/$$(id -u)/com.oasis-x.fleet-report-inputs 2>/dev/null || true
+	@echo "fleet-report-inputs unloaded"
+
 # ── semantic-index build + drift (launchd) ──────────────────────────────────
 # UNLIKE nimbus-watchdog/claw-stuck-lanes above, these plists point DIRECTLY at
 # the real repo path — no script is copied to Application Support. That

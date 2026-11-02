@@ -82,6 +82,8 @@ export class AutoreviewerBot {
     this.commands = new CommandRegistry();
     // Buttons owned by optional features (e.g. the digest's "Watch" button).
     this.callbackHandlers = new Map();
+    // A reply to one of this bot's messages (the fleet report): (msg) => reply text, or null to fall through.
+    this.replyHandler = null;
     this.registerBuiltins();
   }
 
@@ -308,6 +310,13 @@ export class AutoreviewerBot {
     if (!this.isMike(msg.from?.id, msg.chat?.id)) {
       this.log({ event: "dropped_message", from: msg.from?.id ?? null, chat: msg.chat?.id ?? null });
       return;
+    }
+    if (msg.reply_to_message && this.replyHandler) {
+      const answer = await this.replyHandler(msg);
+      if (answer) {
+        await this.telegram.sendMessage(this.chatId, answer);
+        return;
+      }
     }
     const m = /^\/([a-z][a-z0-9_]*)(?:@\S+)?(?:\s+([\s\S]*))?$/i.exec(String(msg.text ?? "").trim());
     if (!m) {

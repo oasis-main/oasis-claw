@@ -20,6 +20,7 @@
 //   AUTOREVIEWER_STATE_DIR            writable state (watches.json); default /var/lib/autoreviewer
 //   AUTOREVIEWER_SNAPSHOT             fleet snapshot (scripts/claw-fleet-snapshot.mjs), read-only
 //   AUTOREVIEWER_DIGEST               "off" stops the weekday 08:00 digest; /brief still sends it (default on)
+//   AUTOREVIEWER_FLEET_BOARD          the fleet folder, read-only: Yes Man's REPORT-<date>.md (unset = no report delivery)
 //   HTTPS_PROXY                       the fleet egress proxy, the only route to api.telegram.org
 
 import { readFileSync } from "node:fs";
@@ -33,6 +34,7 @@ import { Mailer } from "./mailer.mjs";
 import { DigestScheduler, registerDigestCommands } from "./digest.mjs";
 import { loadSnapshot, registerMonitorCommands } from "./monitor.mjs";
 import { registerWatchCommands, Watcher } from "./watch.mjs";
+import { registerReport, ReportScheduler } from "./report.mjs";
 import { GrantLedger } from "./ledger.mjs";
 import { TelegramClient } from "./telegram.mjs";
 
@@ -116,6 +118,22 @@ setInterval(() => {
   if (digestOn) digest.tick().catch((err) => log({ event: "digest_failed", error: String(err.message ?? err) }));
   watcher.tick().catch((err) => log({ event: "watch_tick_failed", error: String(err.message ?? err) }));
 }, 60_000).unref();
+
+// Mike, 2026-11-02: Yes Man's Monday/Wednesday/Friday fleet report, from 08:00
+// New York; a reply to it goes to the coordinator by mail (unset = off).
+if (env.AUTOREVIEWER_FLEET_BOARD) {
+  const report = new ReportScheduler({
+    boardDir: env.AUTOREVIEWER_FLEET_BOARD,
+    stateFile: `${env.AUTOREVIEWER_STATE_DIR || "/var/lib/autoreviewer"}/report.json`,
+    telegram,
+    chatId,
+    log,
+  });
+  registerReport(bot, report, { mailer, coordinator: coordinators[0] ?? null });
+  setInterval(() => {
+    report.tick().catch((err) => log({ event: "report_failed", error: String(err.message ?? err) }));
+  }, 60_000).unref();
+}
 
 // CLAW-127: Claude Code proposes directives through a host-only folder (unset = off).
 if (env.AUTOREVIEWER_CONSOLE_DIR) {
