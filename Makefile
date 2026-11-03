@@ -407,7 +407,7 @@ authority-install: ## (re)deploy + load the authority sync daemon (launchd) — 
 	@cp scripts/com.oasis-x.authority.plist "$(AUTHORITY_PLIST)"
 	@plutil -lint "$(AUTHORITY_PLIST)" >/dev/null
 	@launchctl bootout gui/$$(id -u)/com.oasis-x.authority 2>/dev/null || true
-	@launchctl bootstrap gui/$(id -u) "$(AUTHORITY_PLIST)"
+	@launchctl bootstrap gui/$$(id -u) "$(AUTHORITY_PLIST)"
 	@echo "authority daemon installed — verify with: make authority-daemon-status"
 
 authority-daemon-status: ## the daemon's state and log tail

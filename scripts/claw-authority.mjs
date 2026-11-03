@@ -190,7 +190,11 @@ function runTool(tool, args, input, timeoutMs = 180_000) {
     const child = spawn(tool, args, { stdio: ["pipe", "pipe", "pipe"] });
     let out = "";
     let err = "";
-    const timer = setTimeout(() => child.kill("SIGTERM"), timeoutMs);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+    }, timeoutMs);
     child.stdout.on("data", (c) => (out += c));
     child.stderr.on("data", (c) => (err += c));
     child.on("error", (e) => {
@@ -200,6 +204,8 @@ function runTool(tool, args, input, timeoutMs = 180_000) {
     child.on("close", (code) => {
       clearTimeout(timer);
       if (code === 0) resolve(out);
+      // The root tool waits on Touch ID, so a timeout there means nobody touched the sensor.
+      else if (timedOut) reject(new Error(`${path.basename(tool)} stopped after ${timeoutMs / 1000} s with no answer (no Touch ID?)`));
       else reject(new Error(err.trim() || `${path.basename(tool)} exited ${code}`));
     });
     child.stdin.end(input ?? "");
