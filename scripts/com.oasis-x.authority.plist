@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  authority: the authority hub's sync daemon (Mike, 2026-11-02; step 3 part 2
+  of the identity plan, scripts/claw-authority.mjs).
+
+  WHAT IT DOES: `claw-authority daemon` runs one sync pass at start, after
+  each change in the peer-grant ledger folder (1 s debounce), and every 60 s:
+    1. mirrors peer-grants.json into the hub-signed ledger stream and marks
+       a change that breaks the ledger rules as an anomaly;
+    2. reads each bot's reviewer audit (docker exec) and applies the count
+       rule (5 enforced denials in 10 minutes: fail-closed for 24 h);
+    3. writes ~/Library/Application Support/oasis-x/authority-view/<bot>/
+       authority.json, which each bot mounts read-only at /reach/authority.
+  It signs with the hub key only. It never asks for Touch ID and never
+  loosens anything: a lift needs Mike's root key (`claw-authority lift`,
+  Touch ID).
+
+  MODES (EnvironmentVariables below):
+    OASIS_AUTHORITY_AUTO    shadow | enforce. Automatic (count-rule)
+                            restrictions are audit-only until "enforce".
+                            Mike's own restrictions always enforce.
+    OASIS_AUTHORITY_GRANTS  observe | require. "require" makes the reviewer
+                            use only grants whose signed mirror is legal and
+                            current.
+
+  SAME SHAPE AS observatory-snapshot: `make authority-install` copies the
+  script, and claw-observatory.mjs for the fleet discovery, to ~/Library/
+  Application Support/oasis-x/authority/, because launchd cannot exec a
+  script inside ~/Documents. Needs `docker` and /opt/homebrew/bin/node.
+
+  NOTE: Yes Man mounts ~/Library/LaunchAgents read-write (CLAW-051), so Yes
+  Man can change this plist (for example the two modes) as it can change
+  every other plist there. That exposure is not new; CLAW-051 tracks it.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.oasis-x.authority</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/node</string>
+        <string>/Users/Michaellee/Library/Application Support/oasis-x/authority/claw-authority.mjs</string>
+        <string>daemon</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart after a crash, but not in a tight loop. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/Michaellee</string>
+        <key>OASIS_AUTHORITY_AUTO</key>
+        <string>shadow</string>
+        <key>OASIS_AUTHORITY_GRANTS</key>
+        <string>observe</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/Michaellee/Library/Logs/authority.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/Michaellee/Library/Logs/authority.stderr.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
