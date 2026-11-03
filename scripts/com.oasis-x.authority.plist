@@ -5,7 +5,9 @@
   of the identity plan, scripts/claw-authority.mjs).
 
   WHAT IT DOES: `claw-authority daemon` runs one sync pass at start, after
-  each change in the peer-grant ledger folder (1 s debounce), and every 60 s:
+  each change in the peer-grant ledger folder (1 s debounce), after each
+  restriction or control event (0.5 s debounce: Mike's freeze or lift from
+  the CLI or the observatory reaches the bots at once), and every 60 s:
     1. mirrors peer-grants.json into the hub-signed ledger stream and marks
        a change that breaks the ledger rules as an anomaly;
     2. reads each bot's reviewer audit (docker exec) and applies the count

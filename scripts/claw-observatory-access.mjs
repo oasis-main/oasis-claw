@@ -215,6 +215,7 @@ const MOUNT_KINDS = [
   [/^\/run\/oasis-gh(\/|$)/, "GitHub token"],
   [/^\/reach\/approvals(\/|$)/, "approvals"],
   [/^\/reach\/fleet(\/|$)/, "fleet board"],
+  [/^\/reach\/authority(\/|$)/, "authority view"],
 ];
 
 const hostOf = (mount) => String(mount?.Source ?? "").replace(/^\/host_mnt(?=\/)/, "");
@@ -230,7 +231,8 @@ export function classifyMount(mount, { home, repoRoot } = {}) {
   const kind = MOUNT_KINDS.find(([re]) => re.test(at))?.[1] ?? (type === "volume" ? "volume" : "project");
   const flags = [];
   // The fleet's own plumbing (home, mail, policy, role.yaml, GitHub token,
-  // approvals, fleet board) lives in these places by design: no flag.
+  // approvals, fleet board, authority view) lives in these places by design:
+  // no flag.
   if (type === "bind" && kind === "project") {
     // The repo's .swarm/ is a work board that bots share, not the control plane.
     if (repoRoot && under(host, repoRoot) && !under(host, path.join(repoRoot, ".swarm"))) flags.push("oasis-claw control plane");

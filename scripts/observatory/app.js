@@ -533,6 +533,7 @@ const VIEWS = [
   { id: "agents", label: "Agents", sub: "System 3" },
   { id: "approvals", label: "Approvals & work", sub: "Brief · directives · open work · grants" },
   { id: "access", label: "Access", sub: "Levels · reviewer · mounts · drift" },
+  { id: "authority", label: "Authority", sub: "Cards · freeze · signed history" },
   { id: "cron", label: "Cron", sub: "Schedules · per-job models" },
   { id: "studio", label: "Studio", sub: "Pictures · profiles · Control UI themes" },
   { id: "settings", label: "Settings", sub: "You · background" },
@@ -732,6 +733,7 @@ function renderView() {
   else if (app.view === "cron") renderCron();
   else if (app.view === "studio") renderStudio();
   else if (app.view === "access") renderAccess();
+  else if (app.view === "authority") renderAuthority();
   else renderAgents();
 }
 
@@ -3870,6 +3872,336 @@ function renderAccess() {
   if (app.access.data) draw();
   load();
   every(30_000, load);
+}
+
+// ── Authority: the signed authority log (Mike, 2026-11-03) ───────────────────
+// Step 4 of the identity plan: the authority hub of this Mac
+// (scripts/claw-authority.mjs). Freeze, restrict, lift and keep each send ONE
+// event for Mike's root key to sign. Touch ID on the Mac shows what it signs,
+// and nothing is signed without it. The hub's cards and the approval cards of
+// the autoreviewer's Telegram chat are one queue here.
+
+const AUTHORITY_STREAM_KEY = "claw-observatory-authority-stream";
+const LEVEL_TONE = { "fail-closed": "warn", "read-only": "warn", "chat-only": "bad", stopped: "bad" };
+const HEALTH_TONE = { ok: "ok", warn: "warn", bad: "bad", unknown: "" };
+const VIEW_TONE = { current: "ok", sending: "info", stale: "warn", behind: "warn", missing: "bad", bad: "bad" };
+const CARD_TONE = { bad: "bad", warn: "warn", info: "info" };
+const AUTHORITY_HOURS = [["", "until you lift it"], ["1", "1 h"], ["4", "4 h"], ["24", "24 h"], ["72", "3 d"], ["168", "7 d"]];
+
+app.authority = { data: null, approvals: null, signing: false, stream: recallEarly(AUTHORITY_STREAM_KEY) || "all", form: null };
+
+/** One root-signed event. Returns the server's answer, or null when nothing was signed. */
+async function authorityAction(op, body, question, button) {
+  if (!window.confirm(`${question}\n\nTouch ID on the Mac signs this with your root key. Nothing is signed without it.`)) return null;
+  const text = button?.textContent;
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Touch ID on the Mac…";
+  }
+  app.authority.signing = true;
+  try {
+    return await api(`/api/authority/${op}`, { method: "POST", type: "application/json", body: JSON.stringify(body) });
+  } catch (err) {
+    window.alert(`Not signed: ${err.message}`);
+    return null;
+  } finally {
+    app.authority.signing = false;
+    if (button) {
+      button.disabled = false;
+      button.textContent = text;
+    }
+  }
+}
+
+function authorityButton(text, op, body, question, redraw, tone = "") {
+  return h("button", {
+    type: "button",
+    class: `button small${tone ? ` ${tone}` : ""}`,
+    text,
+    onclick: async (e) => {
+      if (await authorityAction(op, body, question, e.currentTarget)) redraw();
+    },
+  });
+}
+
+const freezeButton = (target, text, redraw) =>
+  authorityButton(
+    text,
+    "restrict",
+    { target, level: "chat-only", reason: "frozen by Mike from the observatory" },
+    `Freeze ${target}?\n\nThe bot can still chat with you, but no tool call runs until you lift the freeze.`,
+    redraw,
+    "danger",
+  );
+
+const levelChip = (level) => chip(level ?? "normal", level ? LEVEL_TONE[level] ?? "warn" : "ok");
+const signerText = (r) => (r.byRoot ? "Mike (root)" : `hub ${r.issuer}`);
+
+function authorityHub(d, redraw) {
+  const s = d.streams;
+  const newestView = d.instances.map((i) => toMs(i.view.at)).filter(Boolean).sort((a, b) => b - a)[0] ?? null;
+  return h(
+    "div",
+    { class: "stack" },
+    h(
+      "dl",
+      { class: "facts" },
+      fact("Log", d.ok ? `verifies: ${s.control.events} control, ${s.restrictions.events} restriction and ${s.ledger.events} ledger events` : `DOES NOT VERIFY: ${d.errors.join("; ")}`),
+      fact("Pinned root", d.pin ?? "none: run make authority-init"),
+      fact("Roots", d.roots.map((r) => `${r.key} (${r.label}) since ${when(r.addedAt)}`).join("; ") || "—"),
+      fact("Hubs", d.hubs.map((x) => `${x.key} for ${x.agents.join(", ")} until ${when(x.expiresAt)}${x.revoked ? " (REVOKED)" : x.valid ? "" : " (EXPIRED)"}`).join("; ") || "—"),
+      fact("Automatic restrictions", d.modes.auto === "enforce" ? "enforce" : "shadow: the reviewer only records them (OASIS_AUTHORITY_AUTO)"),
+      fact("Grants", d.modes.grants === "require" ? "require: the reviewer uses only grants with a legal, current mirror" : "observe: the reviewer records the mirror state only (OASIS_AUTHORITY_GRANTS)"),
+      fact("Bot views", newestView ? `the daemon wrote the newest ${ago(newestView)}` : "no view yet: is the authority daemon running? (make authority-daemon-status)"),
+    ),
+    h("div", { class: "pill-bar" }, freezeButton("fleet", "Freeze the fleet (Touch ID)", redraw)),
+  );
+}
+
+function authorityQueue(d, approvals, redraw) {
+  const rows = d.cards.map((c) => {
+    const actions = [];
+    if (c.kind === "expiring") {
+      actions.push(
+        authorityButton("Keep", "keep", { id: c.id }, `Keep ${c.target} until you lift it?\n\n${c.text}`, redraw),
+        authorityButton("Lift now", "lift", { ids: [c.id] }, `Lift ${c.target} now?`, redraw, "danger"),
+      );
+    }
+    return h(
+      "tr",
+      null,
+      h("td", null, chip(c.kind, CARD_TONE[c.tone] ?? "")),
+      h("td", { class: "item-title" }, h("div", { text: c.title }), h("div", { class: "muted small", text: c.text }), c.kind === "expiring" ? h("div", { class: "muted small", text: "Do nothing to let it expire." }) : null),
+      h("td", null, actions.length ? h("div", { class: "pill-bar" }, actions) : null),
+    );
+  });
+  if (approvals?.error) {
+    rows.push(h("tr", null, h("td", null, chip("approvals", "bad")), h("td", { class: "item-title", text: `The approval cards do not read: ${approvals.error}` }), h("td")));
+  } else if (approvals) {
+    for (const x of (approvals.directives ?? []).filter((x) => x.status === "proposed")) {
+      rows.push(h("tr", null, h("td", null, chip("directive", "info")), h("td", { class: "item-title" }, h("div", { text: `${x.id} for ${botName(x.bot)}: ${x.goal}` }), h("div", { class: "muted small", text: `may: ${x.may}; lapses ${until(x.proposal_expires)}` })), h("td", null, directiveDecide(x, redraw))));
+    }
+    for (const g of approvals.grants.filter((g) => g.status === "proposed")) {
+      rows.push(h("tr", null, h("td", null, chip("peer grant", "info")), h("td", { class: "item-title" }, h("div", { text: `${g.id}: ${botName(g.requester)} → ${g.grantees.map(botName).join(", ")}` }), h("div", { class: "muted small", text: `${g.topic} · ${grantLimits(g)}; lapses ${until(g.proposal_expires)}` })), h("td", null, grantDecide(g, redraw))));
+    }
+    for (const r of approvals.github.filter((r) => r.status === "proposed")) {
+      rows.push(h("tr", null, h("td", null, chip("GitHub access", "info")), h("td", { class: "item-title" }, h("div", { text: `${r.id}: ${r.access} on ${r.account} for ${botName(r.bot)}` }), h("div", { class: "muted small", text: `${r.repos.join(", ")}; asked ${ago(r.proposed_at)}` })), h("td", null, ghDecide(r, redraw))));
+    }
+  }
+  return rows.length ? apTable(["Kind", "Card", "Decide"], rows) : empty("No card is waiting. The hub is quiet and no approval waits.");
+}
+
+const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+
+function authorityRow(i, byId, redraw) {
+  const bot = botByKey(i.key);
+  const h24 = i.reviewer.health;
+  const items = i.restrictions.map((id) => byId.get(id)).filter(Boolean);
+  const mount = i.view.mount.state;
+  const grants = [i.grants.grants.length ? plural(i.grants.grants.length, "grant") : null, i.grants.directives.length ? plural(i.grants.directives.length, "directive") : null].filter(Boolean);
+  return h(
+    "tr",
+    null,
+    h("td", null, h("div", { class: "item-title", text: bot ? botLabel(bot) : i.key }), h("div", { class: "muted small mono", text: i.container }), i.running ? null : h("div", { class: "muted small", text: i.state ?? "not running" })),
+    h("td", null, levelChip(i.level.enforced), i.level.shadow ? h("div", null, chip(`shadow: ${i.level.shadow}`, "info")) : null),
+    h("td", { class: "small", title: `Layer 1 ${i.reviewer.mode} → Layer 2 ${i.reviewer.l2} → decider ${i.reviewer.decider}`, text: `${i.reviewer.mode} / ${i.reviewer.l2} / ${i.reviewer.decider}` }),
+    h(
+      "td",
+      { title: i.reviewer.notes.join("; ") || "no judge failure and no view fault in 24 h" },
+      chip(i.reviewer.status, HEALTH_TONE[i.reviewer.status] ?? ""),
+      h24 && !h24.error ? h("div", { class: "muted small", text: `${plural(h24.calls, "call")}${h24.l2.failed ? `, ${h24.l2.failed} judge fail` : ""}` }) : null,
+    ),
+    h(
+      "td",
+      { class: "small", title: i.homeHubs.map((x) => `${x.key} until ${x.expiresAt}`).join("; ") },
+      i.homeHubs.length ? i.homeHubs.map((x) => h("div", { text: x.signsViews ? "this Mac" : x.key })) : chip("no hub", "bad"),
+    ),
+    h("td", { class: "small" }, h("div", { text: grants.join(", ") || "none" }), i.grants.notLegal.length ? chip(`${i.grants.notLegal.length} not legal`, "bad") : null),
+    h("td", { class: "small" }, items.length ? items.map((r) => h("div", { title: `${r.target}: ${r.reason}` }, levelChip(r.level), r.mode === "shadow" ? " shadow" : "")) : h("span", { class: "muted", text: "none" })),
+    h("td", { title: i.view.text }, chip(i.view.state, VIEW_TONE[i.view.state] ?? ""), mount !== "ro" ? h("div", null, chip(`mount ${mount}`, "bad")) : null),
+    h(
+      "td",
+      null,
+      h(
+        "div",
+        { class: "pill-bar" },
+        i.running ? freezeButton(`instance:${i.key}@${i.container}`, "Instance", redraw) : null,
+        freezeButton(`agent:${i.key}`, "Agent", redraw),
+      ),
+    ),
+  );
+}
+
+function authorityRestrictions(d, redraw) {
+  const rows = d.restrictions.active.map((r) =>
+    h(
+      "tr",
+      null,
+      h("td", { class: "mono small", text: r.target }),
+      h("td", null, levelChip(r.level)),
+      h("td", null, chip(r.mode, r.mode === "enforce" ? "bad" : "info")),
+      h("td", { class: "small", text: r.trigger }),
+      h("td", { class: "small", text: signerText(r) }),
+      h("td", { class: "small", text: ago(r.at) }),
+      h("td", { class: "small", text: r.expiresAt ? until(r.expiresAt) : "until lifted" }),
+      h("td", { class: "item-title small" }, h("div", { text: r.reason }), r.keptBy ? h("div", { class: "muted", text: `kept by ${r.keptBy.slice(0, 12)}` }) : null, h("div", { class: "muted mono", text: r.id.slice(0, 12) })),
+      h("td", null, authorityButton("Lift", "lift", { ids: [r.id] }, `Lift ${r.target} ${r.level} (${r.id.slice(0, 12)})?\n\n${r.reason}`, redraw, "danger")),
+    ),
+  );
+  const held = d.restrictions.held.map((x) =>
+    h("tr", null, h("td", { class: "mono small", text: x.target }), h("td", { class: "small", text: `hub ${x.issuer}` }), h("td", { class: "small", text: when(x.at) }), h("td", { class: "small item-title", text: x.reason })),
+  );
+  return [
+    rows.length ? apTable(["Target", "Level", "Mode", "Trigger", "Signed by", "Since", "Until", "Reason", ""], rows) : empty("No restriction is in force. Every bot runs at its base policy."),
+    held.length ? h("div", null, h("h4", { text: `Held by the rate budget (${held.length}): not in force` }), apTable(["Target", "Issuer", "At", "Why held"], held)) : null,
+  ];
+}
+
+/** Built once, so the 15 s redraw never clears what Mike typed. */
+function authorityForm(d, redraw) {
+  const field = (tag, props, kids) => h(tag, { class: "field", ...props }, kids);
+  const targets = [
+    ["fleet", "the fleet (every bot)"],
+    ...d.instances.flatMap((i) => [
+      [`agent:${i.key}`, `${i.key} (every instance)`],
+      ...(i.container ? [[`instance:${i.key}@${i.container}`, `${i.key} @ ${i.container}`]] : []),
+    ]),
+  ];
+  const target = field("select", { "aria-label": "Target" }, targets.map(([v, t]) => h("option", { value: v, text: t })));
+  const level = field("select", { "aria-label": "Level" }, d.levels.map((l) => h("option", { value: l, text: l })));
+  const hours = field("select", { "aria-label": "Length" }, AUTHORITY_HOURS.map(([v, t]) => h("option", { value: v, text: t })));
+  const reason = field("input", { type: "text", maxlength: "500", placeholder: "Why (required; it is in the signed event)" });
+  const note = h("span", { class: "muted small", role: "status" });
+  const row = (label, input) => h("div", { class: "field-row" }, h("label", { class: "field-label", text: label }), h("div", { class: "field-input" }, input));
+  const submit = h("button", {
+    type: "button",
+    class: "button",
+    text: "Sign with Touch ID",
+    onclick: async () => {
+      if (!reason.value.trim()) {
+        note.textContent = "Write a reason first.";
+        return;
+      }
+      const body = { target: target.value, level: level.value, reason: reason.value.trim(), hours: hours.value ? Number(hours.value) : null };
+      note.textContent = "";
+      const r = await authorityAction("restrict", body, `Restrict ${body.target} to ${body.level}, ${hours.value ? `for ${hours.selectedOptions[0].text}` : "until you lift it"}?\n\nReason: ${body.reason}`, submit);
+      if (r) {
+        note.textContent = `Signed: ${r.summary}`;
+        reason.value = "";
+        redraw();
+      }
+    },
+  });
+  return h(
+    "details",
+    { class: "card form-card" },
+    h("summary", { text: "Restrict a bot or the fleet" }),
+    h(
+      "div",
+      { class: "profile-form" },
+      row("Target", target),
+      row("Level", level),
+      row("Length", hours),
+      row("Reason", reason),
+      h("div", { class: "toolbar tight-row" }, submit, note),
+      h("p", { class: "muted small", text: "Levels, mildest first: fail-closed (every card and every downgrade is a deny), read-only, chat-only (the bot can still chat), stopped. Only your root key lifts a restriction." }),
+    ),
+  );
+}
+
+function authorityHistoryTable(d, redrawHistory) {
+  const pick = app.authority.stream;
+  const rows = d.history.filter((e) => pick === "all" || e.stream === pick);
+  const bar = h(
+    "div",
+    { class: "pill-bar" },
+    [["all", "All"], ["control", "Control"], ["restrictions", "Restrictions"], ["ledger", "Ledger"]].map(([id, text]) =>
+      h("button", {
+        type: "button",
+        class: `pill small${pick === id ? " active" : ""}`,
+        "aria-pressed": String(pick === id),
+        text: `${text}${id === "all" ? "" : ` (${d.history.filter((e) => e.stream === id).length})`}`,
+        onclick: () => {
+          app.authority.stream = id;
+          remember(AUTHORITY_STREAM_KEY, id);
+          redrawHistory();
+        },
+      }),
+    ),
+  );
+  const table = rows.length
+    ? apTable(
+        ["When", "Stream", "Kind", "What", "Signed by", "Event"],
+        rows.map((e) =>
+          h(
+            "tr",
+            null,
+            h("td", { class: "small", title: e.at, text: when(e.at) }),
+            h("td", { class: "small", text: `${e.stream} #${e.seq}` }),
+            h("td", { class: "mono small", text: e.kind }),
+            h("td", { class: "item-title small", text: e.summary }),
+            h("td", { class: "small", text: `${e.signer.label}${e.cosigners ? ` + ${e.cosigners}` : ""}` }),
+            h("td", { class: "mono small", title: e.id, text: e.id.slice(0, 12) }),
+          ),
+        ),
+      )
+    : empty("No event in this stream yet.");
+  return [bar, table];
+}
+
+function renderAuthority() {
+  const hub = h("div", null, placeholder("Reading the authority log…"));
+  const queue = h("div");
+  const matrix = h("div");
+  const restrictions = h("div", { class: "stack" });
+  const formSlot = h("div");
+  const history = h("div", { class: "stack" });
+  mainEl.append(
+    section("Authority", "The signed authority log on this Mac (scripts/claw-authority.mjs). Freeze, restrict, lift and keep each need Touch ID on the Mac. It refreshes every 15 s.", hub),
+    section("Cards", "One queue: the hub's own cards, and the approval cards that the autoreviewer also sends to Telegram. A decision here or on the Telegram card is the same decision.", queue),
+    section("Instances", "Per bot: the level in force, the reviewer chain and its health, the home hub, the live grants and directives, the restrictions, and the bot's own copy of the view (/reach/authority).", matrix),
+    section("Restrictions in force", "Mike's restrictions always enforce. An automatic one enforces only when the daemon runs with OASIS_AUTHORITY_AUTO=enforce.", formSlot, restrictions),
+    section("Signed history", "Every control and restriction event, and the newest 200 ledger events. Each one is signed and chained to the one before it.", history),
+  );
+  const drawHistory = () => {
+    if (app.authority.data) history.replaceChildren(...authorityHistoryTable(app.authority.data, drawHistory));
+  };
+  const draw = () => {
+    const d = app.authority.data;
+    if (!d) return;
+    hub.replaceChildren(authorityHub(d, load));
+    queue.replaceChildren(authorityQueue(d, app.authority.approvals, load));
+    const rows = d.instances.filter((i) => inScope([botByKey(i.key)].filter(Boolean)).length || !botByKey(i.key));
+    const byId = new Map(d.restrictions.active.map((r) => [r.id, r]));
+    matrix.replaceChildren(
+      rows.length
+        ? apTable(["Bot", "Level", "Reviewer L1 / L2 / decider", "Health, 24 h", "Home hub", "Grants", "Restrictions", "View", "Freeze"], rows.map((i) => authorityRow(i, byId, load)))
+        : empty("No chosen bot."),
+    );
+    restrictions.replaceChildren(...authorityRestrictions(d, load).filter(Boolean));
+    if (!app.authority.form) app.authority.form = authorityForm(d, load);
+    formSlot.replaceChildren(app.authority.form);
+    drawHistory();
+  };
+  async function load() {
+    // A redraw while Touch ID waits would bring back a button Mike already pressed.
+    if (app.authority.signing) return;
+    const [d, approvals] = await Promise.all([
+      api("/api/authority").catch((err) => ({ error: err })),
+      api("/api/approvals").catch((err) => ({ error: err.message })),
+    ]);
+    if (d.error) {
+      hub.replaceChildren(errorBox(d.error));
+      return;
+    }
+    app.authority.data = d;
+    app.authority.approvals = approvals;
+    draw();
+  }
+  app.authority.form = null;
+  if (app.authority.data) draw();
+  load();
+  every(15_000, load);
 }
 
 // ── Studio: each bot's face, IDENTITY.md and Control UI theme (2026-10-30) ───
