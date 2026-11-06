@@ -89,7 +89,9 @@
 //   void-key <key> --since ISO          (Touch ID)
 //   renew-hub [--agents a,b]            a new 90-day hub certificate (Touch ID)
 //   sync [--no-count]                   one pass: ledger mirror, count rule, views
-//   daemon [--interval S]               sync on each ledger change and every S s
+//   daemon [--interval S]               sync on each ledger change, on each
+//                                       restriction or control event, and
+//                                       every S s
 // A target is `fleet`, `agent:<bot>` or `instance:<bot>@<container>`.
 // restrict and freeze refuse a bot that has no view folder, unless --force.
 
@@ -120,7 +122,7 @@ export const BUDGET = { agents: 2, windowMs: 3600_000 };
 export const COUNT_RULE = { denials: 5, windowMs: 10 * 60_000 };
 export const EXPIRY_NOTICE_MS = 2 * 3600_000;
 const LOCK_STALE_MS = 10 * 60_000;
-const TARGET_RE = /^(?:fleet|agent:[a-z0-9-]{1,40}|instance:[a-z0-9-]{1,40}@[a-z0-9][a-z0-9_.-]{0,80})$/;
+export const TARGET_RE = /^(?:fleet|agent:[a-z0-9-]{1,40}|instance:[a-z0-9-]{1,40}@[a-z0-9][a-z0-9_.-]{0,80})$/;
 const ID_RE = /^[0-9a-f]{64}$/;
 const BOT_RE = /^[a-z0-9-]{1,40}$/;
 
@@ -1127,10 +1129,17 @@ export async function syncOnce(
   return out;
 }
 
+// The streams whose change the daemon sends to the bots at once: Mike's
+// restrict, freeze, lift and keep (CLI or the observatory page) and key.void.
+// Not the ledger stream: the daemon writes that one itself.
+const WATCHED_STREAMS = new Set(["restrictions.jsonl", "control.jsonl"]);
+
 /**
  * Sync at start, after each change of the ledger folder (1 s debounce, no
- * count rule) and every `intervalMs` (with the count rule). One pass at a
- * time. Logs one JSON line for a pass that changed something or failed.
+ * count rule), after each change of the restrictions or control stream
+ * (0.5 s debounce, no count rule) and every `intervalMs` (with the count
+ * rule). One pass at a time. Logs one JSON line for a pass that changed
+ * something or failed. Returns { stop } (for tests; launchd stops the CLI).
  */
 export async function runDaemon(dir, { ledgerFile = DEFAULT_LEDGER_FILE, intervalMs = 60_000, log = (row) => console.log(JSON.stringify(row)), ...opts } = {}) {
   let busy = false;
@@ -1142,7 +1151,7 @@ export async function runDaemon(dir, { ledgerFile = DEFAULT_LEDGER_FILE, interva
     }
     busy = true;
     try {
-      const r = await syncOnce(dir, { ledgerFile, countRule: reason !== "ledger", ...opts });
+      const r = await syncOnce(dir, { ledgerFile, countRule: reason === "start" || reason === "interval", ...opts });
       if (r.ledger.length || r.restricted.length || r.errors.length || reason === "start") {
         log({ ts: new Date().toISOString(), reason, ledger: r.ledger.length, anomalies: r.anomalies, restricted: r.restricted, views: r.views.length, errors: r.errors });
       }
@@ -1157,17 +1166,37 @@ export async function runDaemon(dir, { ledgerFile = DEFAULT_LEDGER_FILE, interva
       }
     }
   };
+  const watchers = [];
   let debounce = null;
   try {
-    fs.watch(path.dirname(ledgerFile), () => {
+    watchers.push(fs.watch(path.dirname(ledgerFile), () => {
       clearTimeout(debounce);
       debounce = setTimeout(() => pass("ledger"), 1000);
-    });
+    }));
   } catch (err) {
     log({ ts: new Date().toISOString(), reason: "watch", errors: [`no watch on ${path.dirname(ledgerFile)}: ${err.message}; interval only`] });
   }
-  setInterval(() => pass("interval"), intervalMs);
+  let debounceLog = null;
+  try {
+    watchers.push(fs.watch(path.join(dir, "streams"), (_type, name) => {
+      // No name (rare on macOS): sync anyway; a pass with no change is cheap.
+      if (name && !WATCHED_STREAMS.has(String(name))) return;
+      clearTimeout(debounceLog);
+      debounceLog = setTimeout(() => pass("log"), 500);
+    }));
+  } catch (err) {
+    log({ ts: new Date().toISOString(), reason: "watch", errors: [`no watch on ${path.join(dir, "streams")}: ${err.message}; a restriction reaches the bots at the next interval`] });
+  }
+  const timer = setInterval(() => pass("interval"), intervalMs);
   await pass("start");
+  return {
+    stop() {
+      clearInterval(timer);
+      clearTimeout(debounce);
+      clearTimeout(debounceLog);
+      for (const w of watchers) w.close();
+    },
+  };
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────────────

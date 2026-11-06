@@ -43,7 +43,8 @@
 //      the Control UI open and approve (item 7), the settings (item 8), and
 //      the decisions and cron changes (item 9), and .swarm item comments
 //      and edits (item 10), and fleet start/restart (item 11), and the
-//      Studio writes and drafts (item 12).
+//      Studio writes and drafts (item 12), and the authority actions
+//      (item 14).
 //      A write needs the token AND this page's Origin. The requests and their screenshots stay in the
 //      state folder, which no bot mounts: a screenshot can show any agent's
 //      memory.
@@ -107,6 +108,19 @@
 //      none of it reaches the page. In the bot it reads a few keys of
 //      openclaw.json and exec-approvals.json, the persona lock dates, and
 //      role.yaml through the image's own python3 + PyYAML (argv only).
+//  14. Authority (Mike, 2026-11-03). GET /api/authority shows the signed
+//      authority log of scripts/claw-authority.mjs: per bot the level in
+//      force, the reviewer chain and its health, the home hub, the grants and
+//      the bot's copy of the view; the hub's cards; and the signed history
+//      (claw-observatory-authority.mjs). POST /api/authority/restrict|lift|keep
+//      appends ONE restrictions event that Mike's root key signs: the key is
+//      in the Secure Enclave, so each one asks for Touch ID on the Mac, with
+//      a text that the tool builds from the event. The page only asks; Touch
+//      ID is the confirmation outside the page. One signature at a time.
+//      Token + Origin, as item 5. This server never writes a bot view: the
+//      authority daemon stays the only writer. In a bot it reads only counts
+//      and times from the reviewer audit, and from `docker inspect` only
+//      the ACCESS_ENV names and the mounts.
 //   6. `serve` also starts the dot_swarm dashboard (`swarm gui`, 18781), where
 //      the human claims, finishes, blocks and comments on items. A bot can
 //      reach that port too, so the observatory starts it only after it proves
@@ -2468,6 +2482,39 @@ async function routeAccess(req, ctx) {
   return [200, { bots, levels: access.LEVELS }];
 }
 
+// ── Authority (Mike, 2026-11-03) ─────────────────────────────────────────────
+// The authority hub on one page (trust model item 14). The logic is in
+// claw-observatory-authority.mjs; the log and the root key in claw-authority.mjs.
+
+const AUTHORITY_MODULE = new URL("./claw-observatory-authority.mjs", import.meta.url);
+let authorityModule = null;
+const loadAuthorityView = () => (authorityModule ??= import(AUTHORITY_MODULE));
+const AUTHORITY_PATH_RE = /^\/api\/authority(?:\/(restrict|lift|keep))?$/;
+const isAuthorityWrite = (method, pathname) => method === "POST" && !!AUTHORITY_PATH_RE.exec(pathname)?.[1];
+
+/** /api/authority                              GET   the page model
+ *  /api/authority/restrict|lift|keep           POST  one root-signed event (Touch ID) */
+async function routeAuthority(req, url, ctx) {
+  const op = AUTHORITY_PATH_RE.exec(url.pathname)[1];
+  const mod = await loadAuthorityView();
+  const f = await cached(ctx, "fleet", 4000, ctx.discover);
+  // The same bots as the daemon's views: excluded deployments stay out.
+  const bots = f.bots.filter((b) => !b.excluded);
+  if (!op) {
+    if (req.method !== "GET") return [405, { error: "an authority action is a POST to /api/authority/restrict, lift or keep" }];
+    const health = await cached(ctx, "authority-health", 30_000, async () =>
+      Object.fromEntries(
+        await Promise.all(bots.map(async (b) => [b.key, b.running ? await ctx.readReviewerHealth(b).catch((err) => ({ error: err.message })) : null])),
+      ),
+    );
+    return [200, mod.authorityPage({ dir: ctx.authorityDir, viewDir: ctx.authorityViewDir, plist: ctx.authorityPlist, bots, inspectFor: ctx.inspectFor, health })];
+  }
+  if (req.method !== "POST") return [405, { error: "an authority action is a POST" }];
+  const body = await readJsonBody(req, 16 * 1024);
+  const r = await mod.runAction(op, body, { dir: ctx.authorityDir, botKeys: bots.map((b) => b.key), signer: () => ctx.rootSigner(ctx.authorityDir) });
+  return r.error ? [r.status ?? 400, { error: r.error }] : [200, r];
+}
+
 // ── observatory HTTP server ──────────────────────────────────────────────────
 
 const SECURITY_HEADERS = {
@@ -2508,6 +2555,7 @@ export function checkRequest(req, port) {
     isBoardWrite(req.method, pathname) ||
     isFleetWrite(req.method, pathname) ||
     isStudioWrite(req.method, pathname) ||
+    isAuthorityWrite(req.method, pathname) ||
     (req.method === "POST" && pathname === DECIDE_PATH);
   if (!WRITE_METHODS.has(req.method) || !writable) {
     return { status: 405, error: "read-only" };
@@ -3831,6 +3879,11 @@ export function createObservatoryServer(ctx) {
   ctx.readRoleDeclared ??= async (bot) =>
     JSON.parse(await docker(["exec", bot.container, "python3", "-c", (await loadAccess()).ROLE_PY, (await loadAccess()).ROLE_MOUNT], { timeoutMs: 30_000 }));
   ctx.readPolicy ??= async (file) => (await loadAccess()).readPolicyFile(file);
+  ctx.authorityDir ??= process.env.OASIS_AUTHORITY_DIR || path.join(STATE_DIR, "authority");
+  ctx.authorityViewDir ??= process.env.OASIS_AUTHORITY_VIEW_DIR || path.join(OASIS_SUPPORT, "authority-view");
+  ctx.authorityPlist ??= path.join(HOME, "Library", "LaunchAgents", "com.oasis-x.authority.plist");
+  ctx.readReviewerHealth ??= async (bot) => collect(bot.container, (await loadAuthorityView()).collectReviewerHealth);
+  ctx.rootSigner ??= async (dir) => (await loadAuthorityView()).rootSignerFor(dir);
   return http.createServer((req, res) => {
     const refused = checkRequest(req, ctx.port);
     if (refused) {
@@ -3952,6 +4005,16 @@ export function createObservatoryServer(ctx) {
       routeAccess(req, ctx).then(
         ([status, body]) => sendJson(res, status, body),
         (err) => sendJson(res, err.status ?? 502, { error: err.message }),
+      );
+      return;
+    }
+    if (AUTHORITY_PATH_RE.test(url.pathname)) {
+      routeAuthority(req, url, ctx).then(
+        ([status, body]) => sendJson(res, status, body),
+        (err) => {
+          if (err.status === 413) res.once("finish", () => req.destroy());
+          sendJson(res, err.status ?? 502, { error: err.message });
+        },
       );
       return;
     }
