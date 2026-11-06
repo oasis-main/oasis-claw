@@ -749,3 +749,8 @@ button.chip-button:hover { background: var(--accent-soft); }
 .access-drift { margin: 0; padding-left: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; }
 .access-drift li { font-size: 13px; overflow-wrap: anywhere; }
 .access-detail .table td.mono { overflow-wrap: anywhere; }
+
+/* Access edits (step 5 part 1) */
+.stack.tight { gap: 6px; }
+.chip .button.small { margin-left: 2px; padding: 0 6px; font-size: 11px; }
+.access-detail .field-label.small { margin-top: 6px; color: var(--muted); }

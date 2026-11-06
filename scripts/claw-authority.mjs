@@ -21,6 +21,8 @@
 //   restrictions  restriction.add, restriction.lift.
 //   ledger        grant.state, grant.removed: the hub's signed mirror of the
 //                 peer-grant and directive ledger (see LEDGER below).
+//   access        access.change: one edit of a bot's access from the
+//                 observatory (see ACCESS below).
 // Each event: { v, stream, seq, prev, hlc, at, kind, scope, body, signer }
 // plus id = sha256(canonical form) and sig over the same bytes. prev is the
 // id of the event before it, so a changed, dropped or reordered line breaks
@@ -65,6 +67,14 @@
 //   restricts an instance to fail-closed for 24 h after 5 enforced denials in
 //   10 minutes. A reviewer health failure (l2:unavailable, l2FailClosed) and a
 //   restriction's own deny never count, so a restriction never feeds itself.
+//
+// ACCESS (step 5)
+//   Each edit of a bot's access that the observatory makes (a tool in
+//   role.yaml, a reviewer write root) is first one signed event: what, for
+//   which bot, and the hash of the file before and after. A widening (an
+//   add) needs a root signature, so Touch ID; a tightening may be signed by
+//   a hub certified for the bot, so one click. Verify recomputes the
+//   direction from the event, so a hub key can never sign a widening.
 //
 // TRUST: the genesis root is pinned out of band (root.pin; `init` prints the
 // fingerprint). There is no trust on first use: without a pin nothing
@@ -111,7 +121,7 @@ export const DEFAULT_LEDGER_FILE = path.join(OASIS_DIR, "approvals", "peer-grant
 export const DEFAULT_VIEW_DIR = path.join(OASIS_DIR, "authority-view");
 export const VIEW_FILE = "authority.json";
 
-export const STREAMS = ["control", "restrictions", "ledger"];
+export const STREAMS = ["control", "restrictions", "ledger", "access"];
 export const LEVELS = ["fail-closed", "read-only", "chat-only", "stopped"];
 export const AUTO_FLOOR = "chat-only";
 export const HUB_TRIGGERS = ["hard-rule", "canary", "never-downgrade", "count-rule", "x-model"];
@@ -187,7 +197,7 @@ export function keySigner(privateKey) {
   };
 }
 
-function runTool(tool, args, input, timeoutMs = 180_000) {
+function runTool(tool, args, input, timeoutMs = 180_000, timeoutHint = "") {
   return new Promise((resolve, reject) => {
     const child = spawn(tool, args, { stdio: ["pipe", "pipe", "pipe"] });
     let out = "";
@@ -206,8 +216,7 @@ function runTool(tool, args, input, timeoutMs = 180_000) {
     child.on("close", (code) => {
       clearTimeout(timer);
       if (code === 0) resolve(out);
-      // The root tool waits on Touch ID, so a timeout there means nobody touched the sensor.
-      else if (timedOut) reject(new Error(`${path.basename(tool)} stopped after ${timeoutMs / 1000} s with no answer (no Touch ID?)`));
+      else if (timedOut) reject(new Error(`${path.basename(tool)} stopped after ${timeoutMs / 1000} s with no answer${timeoutHint ? ` (${timeoutHint})` : ""}`));
       else reject(new Error(err.trim() || `${path.basename(tool)} exited ${code}`));
     });
     child.stdin.end(input ?? "");
@@ -222,7 +231,8 @@ export async function enclaveSigner(tool, keyFile) {
     public: pub.public,
     key: fingerprint(pub),
     sign: async (bytes) => {
-      const out = JSON.parse(await runTool(tool, ["sign", keyFile], bytes));
+      // The root tool waits on Touch ID, so a timeout there means nobody touched the sensor.
+      const out = JSON.parse(await runTool(tool, ["sign", keyFile], bytes, 180_000, "no Touch ID?"));
       if (out.id !== sha256(bytes) || out.key !== fingerprint(pub)) throw new Error("the root tool signed something else");
       return out.sig;
     },
@@ -398,6 +408,41 @@ export function authorizeRestriction(trust, event) {
   if (!HUB_TRIGGERS.includes(b.trigger)) return `an automatic restriction has a trigger: ${HUB_TRIGGERS.join(", ")}`;
   if (!ID_RE.test(String(b.evidence))) return "an automatic restriction names the hash of the event that caused it";
   if (TTL_TRIGGERS.includes(b.trigger) && !(ms(b.expiresAt) - atMs <= TTL_MS)) return `a ${b.trigger} restriction expires within 24 hours`;
+  return null;
+}
+
+// ── access edits (step 5) ────────────────────────────────────────────────────
+
+/** The settings an access.change may name. A list setting widens on "add". */
+export const ACCESS_SETTINGS = ["tools.alsoAllow", "reviewer.writeRoots"];
+export const ACCESS_OPS = ["add", "remove"];
+
+/** Does this access.change give the bot more than it had? */
+export function accessWidening(body) {
+  return body?.op === "add";
+}
+
+/** Is the signer allowed to append this access event? Error text or null. */
+export function authorizeAccess(trust, event) {
+  const atMs = ms(event.at);
+  const b = event.body ?? {};
+  const signerKey = event.signer?.key;
+  const isRoot = trust.roots.has(signerKey);
+  const hub = isRoot ? null : hubValidAt(trust, signerKey, atMs);
+  const pool = new Map(isRoot ? [[signerKey, trust.roots.get(signerKey)]] : hub ? [[signerKey, hub]] : []);
+  if (!signersOf(trust, event, pool).has(signerKey)) return isRoot || hub ? "bad signature" : "the signer is not a root or a valid hub";
+  if (event.kind !== "access.change") return `unknown access kind ${event.kind}`;
+  if (!BOT_RE.test(String(b.bot)) || event.scope !== `agent:${b.bot}`) return "an access change names its bot (scope agent:<bot>)";
+  if (!ACCESS_SETTINGS.includes(b.setting)) return `the setting is one of ${ACCESS_SETTINGS.join(", ")}`;
+  if (!ACCESS_OPS.includes(b.op)) return `the op is one of ${ACCESS_OPS.join(", ")}`;
+  if (typeof b.value !== "string" || !b.value || b.value.length > 300) return "the value is a short text";
+  if (typeof b.file !== "string" || !b.file || b.file.length > 300) return "the change names its file";
+  if (!ID_RE.test(String(b.before)) || !ID_RE.test(String(b.after))) return "the change holds the file hash before and after";
+  if (b.reason !== undefined && (typeof b.reason !== "string" || b.reason.length > 500)) return "the reason is 500 characters at most";
+  if (isRoot) return null;
+  // A hub: a tightening only, for a bot of its certificate.
+  if (accessWidening(b)) return "a widening needs Mike's root key";
+  if (!hub.agents.includes("*") && !hub.agents.includes(b.bot)) return `this hub is not certified for ${b.bot}`;
   return null;
 }
 
@@ -650,6 +695,7 @@ export function loadAuthority(dir, { pin = readPin(dir) } = {}) {
     control: (e) => applyControl(trust, e),
     restrictions: (e) => authorizeRestriction(trust, e),
     ledger: ledger.check,
+    access: (e) => authorizeAccess(trust, e),
   };
   const streams = {};
   for (const name of STREAMS) streams[name] = verifyChain(name, readLines(path.join(dir, "streams", `${name}.jsonl`)), checks[name]);
@@ -1098,7 +1144,14 @@ export async function syncOnce(
     out.errors.push(`ledger: ${err.message}`);
   }
   if (countRule && bots) {
-    const read = collect ?? (async (container) => JSON.parse(await dockerExec(container, AUDIT_COLLECTOR)));
+    const read =
+      collect ??
+      (async (container) => {
+        const out = await dockerExec(container, AUDIT_COLLECTOR);
+        // Seen at night (a busy or sleeping Docker): exit 0 with no output.
+        if (!out.trim()) throw new Error("the audit read printed nothing");
+        return JSON.parse(out);
+      });
     const denials = [];
     await Promise.all(
       bots
@@ -1278,7 +1331,7 @@ export async function main(argv) {
       if (command === "verify") {
         for (const err of report.errors) say(`FAULT ${err}`);
         const n = report.streams;
-        say(report.ok ? `ok: ${n.control.events} control, ${n.restrictions.events} restriction and ${n.ledger.events} ledger events verify` : "the log does not verify");
+        say(report.ok ? `ok: ${n.control.events} control, ${n.restrictions.events} restriction, ${n.ledger.events} ledger and ${n.access.events} access events verify` : "the log does not verify");
         return report.ok ? 0 : 1;
       }
       if (flags.json) {

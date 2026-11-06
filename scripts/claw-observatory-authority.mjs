@@ -10,7 +10,8 @@
 //     hub certificate near its end. The page puts them in one queue with the
 //     approval cards that the autoreviewer also sends to Telegram.
 //   - Freeze, restrict, lift and keep.
-//   - The signed history of the control, restrictions and ledger streams.
+//   - The signed history of the control, restrictions, ledger and access
+//     streams.
 //
 // WRITES: restrict, lift and keep each append ONE event that Mike's root key
 // signs, through claw-authority.mjs. The root key is in the Secure Enclave:
@@ -249,6 +250,8 @@ export function eventSummary(e) {
     }
     case "grant.removed":
       return `${b.id} removed from the ledger file${b.anomaly ? `; NOT LEGAL: ${b.anomaly}` : ""}`;
+    case "access.change":
+      return `${b.bot}: ${b.op} ${b.setting} ${b.value} (${b.op === "add" ? "widening" : "tightening"}) in ${b.file}${b.reason ? `: ${b.reason}` : ""}`;
     default:
       return e.kind;
   }
@@ -493,21 +496,31 @@ export async function rootSignerFor(dir) {
 let signing = false;
 
 /**
- * Plan, sign (Touch ID) and append one event. One request at a time: a second
- * click while Touch ID waits gets 409, not a second prompt. appendEvent checks
- * the event again under the log lock, against the same rules as verify.
+ * Run `fn` as the only signature in progress in this server (an authority
+ * action here, an access edit in claw-observatory-access-edit.mjs). A second
+ * click while Touch ID waits gets 409, not a second prompt.
  */
-export async function runAction(op, body, { dir, botKeys, signer, now = Date.now }) {
+export async function oneSignature(fn) {
   if (signing) return { status: 409, error: "a Touch ID request is already open on the Mac" };
   signing = true;
   try {
-    const plan = planAction(op, body, { auth: loadAuthority(dir), botKeys, nowMs: now() });
-    if (plan.error) return plan;
-    const e = await appendEvent(dir, "restrictions", plan.entry, await signer(), { now });
-    return { ok: true, op, event: { id: e.id, seq: e.seq, at: e.at, kind: e.kind, scope: e.scope }, summary: eventSummary(e) };
+    return await fn();
   } catch (err) {
     return { status: err.status ?? 502, error: err.message };
   } finally {
     signing = false;
   }
+}
+
+/**
+ * Plan, sign (Touch ID) and append one event. appendEvent checks the event
+ * again under the log lock, against the same rules as verify.
+ */
+export async function runAction(op, body, { dir, botKeys, signer, now = Date.now }) {
+  return oneSignature(async () => {
+    const plan = planAction(op, body, { auth: loadAuthority(dir), botKeys, nowMs: now() });
+    if (plan.error) return plan;
+    const e = await appendEvent(dir, "restrictions", plan.entry, await signer(), { now });
+    return { ok: true, op, event: { id: e.id, seq: e.seq, at: e.at, kind: e.kind, scope: e.scope }, summary: eventSummary(e) };
+  });
 }

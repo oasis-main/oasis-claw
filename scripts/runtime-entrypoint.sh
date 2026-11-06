@@ -1171,10 +1171,30 @@ also = list(also) if isinstance(also, list) else []
 RETIRED_TOOLS = ("reach_search",)
 also = [x for x in also if x not in RETIRED_TOOLS]
 role_also_allow = os.environ.get("OASIS_TOOLS_ALSO_ALLOW", "").strip()
-if role_also_allow:
-    for item in (x.strip() for x in role_also_allow.split(",") if x.strip()):
-        if item not in also:
-            also.append(item)
+role_tools = [x.strip() for x in role_also_allow.split(",") if x.strip()]
+# Step 5 of the identity plan (2026-11-06): a tool that role.yaml (or
+# OASIS_TOOLS_ALSO_ALLOW) added on an earlier boot and no longer lists goes
+# away now. Before this, a tool removed from role.yaml stayed allowed through
+# the persisted list, so the observatory's "remove" did nothing. The state
+# file holds the role list of the last boot that wrote the config. A boot
+# with no state file (the first with this code) prunes nothing. A feature
+# tuple below re-admits a tool that it owns. Same exposure as the persisted
+# list itself: both live in the bot's own home.
+ROLE_TOOLS_STATE = config_path.parent / "role-also-allow.json"
+prev_role_tools = []
+try:
+    if ROLE_TOOLS_STATE.is_file() and not ROLE_TOOLS_STATE.is_symlink():
+        _prev = json.loads(ROLE_TOOLS_STATE.read_text()).get("tools")
+        prev_role_tools = [str(x) for x in _prev] if isinstance(_prev, list) else []
+except (ValueError, AttributeError, OSError):
+    prev_role_tools = []
+dropped_role_tools = [x for x in prev_role_tools if x not in role_tools]
+if dropped_role_tools:
+    also = [x for x in also if x not in dropped_role_tools]
+    print(f"[entrypoint] tools: role.yaml no longer allows {', '.join(dropped_role_tools)}: removed")
+for item in role_tools:
+    if item not in also:
+        also.append(item)
 if entries["sleep-cycle"]["config"]["enabled"]:
     if "sleep_deep" not in also:
         also.append("sleep_deep")
@@ -2589,6 +2609,16 @@ else:
 config_path.parent.mkdir(parents=True, exist_ok=True)
 config_path.write_text(json.dumps(config, indent=2) + "\n")
 print(f"[entrypoint] wrote {config_path}")
+
+# The role list that this config was built from (see Layer 1: tools.alsoAllow).
+# Written after the config, so a crash before it keeps the old list. Never
+# through a symlink: the bot's own home is writable by the agent.
+try:
+    _fd = os.open(ROLE_TOOLS_STATE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(_fd, "w") as _fh:
+        _fh.write(json.dumps({"tools": role_tools}) + "\n")
+except OSError as _err:
+    print(f"[entrypoint] WARN: {ROLE_TOOLS_STATE} not written ({_err}); the next boot prunes nothing")
 PY
 
 # ---- banner ------------------------------------------------------------
