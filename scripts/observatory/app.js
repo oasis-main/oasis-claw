@@ -532,6 +532,7 @@ const VIEWS = [
   { id: "live", label: "Live", sub: "System 1" },
   { id: "agents", label: "Agents", sub: "System 3" },
   { id: "approvals", label: "Approvals & work", sub: "Brief · directives · open work · grants" },
+  { id: "access", label: "Access", sub: "Levels · reviewer · mounts · drift" },
   { id: "cron", label: "Cron", sub: "Schedules · per-job models" },
   { id: "studio", label: "Studio", sub: "Pictures · profiles · Control UI themes" },
   { id: "settings", label: "Settings", sub: "You · background" },
@@ -730,6 +731,7 @@ function renderView() {
   else if (app.view === "approvals") renderApprovals();
   else if (app.view === "cron") renderCron();
   else if (app.view === "studio") renderStudio();
+  else if (app.view === "access") renderAccess();
   else renderAgents();
 }
 
@@ -3699,6 +3701,175 @@ function mountSettings() {
 
 function renderSettings() {
   mainEl.append(section("Settings", "Your profile, the USER.md file in each bot, and the background swarm.", settingsPanel("page")));
+}
+
+// ── Access: who may do what, per bot (Mike, 2026-11-02) ──────────────────────
+// The permission level, exec, reviewer, decider and sandbox settings, the
+// tools, every mount, and where role.yaml, the container and the live config
+// disagree. Read only (phase 1 of the access design): a change still goes
+// through bots/ and a restart or a recreate, as the last table says.
+
+const ACCESS_BOT_KEY = "claw-observatory-access-bot";
+const ACCESS_SEVERITY = { risk: ["high", "bad"], warn: ["check", "warn"], info: ["note", "info"] };
+const ACCESS_CHANGES = [
+  ["Tool surface (role.yaml tools, or OASIS_TOOLS_ALSO_ALLOW)", "Restart. The entrypoint compiles role.yaml at each boot."],
+  ["Exec allowlist: add a pattern", "Restart. The boot merges role.yaml exec.allow into exec-approvals.json."],
+  ["Exec allowlist: remove a pattern", "Edit exec-approvals.json in the bot volume. The boot merge never removes a pattern."],
+  ["Exec level (security, mode, ask)", "Recreate: make -C bots BOT=<bot> recreate. A restart keeps the old environment."],
+  ["Reviewer write roots", "Edit bots/reviewer-policy.local.json, run make reviewer-policy, then restart."],
+  ["Reviewer mode and Layer 2", "Recreate."],
+  ["Decider (off or shadow)", "Recreate."],
+  ["Mounts", "Recreate. Docker cannot add a mount to a running container."],
+];
+
+const accessYesNo = (v) => (v == null ? "—" : v ? "yes" : "no");
+const accessList = (v) => (v?.length ? v.join(", ") : "—");
+
+function accessDriftChips(drift) {
+  const counts = { risk: 0, warn: 0, info: 0 };
+  for (const d of drift) counts[d.severity] = (counts[d.severity] ?? 0) + 1;
+  const chips = Object.entries(counts)
+    .filter(([, n]) => n)
+    .map(([sev, n]) => chip(`${n} ${ACCESS_SEVERITY[sev]?.[0] ?? sev}`, ACCESS_SEVERITY[sev]?.[1] ?? ""));
+  return chips.length ? chips : [chip("none", "ok")];
+}
+
+function accessRow(a, selected, onPick) {
+  const bot = botByKey(a.key);
+  const exec = a.exec.security ? `${a.exec.security} / ${a.exec.mode ?? "—"} / ask ${a.exec.ask ?? "—"}` : "—";
+  const reviewer = `${a.reviewer.mode ?? "off"} / L2 ${a.reviewer.l2 ?? "off"}${a.reviewer.failClosed ? " / fails closed" : ""}`;
+  const rw = a.mounts.filter((m) => m.mode === "rw").length;
+  const tr = h(
+    "tr",
+    { class: `access-row${selected ? " active" : ""}`, tabindex: "0", "aria-selected": String(selected), onclick: onPick },
+    h("td", null, h("span", { class: "item-title", text: bot ? botLabel(bot) : a.key }), a.running ? null : h("span", { class: "muted small", text: ` ${a.state}` })),
+    h("td", { title: a.level.gaps.join("; ") || a.level.label }, chip(a.level.id === "custom" ? "custom" : `Level ${a.level.id}`, a.level.id === "custom" ? "warn" : "info")),
+    h("td", { class: "mono small", text: exec }),
+    h("td", { class: "small", text: reviewer }),
+    h("td", { class: "small", text: a.decider.mode }),
+    h("td", { class: "small", text: a.sandbox.ssh ? `ssh${a.sandbox.backend ? ` (${a.sandbox.backend})` : ""}` : "none" }),
+    h("td", { class: "small", text: a.tools.live ? `${a.tools.live.profile ?? "default"} + ${a.tools.live.alsoAllow.length}` : "—" }),
+    h("td", { class: "num small", text: `${a.mounts.length} (${rw} rw)` }),
+    h("td", { class: "small", text: a.persona.active ? (a.persona.lock?.pinnedAt ? `pinned ${ago(a.persona.lock.pinnedAt)}` : "on") : "not in image" }),
+    h("td", null, accessDriftChips(a.drift)),
+  );
+  tr.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      onPick();
+    }
+  });
+  return tr;
+}
+
+function accessDetail(a) {
+  const bot = botByKey(a.key);
+  const ap = a.exec.approvals;
+  const lock = a.persona.lock;
+  const declared = a.tools.declared;
+  const live = a.tools.live;
+  const settings = h(
+    "dl",
+    { class: "facts" },
+    fact("Level", a.level.id === "custom" ? `Custom: ${a.level.gaps.join("; ")}` : `${a.level.id}: ${a.level.label}`),
+    fact("Exec (container env)", `security ${a.exec.security ?? "—"}, mode ${a.exec.mode ?? "—"}, ask ${a.exec.ask ?? "—"}${a.exec.askFallback ? `, ask fallback ${a.exec.askFallback}` : ""}`),
+    fact("exec-approvals.json", ap?.error ? ap.error : ap ? `security ${ap.security ?? "—"}, ask ${ap.ask ?? "—"}, ${ap.allowlist} allowlist patterns` : "—"),
+    fact("Reviewer", `${a.reviewer.mode ?? "off"}; Layer 2 ${a.reviewer.l2 ?? "off"}; fails closed: ${accessYesNo(a.reviewer.failClosed)}; mail-woken runs need a grant: ${accessYesNo(a.reviewer.mailWakeNeedsGrant)}`),
+    fact("Reviewer write roots", a.reviewer.policyKey ? accessList(a.reviewer.writeRoots) : "— (no per-bot policy entry)"),
+    fact("Decider (X model)", `${a.decider.mode}. Enforce is not available: the decider takes only off or shadow (extensions/oasis-reviewer/src/decider.ts).`),
+    fact("Exec sandbox", a.sandbox.ssh ? `SSH sidecar; backend ${a.sandbox.backend ?? "—"}, mode ${a.sandbox.mode ?? "—"}, workspace access ${a.sandbox.workspaceAccess ?? "—"}` : "none"),
+    fact("Tools (role.yaml)", declared ? `${declared.profile ?? "no profile"}; also allows ${accessList(declared.alsoAllow)}${declared.source === "env" ? " (from OASIS_TOOLS_ALSO_ALLOW)" : ""}` : "—"),
+    fact("Tools (running config)", live ? `${live.profile ?? "default"}; also allows ${accessList(live.alsoAllow)}` : "—"),
+    fact("role.yaml", a.role.present ? (a.role.error ?? `phase ${a.role.phase ?? "—"}${a.role.dormantTiers?.length ? `; dormant tiers ${a.role.dormantTiers.join(", ")}` : ""}`) : "none (environment only)"),
+    fact(
+      "Persona boot check",
+      a.persona.active
+        ? `${a.persona.check}, drift ${a.persona.drift}; ${lock ? `pinned ${when(lock.pinnedAt)}, ${lock.changes} recorded changes` : "not pinned yet"}`
+        : "not in this image (needs the image with scripts/persona-check.mjs)",
+    ),
+  );
+  const drift = a.drift.length
+    ? h(
+        "ul",
+        { class: "access-drift" },
+        a.drift.map((d) => h("li", null, chip(ACCESS_SEVERITY[d.severity]?.[0] ?? d.severity, ACCESS_SEVERITY[d.severity]?.[1] ?? ""), " ", h("span", { class: "muted small", text: `${d.area}: ` }), d.text)),
+      )
+    : empty(a.running ? "role.yaml, the container and the live config agree." : `${a.container} is ${a.state}: drift needs a running container.`);
+  const mounts = apTable(
+    ["Container path", "Host path or volume", "Mode", "Kind", "In role.yaml", "Flags"],
+    a.mounts.map((m) =>
+      h(
+        "tr",
+        null,
+        h("td", { class: "mono small", text: m.at }),
+        h("td", { class: "mono small", text: m.host || "—" }),
+        h("td", null, chip(m.mode, m.mode === "rw" ? "warn" : "ok")),
+        h("td", { class: "small", text: m.type === "volume" ? `${m.kind} (volume)` : m.kind }),
+        h("td", { class: "small", text: m.declared == null ? "—" : m.declared ? "yes" : "no (overlay only)" }),
+        h("td", null, m.flags.map((f) => chip(f, m.mode === "rw" ? "bad" : "warn"))),
+      ),
+    ),
+  );
+  const changes = apTable(
+    ["Setting", "How a change takes effect"],
+    ACCESS_CHANGES.map(([what, how]) => h("tr", null, h("td", { class: "small", text: what }), h("td", { class: "small item-title", text: how }))),
+  );
+  return [
+    h("div", { class: "card-head" }, h("h3", { text: bot ? botLabel(bot) : a.key }), h("span", { class: "muted small", text: a.container })),
+    ...a.errors.map((e) => errorBox(new Error(e))),
+    settings,
+    h("h4", { text: "Drift" }),
+    drift,
+    h("h4", { text: `Mounts (${a.mounts.length})` }),
+    mounts,
+    h("h4", { text: "How a change takes effect" }),
+    changes,
+  ];
+}
+
+function renderAccess() {
+  app.access ??= { bot: recall(ACCESS_BOT_KEY), data: null };
+  const top = h("div", { class: "stack" }, placeholder("Reading each bot's access…"));
+  const detail = h("section", { class: "card access-detail stack" });
+  mainEl.append(
+    section(
+      "Access",
+      "Who may do what, per bot. This view only reads: a change still goes through bots/ and a restart or a recreate (see the last table). It refreshes every 30 s.",
+      top,
+      detail,
+    ),
+  );
+  const draw = () => {
+    const d = app.access.data;
+    if (!d) return;
+    const rows = d.bots.filter((a) => inScope([botByKey(a.key)].filter(Boolean)).length || !botByKey(a.key));
+    if (!rows.some((a) => a.key === app.access.bot)) app.access.bot = rows[0]?.key ?? null;
+    const pick = (key) => () => {
+      app.access.bot = key;
+      remember(ACCESS_BOT_KEY, key);
+      draw();
+    };
+    top.replaceChildren(
+      rows.length
+        ? apTable(
+            ["Bot", "Level", "Exec", "Reviewer", "Decider", "Sandbox", "Tools", "Mounts", "Persona check", "Drift"],
+            rows.map((a) => accessRow(a, a.key === app.access.bot, pick(a.key))),
+          )
+        : empty("No chosen bot."),
+    );
+    const chosen = rows.find((a) => a.key === app.access.bot);
+    detail.replaceChildren(...(chosen ? accessDetail(chosen) : [empty("Choose a bot.")]));
+  };
+  const load = () =>
+    api("/api/access")
+      .then((d) => {
+        app.access.data = d;
+        draw();
+      })
+      .catch((err) => top.replaceChildren(errorBox(err)));
+  if (app.access.data) draw();
+  load();
+  every(30_000, load);
 }
 
 // ── Studio: each bot's face, IDENTITY.md and Control UI theme (2026-10-30) ───

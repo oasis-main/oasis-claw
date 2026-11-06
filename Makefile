@@ -368,6 +368,58 @@ observatory-ai-key: ## give the observatory Studio its own oasis-generation key 
 observatory-app: ## build "Fleet Observatory.app" and install it in ~/Applications: one click runs `make observatory` in this checkout (CLAW-126; see scripts/observatory-app/README.md)
 	@scripts/observatory-app/build.sh "$(CURDIR)" "$(OBSERVATORY_APP_DEST)"
 
+# ── authority hub (Mike, 2026-11-02; scripts/claw-authority.mjs) ─────────────
+# The Mac's signed authority log: Mike's root key in the Secure Enclave (each
+# signature asks for Touch ID), this Mac's hub key, and the control and
+# restriction streams. The folder is in the observatory state folder, which
+# no bot mounts.
+AUTHORITY_DIR ?= $(HOME)/Library/Application Support/oasis-x/observatory/authority
+# Step 3 part 2: the sync daemon mirrors the grant ledger, applies the count
+# rule, and writes one view per bot (authority-view/<bot>/authority.json; each
+# bot mounts its own folder read-only at /reach/authority).
+AUTHORITY_PLIST := $(HOME)/Library/LaunchAgents/com.oasis-x.authority.plist
+AUTHORITY_RUN_DIR := $(WATCHDOG_DIR)/authority
+
+.PHONY: authority-tool authority-init authority-status authority-verify \
+        authority-sync authority-install authority-daemon-status authority-uninstall
+
+authority-tool: ## build oasis-root-key (the Secure Enclave root signer) into the authority folder
+	@mkdir -p "$(AUTHORITY_DIR)/bin" && chmod 700 "$(AUTHORITY_DIR)"
+	@swiftc -O -swift-version 5 -target "$$(uname -m)-apple-macos13.0" -o "$(AUTHORITY_DIR)/bin/oasis-root-key" scripts/authority/oasis-root-key.swift
+	@codesign --force --sign - --identifier com.oasis-x.root-key "$(AUTHORITY_DIR)/bin/oasis-root-key"
+	@echo "built $(AUTHORITY_DIR)/bin/oasis-root-key"
+
+authority-init: authority-tool ## make the root key (Secure Enclave) and the hub key, and sign the genesis (one Touch ID)
+	@OASIS_AUTHORITY_DIR="$(AUTHORITY_DIR)" node scripts/claw-authority.mjs init
+
+authority-status: ## the authority keys, streams and the restrictions in force
+	@OASIS_AUTHORITY_DIR="$(AUTHORITY_DIR)" node scripts/claw-authority.mjs status
+
+authority-verify: ## check every authority stream (signatures, chain, rules); exit 1 on a fault
+	@OASIS_AUTHORITY_DIR="$(AUTHORITY_DIR)" node scripts/claw-authority.mjs verify
+
+authority-sync: ## one authority pass now: ledger mirror, count rule, per-bot views (no Touch ID)
+	@OASIS_AUTHORITY_DIR="$(AUTHORITY_DIR)" node scripts/claw-authority.mjs sync
+
+authority-install: ## (re)deploy + load the authority sync daemon (launchd) — re-run after editing the script
+	@mkdir -p "$(AUTHORITY_RUN_DIR)"
+	@cp scripts/claw-authority.mjs scripts/claw-observatory.mjs "$(AUTHORITY_RUN_DIR)/"
+	@cp scripts/com.oasis-x.authority.plist "$(AUTHORITY_PLIST)"
+	@plutil -lint "$(AUTHORITY_PLIST)" >/dev/null
+	@launchctl bootout gui/$$(id -u)/com.oasis-x.authority 2>/dev/null || true
+	@launchctl bootstrap gui/$$(id -u) "$(AUTHORITY_PLIST)"
+	@echo "authority daemon installed — verify with: make authority-daemon-status"
+
+authority-daemon-status: ## the daemon's state and log tail
+	@launchctl print gui/$$(id -u)/com.oasis-x.authority 2>/dev/null \
+	  | grep -E "state =|last exit code" || echo "not loaded"
+	@tail -5 "$(HOME)/Library/Logs/authority.stdout.log" 2>/dev/null || true
+	@tail -5 "$(HOME)/Library/Logs/authority.stderr.log" 2>/dev/null || true
+
+authority-uninstall: ## unload the authority sync daemon (the bots keep their last view)
+	@launchctl bootout gui/$$(id -u)/com.oasis-x.authority 2>/dev/null || true
+	@echo "authority daemon unloaded"
+
 observe-open: ## open the running observatory and unlock this browser (after that, the bookmark http://127.0.0.1:18780/ works)
 	@node scripts/claw-observatory.mjs open observatory
 
