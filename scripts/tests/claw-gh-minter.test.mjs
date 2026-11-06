@@ -45,7 +45,9 @@ function fakeGitHub(publicKey) {
       if (m && req.method === "GET") {
         if (!verifyJwt(req.headers.authorization)) return send(401, { message: "bad jwt" });
         const inst = installs[m[1]];
-        return inst ? send(200, { id: inst.id, repository_selection: inst.repository_selection }) : send(404, { message: "Not Found" });
+        // The permissions the account owner accepted (the minter drops any it asks above these).
+        const permissions = { contents: "write", metadata: "read", pull_requests: "write", issues: "write" };
+        return inst ? send(200, { id: inst.id, repository_selection: inst.repository_selection, permissions }) : send(404, { message: "Not Found" });
       }
       const t = req.url.match(/^\/app\/installations\/(\d+)\/access_tokens$/);
       if (t && req.method === "POST") {
@@ -156,6 +158,65 @@ test("minter: signs with the App key, cuts each token to the bot's repos and per
     assert.match(rv.out, /revoke HTTP 204/);
     assert.ok(revoked.includes(rec.token));
     assert.ok(!fs.existsSync(houseFile));
+  } finally {
+    server.close();
+  }
+});
+
+test("minter --min-life: mints only missing or near-expiry tokens, and stays silent when none is due", async () => {
+  // Mike, 2026-11-06: launchd runs this every 60 s so a wake gets fresh tokens at once.
+  const support = tmp("gh-minter-life-");
+  const keyDir = path.join(support, "github-app", "keys");
+  fs.mkdirSync(keyDir, { recursive: true });
+  const keyPath = path.join(keyDir, "test.pem");
+  execFileSync("openssl", ["genrsa", "-out", keyPath, "2048"], { stdio: "ignore" });
+  const publicKey = crypto.createPublicKey(fs.readFileSync(keyPath));
+  const apps = { MikeHLee: { app_id: 4242, slug: "t", key: keyPath }, "oasis-main": { app_id: 4242, slug: "t", key: keyPath } };
+  fs.writeFileSync(path.join(support, "github-app", "apps.json"), JSON.stringify(apps));
+  const grants = {
+    bots: {
+      house: { MikeHLee: { repos: ["exp"], permissions: { contents: "write", metadata: "read" } } },
+      yesman: { "oasis-main": { repos: "*", permissions: { contents: "write", metadata: "read" } } },
+      ghost: { Nobody: { repos: "*" } },
+    },
+  };
+  fs.writeFileSync(path.join(support, "github-app", "grants.json"), JSON.stringify(grants));
+  const { server, mints } = fakeGitHub(publicKey);
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const env = { OASIS_GH_SUPPORT_DIR: support, OASIS_GH_API: `http://127.0.0.1:${server.address().port}` };
+  const iso = (ms) => new Date(ms).toISOString().replace(/\.\d+Z$/, "Z");
+  const writeTok = (bot, account, expiresMs) => {
+    fs.mkdirSync(path.join(support, "gh-tokens", bot), { recursive: true });
+    fs.writeFileSync(path.join(support, "gh-tokens", bot, `${account}.json`), JSON.stringify({ account, token: "ghs_old", expires_at: iso(expiresMs) }));
+  };
+  const tok = (bot, account) => JSON.parse(fs.readFileSync(path.join(support, "gh-tokens", bot, `${account}.json`), "utf8")).token;
+  try {
+    // No tokens yet: both are minted.
+    let run = await runMinter(["mint", "--min-life", "25"], env);
+    assert.equal(run.code, 0);
+    assert.match(run.out, /minted 2, failed or skipped 0/);
+    const first = { house: tok("house", "mikehlee"), yesman: tok("yesman", "oasis-main") };
+    assert.doesNotMatch(run.out, /ghost\/Nobody/, "a check run does not log the account with no App");
+
+    // Both fresh (about 60 min left): nothing minted, nothing printed.
+    const before = mints.length;
+    run = await runMinter(["mint", "--min-life", "25"], env);
+    assert.equal(mints.length, before, "no call to GitHub");
+    assert.equal(run.out, "");
+    assert.deepEqual({ house: tok("house", "mikehlee"), yesman: tok("yesman", "oasis-main") }, first);
+
+    // House's token expired (the Mac slept); Yes Man's has 40 min left: only House is minted.
+    writeTok("house", "mikehlee", Date.now() - 600e3);
+    writeTok("yesman", "oasis-main", Date.now() + 40 * 60e3);
+    run = await runMinter(["mint", "--min-life", "25"], env);
+    assert.match(run.out, /minted 1, failed or skipped 0/);
+    assert.notEqual(tok("house", "mikehlee"), "ghs_old", "the expired token is replaced");
+    assert.equal(tok("yesman", "oasis-main"), "ghs_old", "the token with 40 min left stays");
+
+    // NEGATIVE CONTROL: a plain mint ignores token age and mints every token.
+    run = await runMinter(["mint"], env);
+    assert.match(run.out, /minted 2, failed or skipped 0/);
+    assert.notEqual(tok("yesman", "oasis-main"), "ghs_old");
   } finally {
     server.close();
   }
