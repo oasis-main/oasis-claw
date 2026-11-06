@@ -3714,11 +3714,12 @@ function renderSettings() {
 const ACCESS_BOT_KEY = "claw-observatory-access-bot";
 const ACCESS_SEVERITY = { risk: ["high", "bad"], warn: ["check", "warn"], info: ["note", "info"] };
 const ACCESS_CHANGES = [
-  ["Tool surface (role.yaml tools, or OASIS_TOOLS_ALSO_ALLOW)", "Restart. The entrypoint compiles role.yaml at each boot."],
+  ["Tool surface (role.yaml tools.alsoAllow)", "The Edit section above, then a restart: the boot compiles role.yaml. A removed tool goes away only with the image that prunes the role list (step 5)."],
+  ["Tool surface (OASIS_TOOLS_ALSO_ALLOW, a bot with no role.yaml)", "Recreate: the variable is in the bot's compose file."],
   ["Exec allowlist: add a pattern", "Restart. The boot merges role.yaml exec.allow into exec-approvals.json."],
   ["Exec allowlist: remove a pattern", "Edit exec-approvals.json in the bot volume. The boot merge never removes a pattern."],
   ["Exec level (security, mode, ask)", "Recreate: make -C bots BOT=<bot> recreate. A restart keeps the old environment."],
-  ["Reviewer write roots", "Edit bots/reviewer-policy.local.json, run make reviewer-policy, then restart."],
+  ["Reviewer write roots", "The Edit section above (it updates the overlay and the merged policy), then a restart: the reviewer reads its policy once per process."],
   ["Reviewer mode and Layer 2", "Recreate."],
   ["Decider (off or shadow)", "Recreate."],
   ["Mounts", "Recreate. Docker cannot add a mount to a running container."],
@@ -3764,7 +3765,149 @@ function accessRow(a, selected, onPick) {
   return tr;
 }
 
-function accessDetail(a) {
+// ── Access edits (Mike, 2026-11-06; step 5 part 1) ───────────────────────────
+// Add or remove one tool in role.yaml, or one reviewer write root. An add is
+// a widening: Mike's root key signs it first (Touch ID on the Mac). A remove
+// is a tightening: the hub key signs it, one click. The server enforces the
+// rules; a restart applies the edit.
+
+/** One signed edit. Returns the server's answer, or null when nothing changed. */
+async function accessEdit(a, body, question, button) {
+  const widening = body.op === "add";
+  if (!window.confirm(`${question}\n\n${widening ? "This is a widening: Touch ID on the Mac signs it with your root key." : "This is a tightening: the hub key signs it."}`)) return null;
+  const text = button.textContent;
+  button.disabled = true;
+  button.textContent = widening ? "Touch ID on the Mac…" : "Signing…";
+  try {
+    return await api(`/api/access/${encodeURIComponent(a.key)}/edit`, { method: "POST", type: "application/json", body: JSON.stringify(body) });
+  } catch (err) {
+    window.alert(`Not changed: ${err.message}`);
+    return null;
+  } finally {
+    button.disabled = false;
+    button.textContent = text;
+  }
+}
+
+function accessRestartButton(a, reload) {
+  return h("button", {
+    type: "button",
+    class: "button small",
+    text: `Restart ${a.container}`,
+    onclick: async (e) => {
+      if (!window.confirm(`Restart ${a.container} now? Its running session stops; the boot applies the edit.`)) return;
+      const b = e.currentTarget;
+      b.disabled = true;
+      b.textContent = "Restarting…";
+      let msg;
+      try {
+        const res = await api(`/api/fleet/containers/${encodeURIComponent(a.container)}/restart`, { method: "POST" });
+        msg = `${a.container}: ${res.detail ?? "restarted"}.`;
+      } catch (err) {
+        msg = `${a.container}: ${err.message}`;
+      }
+      app.access.notices.set(a.key, { text: msg, restart: false });
+      reload();
+    },
+  });
+}
+
+/** The list of one setting: each item with Remove, and one input with Add. */
+function accessEditList(a, { setting, label, items, hash, widen, canRemove, placeholder, removeHint }, reload) {
+  const draftKey = `${a.key}:${setting}`;
+  const input = h("input", { type: "text", class: "field", maxlength: "200", placeholder, "aria-label": `${label}: new item` });
+  input.value = app.access.drafts.get(draftKey) ?? "";
+  input.addEventListener("input", () => app.access.drafts.set(draftKey, input.value));
+  const done = (r) => {
+    if (!r) return;
+    app.access.drafts.delete(draftKey);
+    app.access.notices.set(a.key, { text: `Signed by the ${r.event.signedBy === "root" ? "root key" : "hub key"} and saved: ${r.summary}. A restart applies it (${r.restart.why}).`, restart: true });
+    reload();
+  };
+  const add = h("button", {
+    type: "button",
+    class: "button small",
+    text: "Add (Touch ID)",
+    disabled: !widen.allowed,
+    title: widen.allowed ? null : widen.reason,
+    onclick: async (e) => {
+      const value = input.value.trim();
+      if (!value) return;
+      done(await accessEdit(a, { setting, op: "add", value, baseHash: hash }, `Add ${value} to ${label} for ${a.key}?`, e.currentTarget));
+    },
+  });
+  return h(
+    "div",
+    { class: "stack tight" },
+    h(
+      "div",
+      { class: "chips" },
+      items.length
+        ? items.map((item) =>
+            h(
+              "span",
+              { class: "chip" },
+              h("span", { class: "mono", text: item }),
+              " ",
+              h("button", {
+                type: "button",
+                class: "button small danger",
+                text: "Remove",
+                disabled: !canRemove,
+                title: canRemove ? null : removeHint,
+                onclick: async (e) => done(await accessEdit(a, { setting, op: "remove", value: item, baseHash: hash }, `Remove ${item} from ${label} for ${a.key}?`, e.currentTarget)),
+              }),
+            ),
+          )
+        : h("span", { class: "muted small", text: "none" }),
+    ),
+    h("div", { class: "toolbar tight-row" }, input, add),
+  );
+}
+
+function accessEditSection(a, reload) {
+  const e = a.edit;
+  const head = h("h4", { text: "Edit" });
+  if (!e || e.error) return [head, empty(e?.error ?? "No edit state.")];
+  const notice = app.access.notices.get(a.key);
+  const parts = [
+    head,
+    h("p", { class: "muted small", text: "An add is a widening: your root key signs it first (Touch ID on the Mac). A remove is a tightening: the hub key signs it. Each edit is in the Authority tab's signed history. A restart applies it." }),
+  ];
+  if (!e.widen.allowed) parts.push(h("p", { class: "muted small", text: `Adds are off: ${e.widen.reason}.` }));
+  if (notice) parts.push(h("div", { class: "toolbar tight-row", role: "status" }, h("span", { class: "small", text: notice.text }), notice.restart && a.running ? accessRestartButton(a, reload) : null));
+  parts.push(h("div", { class: "field-label small", text: `Tools past the profile (tools.alsoAllow${e.tools.file ? ` in ${e.tools.file}` : ""})` }));
+  parts.push(
+    e.tools.error
+      ? empty(e.tools.error)
+      : accessEditList(a, { setting: "tools.alsoAllow", label: "tools.alsoAllow", items: e.tools.items, hash: e.tools.hash, widen: e.widen, canRemove: true, placeholder: "tool name, for example file_fetch" }, reload),
+  );
+  parts.push(h("div", { class: "field-label small", text: `Reviewer write roots${e.writeRoots.file ? ` (hard.per_bot.${e.writeRoots.key} in ${e.writeRoots.file})` : ""}` }));
+  if (!e.writeRoots.error && !e.writeRoots.scoped) {
+    parts.push(h("p", { class: "muted small", text: "denyWriteOutsideAllow is off for this bot: the reviewer does not scope its writes under /reach, so these roots have no effect." }));
+  }
+  parts.push(
+    e.writeRoots.error
+      ? empty(e.writeRoots.error)
+      : accessEditList(
+          a,
+          {
+            setting: "reviewer.writeRoots",
+            label: "the reviewer write roots",
+            items: e.writeRoots.roots,
+            hash: e.writeRoots.hash,
+            widen: e.widen,
+            canRemove: e.writeRoots.roots.length > 1,
+            removeHint: "the last write root stays: an empty list means no write scope at all",
+            placeholder: "/reach/<folder>",
+          },
+          reload,
+        ),
+  );
+  return parts;
+}
+
+function accessDetail(a, reload) {
   const bot = botByKey(a.key);
   const ap = a.exec.approvals;
   const lock = a.persona.lock;
@@ -3820,6 +3963,7 @@ function accessDetail(a) {
     h("div", { class: "card-head" }, h("h3", { text: bot ? botLabel(bot) : a.key }), h("span", { class: "muted small", text: a.container })),
     ...a.errors.map((e) => errorBox(new Error(e))),
     settings,
+    ...accessEditSection(a, reload),
     h("h4", { text: "Drift" }),
     drift,
     h("h4", { text: `Mounts (${a.mounts.length})` }),
@@ -3830,7 +3974,7 @@ function accessDetail(a) {
 }
 
 function renderAccess() {
-  app.access ??= { bot: recall(ACCESS_BOT_KEY), data: null };
+  app.access ??= { bot: recall(ACCESS_BOT_KEY), data: null, drafts: new Map(), notices: new Map() };
   const top = h("div", { class: "stack" }, placeholder("Reading each bot's access…"));
   const detail = h("section", { class: "card access-detail stack" });
   mainEl.append(
@@ -3860,7 +4004,7 @@ function renderAccess() {
         : empty("No chosen bot."),
     );
     const chosen = rows.find((a) => a.key === app.access.bot);
-    detail.replaceChildren(...(chosen ? accessDetail(chosen) : [empty("Choose a bot.")]));
+    detail.replaceChildren(...(chosen ? accessDetail(chosen, load) : [empty("Choose a bot.")]));
   };
   const load = () =>
     api("/api/access")
@@ -3946,7 +4090,7 @@ function authorityHub(d, redraw) {
     h(
       "dl",
       { class: "facts" },
-      fact("Log", d.ok ? `verifies: ${s.control.events} control, ${s.restrictions.events} restriction and ${s.ledger.events} ledger events` : `DOES NOT VERIFY: ${d.errors.join("; ")}`),
+      fact("Log", d.ok ? `verifies: ${s.control.events} control, ${s.restrictions.events} restriction, ${s.ledger.events} ledger and ${s.access?.events ?? 0} access events` : `DOES NOT VERIFY: ${d.errors.join("; ")}`),
       fact("Pinned root", d.pin ?? "none: run make authority-init"),
       fact("Roots", d.roots.map((r) => `${r.key} (${r.label}) since ${when(r.addedAt)}`).join("; ") || "—"),
       fact("Hubs", d.hubs.map((x) => `${x.key} for ${x.agents.join(", ")} until ${when(x.expiresAt)}${x.revoked ? " (REVOKED)" : x.valid ? "" : " (EXPIRED)"}`).join("; ") || "—"),
@@ -4115,7 +4259,7 @@ function authorityHistoryTable(d, redrawHistory) {
   const bar = h(
     "div",
     { class: "pill-bar" },
-    [["all", "All"], ["control", "Control"], ["restrictions", "Restrictions"], ["ledger", "Ledger"]].map(([id, text]) =>
+    [["all", "All"], ["control", "Control"], ["restrictions", "Restrictions"], ["ledger", "Ledger"], ["access", "Access"]].map(([id, text]) =>
       h("button", {
         type: "button",
         class: `pill small${pick === id ? " active" : ""}`,
@@ -4161,7 +4305,7 @@ function renderAuthority() {
     section("Cards", "One queue: the hub's own cards, and the approval cards that the autoreviewer also sends to Telegram. A decision here or on the Telegram card is the same decision.", queue),
     section("Instances", "Per bot: the level in force, the reviewer chain and its health, the home hub, the live grants and directives, the restrictions, and the bot's own copy of the view (/reach/authority).", matrix),
     section("Restrictions in force", "Mike's restrictions always enforce. An automatic one enforces only when the daemon runs with OASIS_AUTHORITY_AUTO=enforce.", formSlot, restrictions),
-    section("Signed history", "Every control and restriction event, and the newest 200 ledger events. Each one is signed and chained to the one before it.", history),
+    section("Signed history", "Every control, restriction and access event, and the newest 200 ledger events. Each one is signed and chained to the one before it.", history),
   );
   const drawHistory = () => {
     if (app.authority.data) history.replaceChildren(...authorityHistoryTable(app.authority.data, drawHistory));

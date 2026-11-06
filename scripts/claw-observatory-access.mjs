@@ -2,9 +2,10 @@
 // Step 2 of the identity plan: per bot, which permission level it runs at,
 // its exec, reviewer, decider and sandbox settings, its tool surface, every
 // mount, and a drift list where role.yaml, the container and the live config
-// do not agree. Phase 1 of the access design: this view ONLY READS. Edits
-// (phase 2, restart; phase 3, recreate) come later, with server-side safety
-// rules and a second confirmation outside the page for a widening.
+// do not agree. This module ONLY READS (phase 1 of the access design). The
+// phase 2 edits (a tool in role.yaml, a reviewer write root; a restart
+// applies them) are in claw-observatory-access-edit.mjs, where a widening is
+// signed by Mike's root key first. Phase 3 (recreate) comes later.
 //
 // SOURCES (all reads):
 //   - `docker inspect` from the observatory's cache: the mounts, and ONLY the

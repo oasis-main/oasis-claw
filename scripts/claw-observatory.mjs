@@ -44,7 +44,7 @@
 //      the decisions and cron changes (item 9), and .swarm item comments
 //      and edits (item 10), and fleet start/restart (item 11), and the
 //      Studio writes and drafts (item 12), and the authority actions
-//      (item 14).
+//      (item 14), and the access edits (item 15).
 //      A write needs the token AND this page's Origin. The requests and their screenshots stay in the
 //      state folder, which no bot mounts: a screenshot can show any agent's
 //      memory.
@@ -102,7 +102,7 @@
 //      Token + Origin on every write, as item 5.
 //  13. Access (Mike, 2026-11-02). GET /api/access shows each bot's level,
 //      exec, reviewer, decider and sandbox settings, tools, mounts and drift
-//      (claw-observatory-access.mjs). It only reads and takes no write method.
+//      (claw-observatory-access.mjs). It only reads; the edits are item 15.
 //      From `docker inspect` it reads the mounts and ONLY the environment
 //      names in ACCESS_ENV: the rest of a bot's environment holds tokens, and
 //      none of it reaches the page. In the bot it reads a few keys of
@@ -121,6 +121,19 @@
 //      authority daemon stays the only writer. In a bot it reads only counts
 //      and times from the reviewer audit, and from `docker inspect` only
 //      the ACCESS_ENV names and the mounts.
+//  15. Access edits (Mike, 2026-11-06; step 5 part 1). POST /api/access/
+//      <bot>/edit adds or removes ONE tool in the bot's role.yaml
+//      (tools.alsoAllow) or ONE reviewer write root (bots/reviewer-policy.
+//      local.json, then the merged bots/.runtime/reviewer-policy.json), in
+//      claw-observatory-access-edit.mjs. Before a file changes, the edit is
+//      an event in the authority log's access stream: an add (a widening)
+//      needs Mike's root key, so Touch ID; a remove (a tightening) is signed
+//      by the hub key. The server enforces the rules (no widening for a
+//      Level C bot, a write root under /reach/ and off the fleet's plumbing,
+//      never the last write root), compares the file hash with the one the
+//      page showed, follows no symlink, writes the two mounted files in
+//      place, and keeps the replaced text in the state folder. Nothing
+//      restarts here: the restart is item 11's route. Token + Origin.
 //   6. `serve` also starts the dot_swarm dashboard (`swarm gui`, 18781), where
 //      the human claims, finishes, blocks and comments on items. A bot can
 //      reach that port too, so the observatory starts it only after it proves
@@ -2479,7 +2492,56 @@ async function routeAccess(req, ctx) {
       }),
     ),
   );
-  return [200, { bots, levels: access.LEVELS }];
+  // What may be edited, read fresh: a cached hash would refuse the next edit.
+  const edit = await loadAccessEdit();
+  const files = ctx.policyFiles ?? edit.policyFiles(ctx.repoRoot);
+  const policySet = edit.readPolicySet(files);
+  const withEdit = bots.map((a) => {
+    try {
+      return { ...a, edit: edit.accessEditState({ inspect: ctx.inspectFor(a.container), repoRoot: ctx.repoRoot, files, policySet }) };
+    } catch (err) {
+      return { ...a, edit: { error: err.message } };
+    }
+  });
+  return [200, { bots: withEdit, levels: access.LEVELS }];
+}
+
+// ── Access edits (Mike, 2026-11-06) ──────────────────────────────────────────
+// Phase 2 of the access design, step 5 part 1 (trust model item 15). The logic
+// is in claw-observatory-access-edit.mjs.
+
+const ACCESS_EDIT_MODULE = new URL("./claw-observatory-access-edit.mjs", import.meta.url);
+let accessEditModule = null;
+const loadAccessEdit = () => (accessEditModule ??= import(ACCESS_EDIT_MODULE));
+const ACCESS_EDIT_PATH_RE = /^\/api\/access\/([a-z0-9-]{1,40})\/edit$/;
+const isAccessWrite = (method, pathname) => method === "POST" && ACCESS_EDIT_PATH_RE.test(pathname);
+const ACCESS_HISTORY_DIR = path.join(STATE_DIR, "access-history");
+
+/** /api/access/<bot>/edit  POST  { setting, op, value, baseHash, reason } */
+async function routeAccessEdit(req, url, ctx) {
+  if (req.method !== "POST") return [405, { error: "an access edit is a POST" }];
+  const key = ACCESS_EDIT_PATH_RE.exec(url.pathname)[1];
+  const f = await cached(ctx, "fleet", 4000, ctx.discover);
+  const bot = f.bots.find((b) => b.key === key && !b.excluded);
+  if (!bot) return [404, { error: `no bot ${key} in the fleet` }];
+  const body = await readJsonBody(req, 16 * 1024);
+  const edit = await loadAccessEdit();
+  const r = await edit.applyAccessEdit(bot.key, body, {
+    repoRoot: ctx.repoRoot,
+    files: ctx.policyFiles,
+    inspect: ctx.inspectFor(bot.container),
+    container: bot.container,
+    running: !!bot.running,
+    parseRole: (text) => ctx.parseRoleInBot(bot.container, text),
+    authorityDir: ctx.authorityDir,
+    rootSigner: () => ctx.rootSigner(ctx.authorityDir),
+    hubSigner: ctx.hubSigner,
+    historyDir: ctx.accessHistoryDir,
+  });
+  // The next GET reads the files again (the edit state is never cached), and
+  // the drift of this bot changed.
+  if (r.ok) ctx.cache.delete("access");
+  return r.error ? [r.status ?? 400, { error: r.error }] : [200, r];
 }
 
 // ── Authority (Mike, 2026-11-03) ─────────────────────────────────────────────
@@ -2556,6 +2618,7 @@ export function checkRequest(req, port) {
     isFleetWrite(req.method, pathname) ||
     isStudioWrite(req.method, pathname) ||
     isAuthorityWrite(req.method, pathname) ||
+    isAccessWrite(req.method, pathname) ||
     (req.method === "POST" && pathname === DECIDE_PATH);
   if (!WRITE_METHODS.has(req.method) || !writable) {
     return { status: 405, error: "read-only" };
@@ -3884,6 +3947,9 @@ export function createObservatoryServer(ctx) {
   ctx.authorityPlist ??= path.join(HOME, "Library", "LaunchAgents", "com.oasis-x.authority.plist");
   ctx.readReviewerHealth ??= async (bot) => collect(bot.container, (await loadAuthorityView()).collectReviewerHealth);
   ctx.rootSigner ??= async (dir) => (await loadAuthorityView()).rootSignerFor(dir);
+  ctx.repoRoot ??= REPO_ROOT;
+  ctx.accessHistoryDir ??= ACCESS_HISTORY_DIR;
+  ctx.parseRoleInBot ??= async (container, text) => (await loadAccessEdit()).parseRoleInBot(container, text);
   return http.createServer((req, res) => {
     const refused = checkRequest(req, ctx.port);
     if (refused) {
@@ -3993,6 +4059,16 @@ export function createObservatoryServer(ctx) {
     }
     if (STUDIO_PATH_RE.test(url.pathname)) {
       routeStudio(req, url, ctx).then(
+        ([status, body]) => sendJson(res, status, body),
+        (err) => {
+          if (err.status === 413) res.once("finish", () => req.destroy());
+          sendJson(res, err.status ?? 502, { error: err.message });
+        },
+      );
+      return;
+    }
+    if (ACCESS_EDIT_PATH_RE.test(url.pathname)) {
+      routeAccessEdit(req, url, ctx).then(
         ([status, body]) => sendJson(res, status, body),
         (err) => {
           if (err.status === 413) res.once("finish", () => req.destroy());
